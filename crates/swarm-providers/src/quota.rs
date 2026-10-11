@@ -142,12 +142,15 @@ impl QuotaGate {
         None
     }
 
-    /// Add estimated spend; enforces the provider cap when one is set.
+    /// Add estimated spend. The spend is always recorded (it has already been
+    /// incurred); the cap is then checked, and exceeding it flips the provider
+    /// to `Unavailable` and returns `Err` so the scheduler stops dispatching.
     pub fn add_spend(&self, provider: &str, micros: u64) -> Result<(), CoreError> {
         let mut st = self.lock();
         let g = st.providers.entry(provider.to_string()).or_default();
+        let total = g.spend_micros.saturating_add(micros);
+        g.spend_micros = total;
         if let Some(cap) = g.max_spend_micros {
-            let total = g.spend_micros.saturating_add(micros);
             if total > cap {
                 g.status = ProviderStatus::Unavailable;
                 return Err(CoreError::BudgetExceeded {
@@ -157,7 +160,6 @@ impl QuotaGate {
                 });
             }
         }
-        g.spend_micros = g.spend_micros.saturating_add(micros);
         Ok(())
     }
 

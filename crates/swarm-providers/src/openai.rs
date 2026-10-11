@@ -50,7 +50,7 @@ pub struct OpenAiConfig {
 }
 
 impl OpenAiConfig {
-    pub fn new(base_url: &str, model: &str) -> Result<Self, CoreError> {
+    pub fn new(base_url: &str, model: &str) -> std::result::Result<Self, CoreError> {
         let base = base_url.trim_end_matches('/');
         // Fail at construction if the URL is malformed.
         reqwest::Url::parse(base)
@@ -135,10 +135,6 @@ impl OpenAiProvider {
             caps,
         })
     }
-
-    fn chat_url(&self) -> String {
-        format!("{}/chat/completions", self.config.base_url)
-    }
 }
 
 #[async_trait]
@@ -153,7 +149,7 @@ impl Provider for OpenAiProvider {
         &self.config.model
     }
     fn capabilities(&self) -> ProviderCapabilities {
-        self.caps
+        self.caps.clone()
     }
     fn billing(&self) -> BillingMode {
         self.config.billing
@@ -209,7 +205,7 @@ impl Session for OpenAiSession {
         let do_stream = self.config.streaming;
         let body = self.build_body(request, do_stream);
 
-        let mut req = self.client.post(self.id.as_str(), self.chat_url());
+        let req = self.client.post(self.chat_url());
         let response = match req
             .json(&body)
             .send()
@@ -224,7 +220,8 @@ impl Session for OpenAiSession {
             r => r,
         };
 
-        if response.status().is_error() {
+        let status = response.status();
+        if status.is_client_error() || status.is_server_error() {
             return Err(self.http_error(response).await);
         }
 
@@ -288,7 +285,7 @@ impl OpenAiSession {
         body
     }
 
-    async fn http_error(&self, mut response: reqwest::Response) -> ProviderError {
+    async fn http_error(&self, response: reqwest::Response) -> ProviderError {
         let status = response.status();
         let retry_after = response
             .headers()
@@ -419,7 +416,7 @@ fn parse_sse_body(body: &str) -> Result<Vec<ProviderTextChunk>> {
 
     let calls: Vec<NativeToolCall> = tools
         .values()
-        .map(|a| NativeToolCall::new(a.id, a.name, parse_tool_arguments(&a.args)))
+        .map(|a| NativeToolCall::new(a.id.clone(), a.name.clone(), parse_tool_arguments(&a.args)))
         .collect();
     Ok(build_chunks(&text, &calls, finish, usage))
 }
@@ -479,30 +476,33 @@ mod tests {
     use super::*;
     use swarm_core::message::ChatMessage;
     use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, Response};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn req(text: &str) -> SendRequest {
         SendRequest::new(vec![ChatMessage::user(text)])
     }
 
-    async fn make_server(body: serde_json::Value) -> MockServer {
-        let server = MockServer::spawn().await;
-        Mock::given(method("POST").and(path("/v1/chat/completions")))
-            .respond_with(
-                Response::new()
-                    .status(200)
-                    .header("content-type", "application/json")
-                    .body_json(body),
-            )
-            .expect(1)
-            .on(&server)
+    /// Serve a single canned body at `status` on the chat-completions endpoint.
+    async fn serve(status: u16, body: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(&server)
             .await;
         server
     }
 
+    async fn provider(uri: &str, streaming: bool) -> OpenAiProvider {
+        let cfg = OpenAiConfig::new(&format!("{uri}/v1"), "test-model")
+            .unwrap()
+            .streaming(streaming);
+        OpenAiProvider::new(ProviderId::new("openai-test").unwrap(), cfg).unwrap()
+    }
+
     #[tokio::test]
     async fn non_streaming_parses_text_tools_and_usage() {
-        let server = make_server(json!({
+        let body = json!({
             "model": "test-model",
             "choices": [{
                 "message": {
@@ -517,12 +517,10 @@ mod tests {
                 "finish_reason": "tool_calls"
             }],
             "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
-        }))
-        .await;
-        let cfg = OpenAiConfig::new(&format!("{}/v1", server.uri()), "test-model")
-            .unwrap()
-            .streaming(false);
-        let p = OpenAiProvider::new(ProviderId::new("openai-test").unwrap(), cfg).unwrap();
+        });
+        let body = body.to_string();
+        let server = serve(200, &body).await;
+        let p = provider(&server.uri(), false).await;
         let session = p.start_session(SessionConfig::default()).await.unwrap();
         let resp = session.send(req("hello")).await.unwrap();
         assert_eq!(resp.text, "done: ");
@@ -536,29 +534,19 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_sse_assembles_text_usage_and_tool_calls() {
-        let body = [
-            "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}}]}}]\n\n",
-            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\": \\\"ls\\\"}\"}}}]}}]\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}, {\"delta\":{\"finish_reason\":\"stop\"}}], \"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
-            "data: [DONE]\n\n",
-        ]
-        .concat();
-        let server = MockServer::spawn().await;
-        Mock::given(method("POST").and(path("/v1/chat/completions")))
-            .respond_with(
-                Response::new()
-                    .status(200)
-                    .header("content-type", "text/event-stream")
-                    .body(body),
-            )
-            .expect(1)
-            .on(&server)
-            .await;
-        let cfg = OpenAiConfig::new(&format!("{}/v1", server.uri()), "test-model")
-            .unwrap()
-            .streaming(true);
-        let p = OpenAiProvider::new(ProviderId::new("openai-test").unwrap(), cfg).unwrap();
+        let events = vec![
+            json!({"choices": [{"delta": {"content": "he"}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "tc1", "function": {"name": "bash", "arguments": ""}}]}}]}),
+            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{\"command\": \"ls\"}"}}]}}]}),
+            json!({"choices": [{"delta": {"content": "llo"}}, {"delta": {"finish_reason": "stop"}}], "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}),
+        ];
+        let mut body = String::new();
+        for e in &events {
+            body.push_str(&format!("data: {e}\n\n"));
+        }
+        body.push_str("data: [DONE]\n\n");
+        let server = serve(200, &body).await;
+        let p = provider(&server.uri(), true).await;
         let session = p.start_session(SessionConfig::default()).await.unwrap();
         let resp = session.send(req("hi")).await.unwrap();
         assert_eq!(resp.text, "hello");
@@ -571,21 +559,8 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_is_classified_and_retryable() {
-        let server = MockServer::spawn().await;
-        Mock::given(method("POST").and(path("/v1/chat/completions")))
-            .respond_with(
-                Response::new()
-                    .status(429)
-                    .header("retry-after", "3")
-                    .body_json(json!({"error": {"message": "slow down"}})),
-            )
-            .expect(1)
-            .on(&server)
-            .await;
-        let cfg = OpenAiConfig::new(&format!("{}/v1", server.uri()), "test-model")
-            .unwrap()
-            .streaming(false);
-        let p = OpenAiProvider::new(ProviderId::new("openai-test").unwrap(), cfg).unwrap();
+        let server = serve(429, r#"{"error": {"message": "slow down"}}"#).await;
+        let p = provider(&server.uri(), false).await;
         let session = p.start_session(SessionConfig::default()).await.unwrap();
         let err = session.send(req("hi")).await.unwrap_err();
         assert!(matches!(
@@ -601,20 +576,8 @@ mod tests {
 
     #[tokio::test]
     async fn auth_error_is_not_retryable() {
-        let server = MockServer::spawn().await;
-        Mock::given(method("POST").and(path("/v1/chat/completions")))
-            .respond_with(
-                Response::new()
-                    .status(401)
-                    .body_json(json!({"error": {"message": "bad key"}})),
-            )
-            .expect(1)
-            .on(&server)
-            .await;
-        let cfg = OpenAiConfig::new(&format!("{}/v1", server.uri()), "test-model")
-            .unwrap()
-            .streaming(false);
-        let p = OpenAiProvider::new(ProviderId::new("openai-test").unwrap(), cfg).unwrap();
+        let server = serve(401, r#"{"error": {"message": "bad key"}}"#).await;
+        let p = provider(&server.uri(), false).await;
         let session = p.start_session(SessionConfig::default()).await.unwrap();
         let err = session.send(req("hi")).await.unwrap_err();
         assert!(!err.is_retryable());

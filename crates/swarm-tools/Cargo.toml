@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 swarm-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tempfile = { workspace = true }

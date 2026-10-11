@@ -17,7 +17,7 @@ use serde_json::json;
 
 use swarm_core::budget::{BillingMode, TokenUsage};
 use swarm_core::message::ChatMessage;
-use swarm_core::provider::{ProviderCapabilities, ProviderErrorClass, ProviderKind, ToolCallKind};
+use swarm_core::provider::{ProviderCapabilities, ProviderErrorClass, ProviderKind};
 use swarm_core::{CoreError, ProviderId, SessionId};
 
 use crate::error::ProviderError;
@@ -95,7 +95,9 @@ pub struct MockProvider {
     pub latency: Duration,
     /// Scripted per-session responses; `None` => default numbered replies.
     pub script: Option<Vec<MockStep>>,
-    call_counter: AtomicU64,
+ /// Shared across all sessions of this provider instance so default
+ /// numbered replies keep incrementing across dispatches.
+ call_counter: std::sync::Arc<AtomicU64>,
 }
 
 impl MockProvider {
@@ -108,7 +110,7 @@ impl MockProvider {
             pricing: ModelPricing::default(),
             latency: Duration::ZERO,
             script: None,
-            call_counter: AtomicU64::new(0),
+            call_counter: std::sync::Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -156,7 +158,7 @@ impl MockProvider {
                 pricing: self.pricing,
                 latency: self.latency,
                 script: self.script.clone(),
-                call_counter: AtomicU64::new(0),
+                call_counter: self.call_counter.clone(),
             }),
             session_id: SessionId::new(),
             script: Mutex::new(
@@ -294,6 +296,7 @@ impl MockSession {
             ),
             tool_calls: Vec::new(),
             finish: FinishReason::Stop,
+            error: None,
         })
     }
 }

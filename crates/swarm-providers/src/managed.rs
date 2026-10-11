@@ -80,7 +80,7 @@ pub struct ManagedAgentProvider {
 }
 
 impl ManagedAgentProvider {
-    pub fn new(id: ProviderId, config: ManagedAgentConfig) -> Result<Self, CoreError> {
+    pub fn new(id: ProviderId, config: ManagedAgentConfig) -> std::result::Result<Self, CoreError> {
         if config.command.is_empty() {
             return Err(CoreError::Config("managed agent command must be non-empty".into()));
         }
@@ -110,7 +110,7 @@ impl Provider for ManagedAgentProvider {
         &self.config.name
     }
     fn capabilities(&self) -> ProviderCapabilities {
-        self.caps
+        self.caps.clone()
     }
     fn billing(&self) -> BillingMode {
         self.config.billing
@@ -118,12 +118,11 @@ impl Provider for ManagedAgentProvider {
     fn pricing(&self) -> ModelPricing {
         self.config.pricing
     }
-    async fn start_session(&self, config: SessionConfig) -> Result<Box<dyn Session>> {
+    async fn start_session(&self, _config: SessionConfig) -> Result<Box<dyn Session>> {
         Ok(Box::new(ManagedAgentSession {
             id: self.id.clone(),
             model: self.config.name.clone(),
             config: self.config.clone(),
-            session_config: config,
             session_id: SessionId::new(),
         }))
     }
@@ -133,7 +132,6 @@ struct ManagedAgentSession {
     id: ProviderId,
     model: String,
     config: ManagedAgentConfig,
-    session_config: SessionConfig,
     session_id: SessionId,
 }
 
@@ -169,29 +167,33 @@ impl Session for ManagedAgentSession {
             FinishReason::Stop,
             Some(TokenUsage::default()),
         );
-        Ok(futures::stream::iter(chunks.into_iter().map(Ok)).boxed())
+        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
     }
 }
 
 impl ManagedAgentSession {
     /// Run the managed-agent process to completion (or timeout).
-    async fn run(&self) -> Result<tokio::process::Output> {
+    async fn run(&self) -> Result<std::process::Output> {
         let mut cmd = tokio::process::Command::new(&self.config.command[0]);
         cmd.args(&self.config.command[1..]);
         cmd.current_dir(&self.config.workdir);
         for (k, v) in &self.config.env {
             cmd.env(k, v);
         }
+        // Capture output: tokio inherits stdout/stderr by default, so
+        // `wait_with_output` would return empty buffers unless we pipe them.
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| ProviderError::Process(format!("spawn `{}`: {e}", self.config.name)))?;
         let output = tokio::time::timeout(self.config.timeout, child.wait_with_output())
             .await
             .map_err(|_| ProviderError::Timeout(self.config.timeout))?
             .map_err(|e| ProviderError::Process(format!("wait `{}`: {e}", self.config.name)))?;
-        Ok((output, start.elapsed()))
+        Ok(output)
     }
 }
 
@@ -207,12 +209,8 @@ mod tests {
     use super::*;
     use crate::provider::SendRequest;
 
-    fn cfg_for(name: &str, cmd: &[&str]) -> ManagedAgentConfig {
-        ManagedAgentConfig::new(
-            name,
-            cmd.iter().map(|s| s.to_string()).collect(),
-            std::env::temp_dir(),
-        )
+    fn cfg_for(name: &str, cmd: Vec<String>) -> ManagedAgentConfig {
+        ManagedAgentConfig::new(name, cmd, std::env::temp_dir())
     }
 
     #[tokio::test]
@@ -239,14 +237,15 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_returns_timeout_error() {
-        let mut cfg = cfg_for(
-            "sleeper",
-            if cfg!(windows) {
-                &["cmd", "/C", "timeout", "/t", "10", "/nobreak"]
-            } else {
-                &["sleep", "10"]
-            },
-        );
+        let raw: &[&str] = if cfg!(windows) {
+            // ping 127.0.0.1 ~3s: a console-independent sleep that outlasts the
+            // 500ms timeout. (`timeout /t` needs an attached console and exits 125
+            // when stdout/stderr are pipes.)
+            &["cmd", "/C", "ping -n 4 127.0.0.1"]
+        } else {
+            &["sleep", "10"]
+        };
+        let mut cfg = cfg_for("sleeper", raw.iter().map(|s| s.to_string()).collect());
         cfg.timeout = Duration::from_millis(500);
         let p = ManagedAgentProvider::new(ProviderId::new("managed-test").unwrap(), cfg).unwrap();
         let session = p.start_session(SessionConfig::default()).await.unwrap();

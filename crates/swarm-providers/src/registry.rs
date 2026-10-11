@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use swarm_core::provider::{ProviderEntry, ProviderStatus};
+use swarm_core::provider::ProviderEntry;
 use swarm_core::{CoreError, ProviderId};
 
 use crate::error::ProviderError;
@@ -50,13 +50,17 @@ impl ProviderRegistry {
     pub fn entries(&self) -> Vec<ProviderEntry> {
         self.providers
             .iter()
-            .map(|p| ProviderEntry {
-                id: p.id().clone(),
-                kind: p.kind(),
-                model: p.model().to_string(),
-                capabilities: p.capabilities(),
-                status: self.gate.status_for(p.id().as_str()),
-                notes: None,
+            .map(|p| {
+                let caps = p.capabilities();
+                ProviderEntry {
+                    id: p.id().clone(),
+                    kind: p.kind(),
+                    model: p.model().to_string(),
+                    status: self.gate.status_for(p.id().as_str()),
+                    zero_cost: p.billing().is_zero_cost(),
+                    concurrency: caps.max_concurrency.unwrap_or(1),
+                    capabilities: caps,
+                }
             })
             .collect()
     }
@@ -85,7 +89,7 @@ impl ProviderRegistry {
         let key = provider.id().as_str().to_string();
         if !self.gate.can_dispatch(&key) {
             return Err(ProviderError::Throttled {
-                provider: key,
+                provider: key.clone(),
                 reason: format!(
                     "provider is not accepting work (status {:?})",
                     self.gate.status_for(&key)
@@ -169,7 +173,7 @@ mod tests {
             let e = reg.dispatch(&id, req("b")).await.unwrap_err();
             assert!(matches!(e, ProviderError::Throttled { .. }));
         }
-        assert_eq!(reg.gate.status_for("mock"), ProviderStatus::Exhausted);
+        assert_eq!(reg.gate.status_for("mock"), swarm_core::provider::ProviderStatus::Exhausted);
     }
 
     #[tokio::test]

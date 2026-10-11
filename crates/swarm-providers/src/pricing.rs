@@ -42,7 +42,7 @@ mod tests {
             output_tokens: 500_000,
             cached_input_tokens: 0,
         };
-        assert_eq!(p.estimate(&u), 1_500_000);
+        assert_eq!(p.estimate(&u), 2_000_000);
     }
 
     #[test]

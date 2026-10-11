@@ -279,7 +279,9 @@ pub async fn collect_response(
                 return Err(ProviderError::Session(chunk.text));
             }
         }
-        resp.usage = chunk.usage.or(resp.usage);
+        if let Some(u) = chunk.usage {
+            resp.usage = u;
+        }
         if let Some(f) = &chunk.finish_reason {
             resp.finish_reason = FinishReason::from_provider_str(f);
         }
@@ -323,7 +325,7 @@ pub trait Provider: Send + Sync {
 /// One conversation with a provider. Swarm owns the history; the session is
 /// a handle plus cleanup.
 #[async_trait]
-pub trait Session: Send {
+pub trait Session: Send + Sync {
     fn provider_id(&self) -> &ProviderId;
     fn model(&self) -> &str;
     fn session_id(&self) -> &SessionId;
