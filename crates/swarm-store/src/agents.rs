@@ -27,6 +27,23 @@ impl Store {
         Ok(())
     }
 
+    /// Persists the agent's mutable fields (state, step count, timestamp).
+    /// Errors if no row matches the id.
+    pub async fn update_agent(&self, agent: &Agent) -> Result<()> {
+        let n = sqlx::query("UPDATE agents SET state = ?, steps = ?, updated_at = ? WHERE id = ?")
+            .bind(agent.state.as_str())
+            .bind(agent.steps as i64)
+            .bind(agent.updated_at)
+            .bind(agent.id.as_str())
+            .execute(&self.pool)
+            .await
+            .context("update agent")?;
+        if n.rows_affected() == 0 {
+            anyhow::bail!("agent not found: {}", agent.id.as_str());
+        }
+        Ok(())
+    }
+
     pub async fn load_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let row = sqlx::query("SELECT * FROM agents WHERE id = ?")
             .bind(id.as_str())
@@ -175,5 +192,59 @@ mod tests {
         store.save_checkpoint(&agent.id, &run_id, &cp, 100).await.unwrap();
         let cp = store.load_checkpoint(&agent.id).await.unwrap().unwrap();
         assert_eq!(cp.steps, 3);
+    }
+
+    #[tokio::test]
+    async fn update_agent_persists_state_and_steps() {
+        let (store, _tmp) = tests_util::open_test_store().await;
+        let run = Run::new("t", "mock", None, 1, true, ResourceBudget::default(), 1);
+        store.create_run(&run).await.unwrap();
+        let run_id = run.id.clone();
+        let task = Task {
+            id: TaskId::new(),
+            run_id: run_id.clone(),
+            parent_id: None,
+            depth: 0,
+            title: "t".into(),
+            objective: "o".into(),
+            role: AgentRole::Worker,
+            group: "g".into(),
+            priority: 0,
+            depends_on: vec![],
+            state: TaskState::Ready,
+            attempts: 0,
+            created_at: 1,
+            updated_at: 1,
+        };
+        store.create_task(&task).await.unwrap();
+        let mut agent = Agent {
+            id: AgentId::new(),
+            run_id,
+            task_id: task.id,
+            parent_id: None,
+            role: AgentRole::Worker,
+            state: AgentState::Created,
+            depth: 0,
+            steps: 0,
+            created_at: 1,
+            updated_at: 1,
+        };
+        store.create_agent(&agent).await.unwrap();
+
+        agent.state = AgentState::Running;
+        agent.steps = 2;
+        agent.updated_at = 200;
+        store.update_agent(&agent).await.unwrap();
+        let loaded = store.load_agent(&agent.id).await.unwrap().unwrap();
+        assert_eq!(loaded.state, AgentState::Running);
+        assert_eq!(loaded.steps, 2);
+        assert_eq!(loaded.updated_at, 200);
+
+        // Updating an id with no matching row is an error.
+        let ghost = Agent {
+            id: AgentId::new(),
+            ..agent
+        };
+        assert!(store.update_agent(&ghost).await.is_err());
     }
 }
