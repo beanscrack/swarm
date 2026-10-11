@@ -70,6 +70,7 @@ pub mod tool;
 
 pub use error::{CoreError, CoreResult};
 pub use ids::{AgentId, ArtifactId, HypothesisId, MessageId, ProviderId, RunId, SessionId, TaskId};
+pub use message::MessageToolCall;
 pub use task::AgentRole;
 pub use run::RunMode;
 pub use state::{AgentState, RunStatus, StateMachine, TaskState};

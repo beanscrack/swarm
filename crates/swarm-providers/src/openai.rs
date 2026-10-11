@@ -252,7 +252,36 @@ impl OpenAiSession {
             messages.push(json!({"role": "system", "content": system}));
         }
         for m in &request.messages {
-            messages.push(json!({"role": m.role.as_str(), "content": m.content}));
+            let mut obj = serde_json::Map::new();
+            obj.insert("role".to_string(), json!(m.role.as_str()));
+            // A pure assistant tool-call turn has no text; OpenAI wants `null` there.
+            if m.content.is_empty() && !m.tool_calls.is_empty() {
+                obj.insert("content".to_string(), Value::Null);
+            } else {
+                obj.insert("content".to_string(), json!(m.content));
+            }
+            if !m.tool_calls.is_empty() {
+                let calls: Vec<Value> = m
+                    .tool_calls
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": {
+                                "name": c.name,
+                                // OpenAI requires `arguments` as a JSON-encoded string.
+                                "arguments": c.arguments.to_string(),
+                            },
+                        })
+                    })
+                    .collect();
+                obj.insert("tool_calls".to_string(), Value::Array(calls));
+            }
+            if let Some(id) = &m.tool_call_id {
+                obj.insert("tool_call_id".to_string(), json!(id));
+            }
+            messages.push(Value::Object(obj));
         }
 
         let has_tools = !request.tools.is_empty();
@@ -475,6 +504,7 @@ fn parse_usage(u: Option<&Value>) -> Option<TokenUsage> {
 mod tests {
     use super::*;
     use swarm_core::message::ChatMessage;
+    use swarm_core::MessageToolCall;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -530,6 +560,47 @@ mod tests {
         assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
         assert_eq!(resp.usage.input_tokens, 5);
         assert_eq!(resp.usage.output_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn native_tool_calls_round_trip_on_the_wire() {
+        let body = json!({
+            "model": "test-model",
+            "choices": [{"message": {"role": "assistant", "content": "done"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string();
+        let server = serve(200, &body).await;
+        let p = provider(&server.uri(), false).await;
+        let session = p.start_session(SessionConfig::default()).await.unwrap();
+
+        let messages = vec![
+            ChatMessage::user("go"),
+            ChatMessage::assistant_with_tool_calls(
+                "",
+                vec![MessageToolCall {
+                    id: "c1".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({"path": "hello.txt"}),
+                }],
+            ),
+            ChatMessage::tool("c1", "ok"),
+        ];
+        session.send(SendRequest::new(messages)).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let sent: serde_json::Value = received[0].body_json().unwrap();
+        let msgs = sent["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert_eq!(assistant["content"], Value::Null);
+        assert_eq!(assistant["tool_calls"][0]["function"]["name"], "write_file");
+        // `arguments` must be a JSON-encoded string, not an inline object.
+        let args = &assistant["tool_calls"][0]["function"]["arguments"];
+        assert!(args.is_string());
+        assert!(args.as_str().unwrap().contains("hello.txt"));
+        let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(tool["tool_call_id"], "c1");
     }
 
     #[tokio::test]
