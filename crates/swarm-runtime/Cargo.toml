@@ -1,0 +1,21 @@
+[package]
+name = "swarm-runtime"
+description = "Swarm agent runtime: the loop that turns models, tools, and state into work."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+swarm-core = { workspace = true }
+swarm-store = { workspace = true }
+swarm-providers = { workspace = true }
+swarm-scheduler = { workspace = true }
+swarm-tools = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

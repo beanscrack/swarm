@@ -1,0 +1,30 @@
+[package]
+name = "swarm-cli"
+description = "Swarm command-line interface and TUI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+swarm-core = { workspace = true }
+swarm-store = { workspace = true }
+swarm-providers = { workspace = true }
+swarm-scheduler = { workspace = true }
+swarm-tools = { workspace = true }
+swarm-runtime = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+ratatui = "0.30.2"
+
+[dev-dependencies]
+swarm-providers = { workspace = true }
+
+[[bin]]
+name = "swarm"
+path = "src/main.rs"
