@@ -25,7 +25,7 @@ pub mod registry;
 // Convenience re-exports.
 pub use error::ProviderError;
 pub use managed::{ManagedAgentConfig, ManagedAgentProvider};
-pub use mock::{MockProvider, MockStep};
+pub use mock::{coding_script, MockProvider, MockStep};
 pub use openai::{OpenAiConfig, OpenAiProvider};
 pub use pricing::ModelPricing;
 pub use provider::{
