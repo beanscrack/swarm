@@ -8,8 +8,10 @@ mod agent;
 mod error;
 mod factory;
 mod prompt;
+mod runtime;
 
 pub use agent::{AgentOutcome, AgentRunner};
 pub use error::RuntimeError;
 pub use factory::{build_registry, local_provider_config, scheduler_config};
 pub use prompt::{initial_messages, system_prompt};
+pub use runtime::Runtime;
