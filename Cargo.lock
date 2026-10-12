@@ -2670,6 +2670,7 @@ dependencies = [
 name = "swarm-runtime"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "futures",
  "serde_json",
@@ -2678,9 +2679,11 @@ dependencies = [
  "swarm-scheduler",
  "swarm-store",
  "swarm-tools",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
