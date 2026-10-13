@@ -86,6 +86,7 @@ impl AgentRunner {
             Some(existing) => existing,
             None => fresh_checkpoint(run, task),
         };
+        agent.steps = cp.steps;
 
         // Move the agent Created -> Ready -> Running (idempotent on resume).
         let from = agent.state;
@@ -186,6 +187,7 @@ impl AgentRunner {
             self.store.record_usage(&run.id, &delta, now).await?;
             cp.usage.add(&delta);
             cp.steps += 1;
+            agent.steps = cp.steps;
             self.emit(
                 run,
                 agent,
@@ -388,6 +390,7 @@ impl AgentRunner {
         now: i64,
     ) -> anyhow::Result<()> {
         self.store.save_checkpoint(&agent.id, &run.id, cp, now).await?;
+        self.store.update_agent(agent).await?;
         self.emit(
             run,
             agent,

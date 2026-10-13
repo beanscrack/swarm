@@ -1,5 +1,7 @@
 target/
 .swarm/
+.swarm-test/
+work/
 *.db
 *.db-wal
 *.db-shm

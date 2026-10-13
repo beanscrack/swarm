@@ -1,5 +1,22 @@
-//! Swarm CLI entry point (thin; logic lives in the `swarm_cli` lib target).
-fn main() -> anyhow::Result<()> {
-    // Implemented in the CLI milestone.
-    Ok(())
+use clap::Parser;
+use std::process::ExitCode;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    match swarm_cli::execute(swarm_cli::Cli::parse()).await {
+        Ok(result) => {
+            if !result.text.is_empty() {
+                println!("{}", result.text);
+            }
+            if result.success {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
 }

@@ -2632,9 +2632,12 @@ dependencies = [
  "swarm-scheduler",
  "swarm-store",
  "swarm-tools",
+ "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

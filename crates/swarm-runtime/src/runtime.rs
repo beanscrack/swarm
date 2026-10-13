@@ -50,6 +50,7 @@ pub struct Runtime {
     registry: Arc<ProviderRegistry>,
     executor: Arc<ToolExecutor>,
     scheduler: Scheduler,
+    approval: ApprovalPolicy,
 }
 
 impl Runtime {
@@ -59,7 +60,13 @@ impl Runtime {
         executor: Arc<ToolExecutor>,
         scheduler: Scheduler,
     ) -> Self {
-        Self { store, registry, executor, scheduler }
+        Self { store, registry, executor, scheduler, approval: ApprovalPolicy::AskDangerous }
+    }
+
+    /// Sets the tool approval policy used by agents in this runtime.
+    pub fn with_approval(mut self, approval: ApprovalPolicy) -> Self {
+        self.approval = approval;
+        self
     }
 
     /// Persists the run plus its single root task (depth 0, Worker, group
@@ -180,13 +187,14 @@ impl Runtime {
                 let executor = self.executor.clone();
                 let provider_c = provider.clone();
                 let token_c = token.clone();
+                let approval = self.approval;
                 in_flight.spawn(async move {
                     let prov = ProviderId::new(provider_c).expect("provider id");
                     let runner = AgentRunner {
                         store,
                         registry,
                         executor,
-                        approval: ApprovalPolicy::Never,
+                        approval,
                     };
                     // Same `Agent` value persisted above, so `update_agent` finds the row.
                     let mut agent = agent;
@@ -213,7 +221,7 @@ impl Runtime {
             match woke {
                 Some(Ok((task_id, token, outcome))) => {
                     lease_tokens.retain(|(id, _)| id != &task_id);
-                    self.finish(task_id, &token, outcome, &run, now).await?;
+                    self.finish(task_id, &token, outcome, &run, now_ms()).await?;
                 }
                 Some(Err(e)) => {
                     return Err(RuntimeError::Core(CoreError::Protocol(format!(
@@ -305,9 +313,14 @@ impl Runtime {
         now: i64,
     ) -> Result<(), RuntimeError> {
         match outcome {
-            AgentOutcome::Completed { .. } => {
+            AgentOutcome::Completed { summary } => {
                 self.store.complete_task(&task_id, token, now).await?;
                 self.emit_task(&run.id, &task_id, TaskState::Completed).await?;
+                self.store.append_event(&RunEvent::new(
+                    EventKind::Message,
+                    run.id.clone(),
+                    json!({ "summary": summary }),
+                ).with_task(task_id)).await?;
             }
             AgentOutcome::Failed { reason: _, retryable } => {
                 let task = self.store.load_task(&task_id).await?;
