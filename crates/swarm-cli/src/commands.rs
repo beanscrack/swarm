@@ -189,6 +189,11 @@ async fn run(args: RunArgs) -> Result<CommandOutcome> {
     let executor = Arc::new(ToolExecutor::new(sandbox));
     let runtime = Runtime::new(store.clone(), registry, executor, scheduler)
         .with_approval(cfg.tools.approval);
+    let runtime = if cfg.tools.approval == ApprovalPolicy::Never {
+        runtime
+    } else {
+        runtime.with_approval_handler(Arc::new(crate::approval::ConsoleApproval::default()))
+    };
     let created = runtime.create_run(&cfg, RunMode::Coding).await?;
     let state = runtime.drive(&created.id).await?;
     let task_count = store.finished_task_count(&created.id).await?;

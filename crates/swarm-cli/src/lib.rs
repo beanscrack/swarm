@@ -1,5 +1,6 @@
 //! Command-line entry points for running and inspecting durable Swarm runs.
 
+mod approval;
 mod commands;
 mod tui;
 

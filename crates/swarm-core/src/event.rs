@@ -21,6 +21,8 @@ string_enum! {
         InferenceCompleted => "inference_completed",
         InferenceFailed => "inference_failed",
         ToolRequested => "tool_requested",
+        ApprovalRequested => "approval_requested",
+        ApprovalResolved => "approval_resolved",
         ToolResult => "tool_result",
         FindingSubmitted => "finding_submitted",
         ArtifactCreated => "artifact_created",

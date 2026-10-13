@@ -66,8 +66,10 @@ policy in that configuration.
 The local preset has been smoke-tested with the Qwen3.8 27B HauhauCS IQ3_M
 model through llama-server, including a file write and read-back verification.
 
-By default, tools marked as needing approval return an approval-required
-message to the agent; interactive approval is not yet supported. Use
+By default, tools marked as needing approval prompt in the terminal with the
+tool name, arguments, and risk. Only `y` approves that exact call; all other
+answers deny it. In a noninteractive session the call is denied. Set
+`tools.approval = "ask_all"` in a TOML config to prompt for every tool. Use
 `--approve-all` only for a workspace where the agent may run those tools.
 
 Local state (`.swarm/`, `*.db`) and build output (`target/`) are git-ignored.

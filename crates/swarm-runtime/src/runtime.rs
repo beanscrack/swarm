@@ -29,6 +29,7 @@ use swarm_store::{Store, DEFAULT_LEASE_TTL_MS};
 use swarm_tools::ToolExecutor;
 
 use crate::agent::{AgentOutcome, AgentRunner};
+use crate::approval::ApprovalHandler;
 use crate::error::RuntimeError;
 
 /// Lease-renewal tick: `DEFAULT_LEASE_TTL_MS / 3`, so in-flight leases are
@@ -51,6 +52,7 @@ pub struct Runtime {
     executor: Arc<ToolExecutor>,
     scheduler: Scheduler,
     approval: ApprovalPolicy,
+    approval_handler: Option<Arc<dyn ApprovalHandler>>,
 }
 
 impl Runtime {
@@ -60,12 +62,19 @@ impl Runtime {
         executor: Arc<ToolExecutor>,
         scheduler: Scheduler,
     ) -> Self {
-        Self { store, registry, executor, scheduler, approval: ApprovalPolicy::AskDangerous }
+        Self { store, registry, executor, scheduler, approval: ApprovalPolicy::AskDangerous,
+            approval_handler: None }
     }
 
     /// Sets the tool approval policy used by agents in this runtime.
     pub fn with_approval(mut self, approval: ApprovalPolicy) -> Self {
         self.approval = approval;
+        self
+    }
+
+    /// Supplies an interactive approval handler shared by every agent.
+    pub fn with_approval_handler(mut self, handler: Arc<dyn ApprovalHandler>) -> Self {
+        self.approval_handler = Some(handler);
         self
     }
 
@@ -216,6 +225,7 @@ impl Runtime {
                 let provider_c = provider.clone();
                 let token_c = token.clone();
                 let approval = self.approval;
+                let approval_handler = self.approval_handler.clone();
                 in_flight.spawn(async move {
                     let prov = ProviderId::new(provider_c).expect("provider id");
                     let runner = AgentRunner {
@@ -223,6 +233,7 @@ impl Runtime {
                         registry,
                         executor,
                         approval,
+                        approval_handler,
                     };
                     // Same `Agent` value persisted above, so `update_agent` finds the row.
                     let mut agent = agent;

@@ -39,6 +39,7 @@ use swarm_tools::{ToolCall, ToolExecutor, ToolResult};
 
 use crate::prompt::initial_messages;
 use crate::reply::parse_plan;
+use crate::approval::{ApprovalHandler, ApprovalRequest};
 
 /// How a single agent turn ends.
 #[derive(Debug)]
@@ -56,6 +57,7 @@ pub struct AgentRunner {
     pub registry: Arc<ProviderRegistry>,
     pub executor: Arc<ToolExecutor>,
     pub approval: ApprovalPolicy,
+    pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
 }
 
 /// Tool output fed back to the model is capped this large (8 KiB).
@@ -408,10 +410,39 @@ impl AgentRunner {
         .await?;
 
         let validation = self.executor.validate(name.as_str(), &tc.arguments);
-        let auto = matches!(validation, ToolRequestValidation::AutoApprove { .. });
-        let approved = auto
-            || (matches!(validation, ToolRequestValidation::NeedsApproval { .. })
-                && self.approval == ApprovalPolicy::Never);
+        let approval_risk = match &validation {
+            ToolRequestValidation::AutoApprove { .. } if self.approval == ApprovalPolicy::AskAll => {
+                Some("approval policy asks for every tool".to_string())
+            }
+            ToolRequestValidation::NeedsApproval { risk }
+                if self.approval != ApprovalPolicy::Never => Some(risk.clone()),
+            _ => None,
+        };
+        let mut approval_denial = None;
+        let approved = if matches!(validation, ToolRequestValidation::Deny { .. }) {
+            false
+        } else if let Some(risk) = approval_risk {
+            self.emit(run, agent, task, EventKind::ApprovalRequested,
+                json!({ "call_id": tc.id, "name": name, "risk": risk })).await?;
+            let decision = if let Some(handler) = &self.approval_handler {
+                handler.approve(&ApprovalRequest {
+                    run_id: run.id.clone(), task_id: task.id.clone(), agent_id: agent.id.clone(),
+                    call_id: tc.id.clone(), name: name.clone(),
+                    arguments: tc.arguments.clone(), risk,
+                }).await
+            } else {
+                approval_denial = Some("approval required; no interactive handler is available".to_string());
+                false
+            };
+            if !decision && approval_denial.is_none() {
+                approval_denial = Some("tool call was not approved".to_string());
+            }
+            self.emit(run, agent, task, EventKind::ApprovalResolved,
+                json!({ "call_id": tc.id, "name": name, "approved": decision })).await?;
+            decision
+        } else {
+            true
+        };
 
         let (success, model_output, record) = if approved {
             let call = ToolCall::new(tc.id.clone(), tc.name.clone(), tc.arguments.clone());
@@ -424,9 +455,11 @@ impl AgentRunner {
                     format!("tool call denied: {reason}")
                 }
                 ToolRequestValidation::NeedsApproval { risk } => {
-                    format!("tool `{name}` requires approval: {risk}")
+                    format!("tool `{name}` requires approval: {risk}; {}",
+                        approval_denial.as_deref().unwrap_or("approval was denied"))
                 }
-                _ => unreachable!("reached the unapproved branch"),
+                ToolRequestValidation::AutoApprove { .. } => approval_denial
+                    .unwrap_or_else(|| "tool call was not approved".to_string()),
             };
             let mut denied = ToolResult::failure(reason.clone());
             denied.call_id = tc.id.clone();
@@ -568,11 +601,27 @@ fn cap_for_model(out: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use swarm_core::budget::ResourceBudget;
     use swarm_core::provider::ProviderErrorClass;
     use swarm_core::{AgentRole, TaskId, TaskState};
     use swarm_providers::{coding_script, MockProvider, MockStep, Provider};
     use swarm_tools::SandboxConfig;
+
+    struct StaticApproval {
+        decision: bool,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalHandler for StaticApproval {
+        async fn approve(&self, request: &ApprovalRequest) -> bool {
+            assert!(!request.call_id.is_empty());
+            assert!(request.arguments.is_object());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.decision
+        }
+    }
 
     /// Builds a wired runtime over a tempdir: a store, a mock registry, and a
     /// sandboxed tool executor rooted at `ws`.
@@ -630,6 +679,7 @@ mod tests {
             registry: Arc::new(registry),
             executor: Arc::new(executor),
             approval: ApprovalPolicy::Never,
+            approval_handler: None,
         };
         (runner, run, task, agent, provider, dir)
     }
@@ -784,10 +834,32 @@ mod tests {
             )]),
             MockStep::text("done"),
         ];
-        let (runner, run, task, mut agent, provider, dir) = fixture(script).await;
+        let (mut runner, run, task, mut agent, provider, dir) = fixture(script).await;
+        runner.approval = ApprovalPolicy::AskDangerous;
+        let approval = Arc::new(StaticApproval { decision: true, calls: AtomicUsize::new(0) });
+        runner.approval_handler = Some(approval.clone());
         let outcome = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
         assert!(matches!(outcome, AgentOutcome::Completed { .. }));
         assert!(dir.path().join("ws/marker.txt").exists());
+        assert_eq!(approval.calls.load(Ordering::SeqCst), 1);
+        let events = runner.store.latest_events(&run.id, 100).await.unwrap();
+        assert!(events.iter().any(|event| event.kind == EventKind::ApprovalResolved
+            && event.payload["approved"] == true));
+
+        let script = vec![
+            MockStep::tool_calls(vec![NativeToolCall::new(
+                "c1", "write_file", json!({ "path": "marker.txt", "content": "hello" }),
+            )]),
+            MockStep::text("done"),
+        ];
+        let (mut runner, run, task, mut agent, provider, dir) = fixture(script).await;
+        runner.approval = ApprovalPolicy::AskAll;
+        let approval = Arc::new(StaticApproval { decision: false, calls: AtomicUsize::new(0) });
+        runner.approval_handler = Some(approval.clone());
+        let outcome = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }));
+        assert!(!dir.path().join("ws/marker.txt").exists());
+        assert_eq!(approval.calls.load(Ordering::SeqCst), 1);
     }
 
     // (e) Crash-and-restart: resume from a persisted checkpoint and build on
