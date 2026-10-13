@@ -6,12 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use swarm_core::budget::BillingMode;
 use swarm_core::config::{ProviderConfig, RunConfig};
 use swarm_core::provider::ProviderKind;
 use swarm_core::ProviderId;
-use swarm_providers::{MockProvider, OpenAiConfig, OpenAiProvider, Provider, ProviderRegistry};
+use swarm_providers::{ManagedAgentConfig, ManagedAgentProvider, MockProvider, OpenAiConfig, OpenAiProvider, Provider, ProviderRegistry};
 use swarm_scheduler::SchedulerConfig;
 
 use crate::error::RuntimeError;
@@ -34,15 +35,18 @@ pub fn build_registry(cfg: &RunConfig) -> Result<ProviderRegistry, RuntimeError>
 }
 
 /// Maps a run's provider/scheduler settings onto the scheduler's config.
-pub fn scheduler_config(cfg: &RunConfig, _registry: &ProviderRegistry) -> SchedulerConfig {
+pub fn scheduler_config(cfg: &RunConfig, registry: &ProviderRegistry) -> SchedulerConfig {
     let mut provider_limits = BTreeMap::new();
     for pc in &cfg.providers {
         if !cfg.may_run(pc) {
             continue;
         }
-        let limit = pc
+        let requested = pc
             .max_concurrency
             .unwrap_or(cfg.scheduler.default_provider_concurrency) as usize;
+        let limit = registry.find(&pc.name)
+            .and_then(|provider| provider.capabilities().max_concurrency)
+            .map_or(requested, |cap| requested.min(cap as usize));
         provider_limits.insert(pc.name.as_str().to_string(), limit);
     }
     SchedulerConfig {
@@ -65,6 +69,8 @@ pub fn local_provider_config() -> ProviderConfig {
         max_output_tokens: 8192,
         temperature: Some(0.0),
         workspace_dir: None,
+        command: Vec::new(),
+        timeout_secs: None,
         extra_args: Vec::new(),
         zero_cost: true,
         billing: BillingMode::ZeroCost,
@@ -93,10 +99,23 @@ fn provider_for(pc: &ProviderConfig) -> Result<Arc<dyn Provider>, RuntimeError> 
             let provider: Arc<dyn Provider> = Arc::new(OpenAiProvider::new(pc.name.clone(), oai)?);
             Ok(provider)
         }
-        ProviderKind::ManagedAgent => Err(RuntimeError::Unsupported(format!(
-            "managed-agent providers are not yet supported by the runtime: {}",
-            pc.name.as_str()
-        ))),
+        ProviderKind::ManagedAgent => {
+            if pc.command.is_empty() {
+                return Err(RuntimeError::Config(format!(
+                    "managed-agent provider '{}' needs a command", pc.name,
+                )));
+            }
+            let workdir = pc.workspace_dir.clone().ok_or_else(|| RuntimeError::Config(format!(
+                "managed-agent provider '{}' needs a workspace_dir", pc.name,
+            )))?;
+            let mut command = pc.command.clone();
+            command.extend(pc.extra_args.iter().cloned());
+            let config = ManagedAgentConfig::new(&pc.model, command, workdir)
+                .billing(pc.billing)
+                .timeout(Duration::from_secs(pc.timeout_secs.unwrap_or(600).max(1)));
+            let provider: Arc<dyn Provider> = Arc::new(ManagedAgentProvider::new(pc.name.clone(), config)?);
+            Ok(provider)
+        }
     }
 }
 
@@ -140,5 +159,21 @@ mod tests {
             s.default_provider_limit,
             cfg.scheduler.default_provider_concurrency as usize
         );
+    }
+
+    #[test]
+    fn managed_provider_builds_from_command_and_workspace() {
+        let mut cfg = RunConfig::mock("goal", 1);
+        let mut provider = ProviderConfig::mock("managed", "local-agent");
+        provider.kind = ProviderKind::ManagedAgent;
+        provider.command = vec!["agent-program".into(), "{prompt}".into()];
+        provider.workspace_dir = Some(std::env::temp_dir());
+        cfg.provider = provider.name.clone();
+        cfg.providers = vec![provider];
+        let registry = build_registry(&cfg).unwrap();
+        let managed = registry.find(&cfg.provider).unwrap();
+        assert_eq!(managed.kind(), ProviderKind::ManagedAgent);
+        let scheduler = scheduler_config(&cfg, &registry);
+        assert_eq!(scheduler.provider_limits.get("managed"), Some(&1));
     }
 }

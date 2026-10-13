@@ -35,6 +35,13 @@ pub struct ProviderConfig {
     pub max_output_tokens: u32,
     pub temperature: Option<f32>,
     pub workspace_dir: Option<PathBuf>,
+    /// Managed-agent executable and arguments; use `{prompt}` in an argument
+    /// to pass the task there, otherwise the prompt is sent on stdin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Whole-process timeout for a managed agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     pub extra_args: Vec<String>,
     /// Zero-cost providers never trigger a paid request by default.
     pub zero_cost: bool,
@@ -55,6 +62,8 @@ impl ProviderConfig {
             max_output_tokens: 2048,
             temperature: Some(0.2),
             workspace_dir: None,
+            command: Vec::new(),
+            timeout_secs: None,
             extra_args: Vec::new(),
             zero_cost: true,
             billing: BillingMode::ZeroCost,
@@ -74,6 +83,8 @@ impl ProviderConfig {
             max_output_tokens: 4096,
             temperature: Some(0.2),
             workspace_dir: None,
+            command: Vec::new(),
+            timeout_secs: None,
             extra_args: Vec::new(),
             zero_cost: false,
             billing: BillingMode::OnDemand,

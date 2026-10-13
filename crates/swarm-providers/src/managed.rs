@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt;
 
 use swarm_core::budget::{BillingMode, TokenUsage};
 use swarm_core::provider::{ProviderCapabilities, ProviderKind};
@@ -147,8 +148,11 @@ impl Session for ManagedAgentSession {
         &self.session_id
     }
 
-    async fn stream(&self, _request: &SendRequest) -> Result<ProviderStream> {
-        let output = self.run().await?;
+    async fn stream(&self, request: &SendRequest) -> Result<ProviderStream> {
+        let prompt = request.messages.iter()
+            .map(|message| format!("{}:\n{}", message.role.as_str(), message.content))
+            .collect::<Vec<_>>().join("\n\n");
+        let output = self.run(&prompt).await?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -159,6 +163,11 @@ impl Session for ManagedAgentSession {
                 self.config.name,
                 code,
                 truncate_at(&stderr, 2048)
+            )));
+        }
+        if stdout.trim().is_empty() {
+            return Err(ProviderError::Process(format!(
+                "agent `{}` returned no output", self.config.name,
             )));
         }
         let chunks = build_chunks(
@@ -173,9 +182,11 @@ impl Session for ManagedAgentSession {
 
 impl ManagedAgentSession {
     /// Run the managed-agent process to completion (or timeout).
-    async fn run(&self) -> Result<std::process::Output> {
+    async fn run(&self, prompt: &str) -> Result<std::process::Output> {
         let mut cmd = tokio::process::Command::new(&self.config.command[0]);
-        cmd.args(&self.config.command[1..]);
+        let prompt_in_args = self.config.command[1..].iter().any(|arg| arg.contains("{prompt}"));
+        cmd.args(self.config.command[1..].iter()
+            .map(|arg| arg.replace("{prompt}", prompt)));
         cmd.current_dir(&self.config.workdir);
         for (k, v) in &self.config.env {
             cmd.env(k, v);
@@ -184,15 +195,23 @@ impl ManagedAgentSession {
         // `wait_with_output` would return empty buffers unless we pipe them.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(if prompt_in_args { std::process::Stdio::null() }
+            else { std::process::Stdio::piped() });
         cmd.kill_on_drop(true);
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| ProviderError::Process(format!("spawn `{}`: {e}", self.config.name)))?;
-        let output = tokio::time::timeout(self.config.timeout, child.wait_with_output())
+        let process = async {
+            let mut child = cmd.spawn()
+                .map_err(|e| ProviderError::Process(format!("spawn `{}`: {e}", self.config.name)))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(prompt.as_bytes()).await
+                    .map_err(|e| ProviderError::Process(format!("send prompt to `{}`: {e}", self.config.name)))?;
+            }
+            child.wait_with_output().await
+                .map_err(|e| ProviderError::Process(format!("wait `{}`: {e}", self.config.name)))
+        };
+        let output = tokio::time::timeout(self.config.timeout, process)
             .await
-            .map_err(|_| ProviderError::Timeout(self.config.timeout))?
-            .map_err(|e| ProviderError::Process(format!("wait `{}`: {e}", self.config.name)))?;
+            .map_err(|_| ProviderError::Timeout(self.config.timeout))??;
         Ok(output)
     }
 }
@@ -222,6 +241,21 @@ mod tests {
         assert!(resp.text.contains("hello-from-agent"), "got: {}", resp.text);
         // Usage reported as zero (managed agents don't report tokens).
         assert_eq!(resp.usage.input_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn sends_task_prompt_to_managed_process_stdin() {
+        let command = if cfg!(windows) {
+            vec!["cmd".into(), "/C".into(), "more".into()]
+        } else {
+            vec!["cat".into()]
+        };
+        let cfg = cfg_for("stdin-agent", command);
+        let provider = ManagedAgentProvider::new(ProviderId::new("managed-test").unwrap(), cfg).unwrap();
+        let session = provider.start_session(SessionConfig::default()).await.unwrap();
+        let request = SendRequest::new(vec![swarm_core::message::ChatMessage::user("managed-prompt-token")]);
+        let response = session.send(request).await.unwrap();
+        assert!(response.text.contains("managed-prompt-token"), "{}", response.text);
     }
 
     #[tokio::test]

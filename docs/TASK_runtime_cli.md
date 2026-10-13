@@ -11,6 +11,9 @@
 > concurrently with creation and caused redundant tool calls. Plan steps now
 > support explicit dependencies on earlier steps; whether the model declares
 > every necessary dependency remains a planner-quality concern.
+> Subsequent work added a read-only TUI, terminal tool approvals, and the
+> managed-agent provider path. The original step scope below is retained as
+> the implementation record for the CLI milestone.
 
 Goal: `swarm run "<goal>" --provider mock` creates a run, executes agents through the scheduler, tools and
 store, and exits 0 with a persisted, inspectable result. Then the same with `--provider local`

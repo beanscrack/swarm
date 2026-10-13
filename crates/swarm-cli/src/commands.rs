@@ -148,6 +148,11 @@ fn run_config(args: &RunArgs) -> Result<RunConfig> {
         .position(|p| p.name == cfg.provider)
         .ok_or_else(|| anyhow!("provider '{}' is not configured", cfg.provider))?;
     let selected = &mut cfg.providers[selected_index];
+    if selected.kind == swarm_core::provider::ProviderKind::ManagedAgent
+        && selected.workspace_dir.is_none()
+    {
+        selected.workspace_dir = Some(args.workspace.clone());
+    }
     if let Some(model) = &args.model {
         selected.model = model.clone();
         cfg.model = model.clone();
@@ -174,15 +179,21 @@ fn run_config(args: &RunArgs) -> Result<RunConfig> {
 
 async fn run(args: RunArgs) -> Result<CommandOutcome> {
     let cfg = run_config(&args)?;
-    std::fs::create_dir_all(&args.workspace)
-        .with_context(|| format!("create workspace {}", args.workspace.display()))?;
+    let selected = cfg.providers.iter().find(|provider| provider.name == cfg.provider).unwrap();
+    let workspace = if selected.kind == swarm_core::provider::ProviderKind::ManagedAgent {
+        selected.workspace_dir.as_ref().unwrap_or(&args.workspace)
+    } else {
+        &args.workspace
+    };
+    std::fs::create_dir_all(workspace)
+        .with_context(|| format!("create workspace {}", workspace.display()))?;
     let store = Arc::new(Store::open(&args.store.store).await?);
     let registry = Arc::new(build_registry(&cfg)?);
     if registry.find(&cfg.provider).is_none() {
         bail!("provider '{}' could not be started", cfg.provider);
     }
     let scheduler = Scheduler::new(scheduler_config(&cfg, &registry));
-    let sandbox = SandboxConfig::new(&args.workspace)
+    let sandbox = SandboxConfig::new(workspace)
         .command_timeout(Duration::from_secs(cfg.tools.command_timeout_secs))
         .output_cap_bytes(cfg.tools.max_output_bytes)
         .allow_network(cfg.tools.allow_network);
@@ -505,5 +516,34 @@ mod tests {
             "swarm", "status", run.id.as_str(), "--store", store_path.to_str().unwrap(),
         ]).unwrap()).await.unwrap();
         assert!(status.text.contains("result    [mock:overridden-mock]"));
+    }
+
+    #[tokio::test]
+    async fn managed_provider_runs_from_toml_config() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("swarm.toml");
+        let mut config = RunConfig::mock("managed-prompt-token", 1);
+        let mut provider = swarm_core::config::ProviderConfig::mock("managed", "stdin-agent");
+        provider.kind = swarm_core::provider::ProviderKind::ManagedAgent;
+        provider.command = if cfg!(windows) {
+            vec!["cmd".into(), "/C".into(), "more".into()]
+        } else {
+            vec!["cat".into()]
+        };
+        config.provider = provider.name.clone();
+        config.providers = vec![provider];
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let store_path = temp.path().join("store");
+        let workspace = temp.path().join("work");
+        let result = execute(Cli::try_parse_from([
+            "swarm", "run", "managed-prompt-token", "--provider", "managed",
+            "--config", config_path.to_str().unwrap(), "--store", store_path.to_str().unwrap(),
+            "--workspace", workspace.to_str().unwrap(),
+        ]).unwrap()).await.unwrap();
+        assert!(result.success, "{}", result.text);
+        let status = execute(Cli::try_parse_from([
+            "swarm", "status", "--store", store_path.to_str().unwrap(),
+        ]).unwrap()).await.unwrap();
+        assert!(status.text.contains("managed-prompt-token"));
     }
 }

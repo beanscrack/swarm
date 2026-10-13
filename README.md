@@ -63,6 +63,16 @@ Use `--model` and `--base-url` to override its defaults. A named provider
 other than `mock` or `local` must be defined in a TOML file passed with
 `--config`. Runs using paid providers must explicitly disable the zero-cost
 policy in that configuration.
+For a managed-agent provider, set `kind = "managed_agent"`, a `command` array,
+and optionally `workspace_dir` and `timeout_secs` in its provider entry.
+The CLI uses `--workspace` when `workspace_dir` is omitted. Swarm sends the
+task prompt to the process on stdin, or replaces `{prompt}` in a command
+argument. The external agent runs its own tools; Swarm captures stdout as its
+result. Managed agents that do not report token usage show zero tokens.
+To generate a complete transport test config, run
+`cargo run -q -p swarm-cli --example managed_echo_config > swarm.toml`.
+That example only echoes the prompt; replace its `command` with your agent CLI
+before using it for actual work.
 The local preset has been smoke-tested with the Qwen3.8 27B HauhauCS IQ3_M
 model through llama-server, including a file write and read-back verification.
 
