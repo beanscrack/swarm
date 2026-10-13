@@ -3,7 +3,7 @@
 A Rust workspace for orchestrating swarms of LLM agents: scheduling tasks, tracking budgets and usage, and persisting runs, events, findings, and artifacts.
 
 > Status: early development. The CLI runs goals end to end and can decompose
-> multi-agent runs. A terminal UI is still planned.
+> multi-agent runs. A read-only terminal dashboard shows live run state.
 
 ## Crates
 
@@ -37,11 +37,16 @@ cargo run -p swarm-cli -- status
 cargo run -p swarm-cli -- tasks
 cargo run -p swarm-cli -- agents
 cargo run -p swarm-cli -- logs
+cargo run -p swarm-cli -- tui
 ```
 
 `run` writes to `.swarm/` by default and gives agents a `./work` workspace.
 Use `--store DIR` on every command to choose another store. Inspection
 commands accept an optional run ID; otherwise they show the latest run.
+`tui` requires an interactive terminal, refreshes twice per second, and shows
+run usage, tasks, agents, and recent events. Press Tab or the arrow keys to
+switch runs, `r` to refresh, and `q` to quit. Pass a run ID to keep it focused
+on one run.
 Pass `--agents N` with `N > 1` to have one planner create up to `N - 1`
 worker tasks. The planner can declare dependencies between tasks so a worker
 waits for prerequisite work to finish. The mock provider simulates their

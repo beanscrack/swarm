@@ -36,6 +36,8 @@ enum Command {
     Agents(InspectArgs),
     /// Show recent events, optionally following new ones.
     Logs(LogsArgs),
+    /// Open a live dashboard for runs, tasks, agents, and events.
+    Tui(InspectArgs),
 }
 
 #[derive(Debug, Args)]
@@ -103,6 +105,10 @@ pub async fn execute(cli: Cli) -> Result<CommandOutcome> {
         Command::Tasks(args) => tasks(args).await,
         Command::Agents(args) => agents(args).await,
         Command::Logs(args) => logs(args).await,
+        Command::Tui(args) => {
+            crate::tui::run(args.store.store, args.run_id).await?;
+            Ok(CommandOutcome::success(String::new()))
+        }
     }
 }
 
