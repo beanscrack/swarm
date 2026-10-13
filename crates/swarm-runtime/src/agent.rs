@@ -370,7 +370,9 @@ impl AgentRunner {
                         return Err(last.unwrap());
                     }
                     if attempt < MAX_RETRIES {
-                        let delay_ms = (500u64 * 2u64.pow(attempt)).min(30_000);
+                        let delay_ms = class.retry_after_ms()
+                            .unwrap_or(500u64 * 2u64.pow(attempt))
+                            .min(30_000);
                         sleep(Duration::from_millis(delay_ms)).await;
                     }
                 }

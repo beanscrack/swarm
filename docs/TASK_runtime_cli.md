@@ -2,9 +2,14 @@
 
 > Implementation status (2026-10-13): steps 0a through 6 are implemented and
 > covered by workspace tests, including the optional planner decomposition.
-> The HTTP path for the local preset is tested against an OpenAI-compatible
-> server fixture. The manual llama-server smoke test below still needs a
-> running local model.
+> The local preset passed both an HTTP fixture test and the manual llama-server
+> smoke test below. The real Qwen model created `hello.txt` containing `hello`
+> and verified it with a read; the persisted run completed after three
+> inferences and two successful tool calls. A second real-model run completed
+> a three-task plan and produced verified `alpha.txt` and `beta.txt` files.
+> In that run the planner made verification a separate task, which ran
+> concurrently with creation and caused redundant tool calls; plan-step
+> dependencies remain a quality improvement for multi-agent work.
 
 Goal: `swarm run "<goal>" --provider mock` creates a run, executes agents through the scheduler, tools and
 store, and exits 0 with a persisted, inspectable result. Then the same with `--provider local`

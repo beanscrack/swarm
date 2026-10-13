@@ -470,4 +470,29 @@ mod tests {
                 .contains("not configured")
         );
     }
+
+    #[tokio::test]
+    async fn toml_config_and_cli_overrides_run_end_to_end() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("swarm.toml");
+        let config = RunConfig::mock("objective from file", 1);
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let store_path = temp.path().join("store");
+        let workspace = temp.path().join("work");
+        let cli = Cli::try_parse_from([
+            "swarm", "run", "objective from cli", "--config", config_path.to_str().unwrap(),
+            "--model", "overridden-mock", "--approve-all", "--store", store_path.to_str().unwrap(),
+            "--workspace", workspace.to_str().unwrap(),
+        ]).unwrap();
+        let result = execute(cli).await.unwrap();
+        assert!(result.success, "{}", result.text);
+        let store = Store::open(&store_path).await.unwrap();
+        let run = select_run(&store, None).await.unwrap();
+        assert_eq!(run.objective, "objective from cli");
+        assert_eq!(run.model.as_deref(), Some("overridden-mock"));
+        let status = execute(Cli::try_parse_from([
+            "swarm", "status", run.id.as_str(), "--store", store_path.to_str().unwrap(),
+        ]).unwrap()).await.unwrap();
+        assert!(status.text.contains("result    [mock:overridden-mock]"));
+    }
 }

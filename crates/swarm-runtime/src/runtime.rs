@@ -22,7 +22,7 @@ use swarm_core::config::{ApprovalPolicy, RunConfig};
 use swarm_core::event::{EventKind, RunEvent};
 use swarm_core::run::{Run, RunMode};
 use swarm_core::task::Task;
-use swarm_core::{AgentRole, CoreError, ProviderId, RunId, RunStatus, TaskId, TaskState};
+use swarm_core::{AgentRole, AgentState, CoreError, ProviderId, RunId, RunStatus, StateMachine, TaskId, TaskState};
 use swarm_providers::ProviderRegistry;
 use swarm_scheduler::{Occupancy, SchedulableTask, Scheduler};
 use swarm_store::{Store, DEFAULT_LEASE_TTL_MS};
@@ -131,7 +131,35 @@ impl Runtime {
             let budget = &run.budget;
 
             // (6) Wall-clock budget.
-            if now - run.created_at > budget.max_wall_clock_secs as i64 * 1000 {
+            let wall_ms = budget.max_wall_clock_secs.saturating_mul(1000).min(i64::MAX as u64) as i64;
+            let deadline = run.created_at.saturating_add(wall_ms);
+            if now >= deadline {
+                in_flight.abort_all();
+                while in_flight.join_next().await.is_some() {}
+                for task in self.store.list_tasks(run_id).await? {
+                    if task.state.is_terminal() {
+                        continue;
+                    }
+                    if let Some((_, token)) = lease_tokens.iter().find(|(id, _)| id == &task.id) {
+                        self.store.fail_task(&task.id, token, now, false).await?;
+                    } else {
+                        self.store.set_task_state(&task.id, TaskState::Failed, now).await?;
+                    }
+                    self.emit_task(run_id, &task.id, TaskState::Failed).await?;
+                }
+                for mut agent in self.store.agents_for_run(run_id).await? {
+                    if agent.state.is_terminal() {
+                        continue;
+                    }
+                    let from = agent.state;
+                    agent.transition(AgentState::Failed, now)?;
+                    self.store.update_agent(&agent).await?;
+                    self.store.append_event(&RunEvent::new(
+                        EventKind::AgentStateChanged,
+                        run_id.clone(),
+                        json!({ "from": from.as_str(), "to": "failed", "reason": "wall-clock budget exceeded" }),
+                    ).with_agent(agent.id).with_task(agent.task_id)).await?;
+                }
                 return self.finalize(run_id, RunStatus::Failed).await;
             }
 
@@ -214,9 +242,10 @@ impl Runtime {
             }
 
             // (5) Wait for the next finished agent or a renewal tick.
+            let wait_ms = (deadline - now_ms()).clamp(1, RENEW_TICK_MS) as u64;
             let woke = tokio::select! {
                 r = in_flight.join_next() => r,
-                _ = tokio::time::sleep(Duration::from_millis(RENEW_TICK_MS as u64)) => None,
+                _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => None,
             };
             match woke {
                 Some(Ok((task_id, token, outcome))) => {
@@ -392,10 +421,19 @@ mod tests {
         script: Vec<MockStep>,
         provider_limit: usize,
     ) -> (TempDir, Arc<Store>, Arc<Runtime>, Run) {
+        setup_with_latency(script, provider_limit, Duration::ZERO).await
+    }
+
+    async fn setup_with_latency(
+        script: Vec<MockStep>,
+        provider_limit: usize,
+        latency: Duration,
+    ) -> (TempDir, Arc<Store>, Arc<Runtime>, Run) {
         let dir = TempDir::new().unwrap();
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
-        let mock = MockProvider::unowned().with_script(script);
+        let mut mock = MockProvider::unowned().with_script(script);
+        mock.latency = latency;
         let mut registry = ProviderRegistry::new();
         let provider_entry: Arc<dyn Provider> = Arc::new(mock);
         registry.register(provider_entry);
@@ -491,5 +529,22 @@ mod tests {
         let status = rt.drive(&run.id).await.unwrap();
         assert!(matches!(status, RunStatus::Completed), "expected Completed");
         assert!(dir.path().join("ws/hello.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn wall_clock_budget_stops_inference_and_finalizes_tasks() {
+        let (_dir, store, rt, run) = setup_with_latency(
+            vec![MockStep::text("too late")], 1, Duration::from_secs(2),
+        ).await;
+        let mut limited = run.clone();
+        limited.budget.max_wall_clock_secs = 1;
+        store.update_run(&limited).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(3), rt.drive(&run.id))
+            .await.unwrap().unwrap();
+        assert_eq!(status, RunStatus::Failed);
+        assert!(store.list_tasks(&run.id).await.unwrap().iter()
+            .all(|task| task.state == TaskState::Failed));
+        assert!(store.agents_for_run(&run.id).await.unwrap().iter()
+            .all(|agent| agent.state == AgentState::Failed));
     }
 }

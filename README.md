@@ -57,6 +57,8 @@ Use `--model` and `--base-url` to override its defaults. A named provider
 other than `mock` or `local` must be defined in a TOML file passed with
 `--config`. Runs using paid providers must explicitly disable the zero-cost
 policy in that configuration.
+The local preset has been smoke-tested with the Qwen3.8 27B HauhauCS IQ3_M
+model through llama-server, including a file write and read-back verification.
 
 By default, tools marked as needing approval return an approval-required
 message to the agent; interactive approval is not yet supported. Use
