@@ -1,9 +1,10 @@
-# Swarm API summary (what `swarm-runtime` and `swarm-cli` may call)
+# Historical Swarm API summary
 
-Snapshot of the public surface at commit `e22fbd1` ("turn 2/20"), verified against the source.
-**Use this instead of reading the crates.** If something you need is not listed, run
-`grep -n "pub fn NAME" -A6 crates/<crate>/src/<file>.rs` rather than reading the whole file.
-Everything below compiles and is covered by tests (107 passing).
+This records the public surface at commit `e22fbd1` ("turn 2/20"). It is not
+the current API: later work implemented the runtime, CLI, provider factory,
+tool reply handling, managed-agent provider, and Gemini web provider. Consult
+the current source for implementation details. The snapshot below is retained
+only as an implementation record.
 
 Crate dependency order: `core` <- `store`, `providers`, `scheduler`, `tools` <- `runtime` <- `cli`.
 

@@ -44,6 +44,8 @@ pub enum FinishReason {
     ToolCalls,
     /// Cut off by the token budget.
     Length,
+    /// A text-protocol tool request needs a format correction.
+    MalformedTool,
     /// Something else the provider reported.
     Other,
 }
@@ -54,6 +56,7 @@ impl FinishReason {
             Self::Stop => "stop",
             Self::ToolCalls => "tool_calls",
             Self::Length => "length",
+            Self::MalformedTool => "malformed_tool",
             Self::Other => "other",
         }
     }
@@ -64,6 +67,7 @@ impl FinishReason {
             "stop" | "completed" => Self::Stop,
             "tool_calls" | "function_call" => Self::ToolCalls,
             "length" | "max_tokens" => Self::Length,
+            "malformed_tool" => Self::MalformedTool,
             _ => Self::Other,
         }
     }

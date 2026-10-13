@@ -11,7 +11,7 @@ A Rust workspace for orchestrating swarms of LLM agents: scheduling tasks, track
 | --- | --- |
 | `swarm-core` | Shared types: ids, agents, tasks, runs, events, messages, budgets, config, provider/tool traits |
 | `swarm-store` | SQLite persistence (sqlx) with migrations for runs, tasks, agents, events, artifacts, findings, hypotheses, usage |
-| `swarm-providers` | LLM provider abstraction, OpenAI client, mock provider, pricing, quota, registry |
+| `swarm-providers` | LLM provider abstraction, OpenAI client, Gemini web bridge client, mock provider, pricing, quota, registry |
 | `swarm-scheduler` | Task scheduling |
 | `swarm-tools` | Tool implementations available to agents |
 | `swarm-runtime` | Agent runtime tying scheduler, providers, tools, and store together |
@@ -58,11 +58,29 @@ To use a running OpenAI-compatible llama-server on `127.0.0.1:8080`:
 cargo run -p swarm-cli -- run "create hello.txt containing hello and verify it" --provider local --approve-all
 ```
 
+On this workstation, the Qwen server can be started with
+`C:\Users\fortn\llama.cpp\start-qwen38-27b.ps1`. Its declared alias is
+`qwen3.8-27b-hauhau`, matching the `local` preset.
+
 The `local` preset uses one concurrent request and a 600-second HTTP timeout.
 Use `--model` and `--base-url` to override its defaults. A named provider
-other than `mock` or `local` must be defined in a TOML file passed with
+other than `mock`, `local`, or `gemini-web` must be defined in a TOML file passed with
 `--config`. Runs using paid providers must explicitly disable the zero-cost
 policy in that configuration.
+
+To use Gemini web chat as Swarm's reasoning model, start the local Chrome
+bridge with an account that can select 4 Argon. Then run:
+
+```sh
+cargo run -p swarm-cli -- run "create hello.txt and verify it" --provider gemini-web --agents 3
+```
+
+The `gemini-web` preset selects `4 Argon`. It requires an account that can use
+that model. The bridge gives every Swarm agent a separate chat tab and allows
+concurrent sessions. Setup, account requirements, limitations, and multi-profile
+configuration are in [Gemini web bridge](docs/GEMINI_WEB.md). A live Argon run
+has not been verified on this machine because the available account requested
+an upgrade.
 For a managed-agent provider, set `kind = "managed_agent"`, a `command` array,
 and optionally `workspace_dir` and `timeout_secs` in its provider entry.
 The CLI uses `--workspace` when `workspace_dir` is omitted. Swarm sends the

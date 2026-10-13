@@ -14,6 +14,7 @@
 //!   Swarm manages the process, workspace, and captured output only.
 
 pub mod error;
+pub mod gemini_web;
 pub mod managed;
 pub mod mock;
 pub mod openai;
@@ -24,6 +25,7 @@ pub mod registry;
 
 // Convenience re-exports.
 pub use error::ProviderError;
+pub use gemini_web::{GeminiWebConfig, GeminiWebProvider};
 pub use managed::{ManagedAgentConfig, ManagedAgentProvider};
 pub use mock::{coding_script, MockProvider, MockStep};
 pub use openai::{OpenAiConfig, OpenAiProvider};

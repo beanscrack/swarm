@@ -129,14 +129,14 @@ fn run_config(args: &RunArgs) -> Result<RunConfig> {
     }
 
     if let Some(name) = &args.provider {
-        if name == "local" {
-            let local = local_provider_config();
-            cfg.provider = local.name.clone();
-            cfg.model = local.model.clone();
-            cfg.providers.retain(|p| p.name != local.name);
-            cfg.providers.push(local);
-            cfg.zero_cost = true;
-            cfg.scheduler.zero_cost = true;
+        if name == "local" || name == "gemini-web" {
+            let selected = if name == "local" { local_provider_config() } else { swarm_runtime::gemini_web_provider_config() };
+            cfg.provider = selected.name.clone();
+            cfg.model = selected.model.clone();
+            cfg.providers.retain(|p| p.name != selected.name);
+            cfg.zero_cost = selected.zero_cost;
+            cfg.scheduler.zero_cost = selected.zero_cost;
+            cfg.providers.push(selected);
         } else {
             cfg.provider = ProviderId::new(name.clone())?;
         }
@@ -160,8 +160,8 @@ fn run_config(args: &RunArgs) -> Result<RunConfig> {
         cfg.model = selected.model.clone();
     }
     if let Some(url) = &args.base_url {
-        if selected.kind != swarm_core::provider::ProviderKind::OpenAiCompatible {
-            bail!("--base-url requires an OpenAI-compatible provider");
+        if !matches!(selected.kind, swarm_core::provider::ProviderKind::OpenAiCompatible | swarm_core::provider::ProviderKind::GeminiWeb) {
+            bail!("--base-url requires an OpenAI-compatible or Gemini web provider");
         }
         selected.base_url = Some(url.clone());
     }
@@ -209,10 +209,18 @@ async fn run(args: RunArgs) -> Result<CommandOutcome> {
     let state = runtime.drive(&created.id).await?;
     let task_count = store.finished_task_count(&created.id).await?;
     let tokens = store.load_stats(&created.id).await?.usage.total_tokens();
+    let failure = if state == RunStatus::Failed {
+        store.latest_events(&created.id, 100).await?.into_iter()
+            .rev()
+            .find_map(|event| event.payload.get("error").and_then(|value| value.as_str()).map(str::to_owned))
+    } else {
+        None
+    };
+    let suffix = failure.map(|message| format!("\nreason: {message}")).unwrap_or_default();
     Ok(CommandOutcome {
         text: format!(
-            "run {} {}: {} tasks, {} tokens",
-            created.id, state, task_count, tokens
+            "run {} {}: {} tasks, {} tokens{}",
+            created.id, state, task_count, tokens, suffix
         ),
         success: state == RunStatus::Completed,
     })

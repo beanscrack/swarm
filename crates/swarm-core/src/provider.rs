@@ -16,6 +16,7 @@ string_enum! {
         Mock => "mock",
         OpenAiCompatible => "open_ai_compatible",
         ManagedAgent => "managed_agent",
+        GeminiWeb => "gemini_web",
     }
 }
 

@@ -362,7 +362,7 @@ impl Runtime {
                     json!({ "summary": summary }),
                 ).with_task(task_id)).await?;
             }
-            AgentOutcome::Failed { reason: _, retryable } => {
+            AgentOutcome::Failed { reason, retryable } => {
                 let task = self.store.load_task(&task_id).await?;
                 let attempts = task.as_ref().map(|t| t.attempts).unwrap_or(0);
                 let retry = retryable && attempts < run.budget.max_task_attempts;
@@ -373,6 +373,11 @@ impl Runtime {
                     TaskState::Failed
                 };
                 self.emit_task(&run.id, &task_id, state).await?;
+                self.store.append_event(&RunEvent::new(
+                    EventKind::Message,
+                    run.id.clone(),
+                    json!({ "error": reason, "retryable": retry }),
+                ).with_task(task_id)).await?;
             }
         }
         Ok(())

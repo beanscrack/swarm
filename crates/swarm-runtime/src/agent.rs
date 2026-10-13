@@ -31,7 +31,7 @@ use swarm_core::tool::ToolRequestValidation;
 use swarm_core::protocol::AgentPlan;
 use swarm_core::{AgentRole, ProviderId, StateMachine, TaskId, TaskState};
 use swarm_providers::{
-    FinishReason, InferenceResponse, NativeToolCall, ProviderError, ProviderRegistry,
+    FinishReason, InferenceResponse, NativeToolCall, Provider, ProviderError, ProviderRegistry,
     SendRequest, Session, SessionConfig, ToolProtocol,
 };
 use swarm_store::Store;
@@ -86,7 +86,7 @@ impl AgentRunner {
 
         // Resume from a durable checkpoint if one exists; otherwise seed the
         // conversation with the run/task prompts.
-        let mut cp = match self.store.load_checkpoint(&agent.id).await? {
+        let cp = match self.store.load_checkpoint(&agent.id).await? {
             Some(existing) => existing,
             None => fresh_checkpoint(run, task),
         };
@@ -126,11 +126,34 @@ impl AgentRunner {
                 .await;
         }
         let key = provider_entry.id().as_str().to_string();
+        let tool_protocol = if provider_entry.capabilities().tools {
+            ToolProtocol::Native
+        } else {
+            ToolProtocol::Text
+        };
         let mut session: Box<dyn Session> = provider_entry
             .start_session(SessionConfig::default())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+        let result = self.run_session(run, task, agent, provider_entry.as_ref(), &key,
+            tool_protocol, &mut session, cp, now).await;
+        let _ = session.close().await;
+        result
+    }
+
+    async fn run_session(
+        &self,
+        run: &Run,
+        task: &Task,
+        agent: &mut Agent,
+        provider_entry: &dyn Provider,
+        key: &str,
+        tool_protocol: ToolProtocol,
+        session: &mut Box<dyn Session>,
+        mut cp: AgentCheckpoint,
+        now: i64,
+    ) -> anyhow::Result<AgentOutcome> {
         loop {
             // Budget + quota gates, checked before spending an inference.
             let stats = self.store.load_stats(&run.id).await?;
@@ -166,7 +189,7 @@ impl AgentRunner {
             .await?;
             let started = Instant::now();
             let resp = match self
-                .infer(&mut session, &key, run, agent, task, &cp.messages)
+                .infer(session, key, run, agent, task, &cp.messages, tool_protocol)
                 .await
             {
                 Ok(r) => r,
@@ -210,7 +233,19 @@ impl AgentRunner {
 
             // Append the assistant reply and branch on whether it asked for tools.
             if resp.tool_calls.is_empty() {
-                if resp.finish_reason == FinishReason::Length {
+                if resp.finish_reason == FinishReason::MalformedTool {
+                    cp.format_retries += 1;
+                    if cp.format_retries > run.budget.max_format_retries {
+                        return self.finish_failed(run, agent, task,
+                            "Gemini did not provide a valid tool request after format retries".to_string(), false).await;
+                    }
+                    cp.messages.push(ChatMessage::assistant(resp.text.clone()));
+                    cp.messages.push(ChatMessage::user(
+                        "Your last tool request was malformed and no tool ran. Reply with only one fenced ```swarm JSON block: {\"tool\":{\"name\":\"exact_tool_name\",\"arguments\":{\"required_field\":\"value\"}}}. The arguments field must be a JSON object matching the selected tool schema."
+                    ));
+                    self.save(run, agent, task, &cp, now).await?;
+                    continue;
+                } else if resp.finish_reason == FinishReason::Length {
                     cp.messages.push(ChatMessage::assistant(resp.text.clone()));
                     cp.messages.push(ChatMessage::user("Continue."));
                     cp.format_retries += 1;
@@ -344,12 +379,13 @@ impl AgentRunner {
         agent: &Agent,
         task: &Task,
         messages: &[ChatMessage],
+        tool_protocol: ToolProtocol,
     ) -> Result<InferenceResponse, ProviderError> {
         let mut last: Option<ProviderError> = None;
         for attempt in 0..=MAX_RETRIES {
             let mut req = SendRequest::new(messages.to_vec());
             req.tools = self.executor.catalog().specs.clone();
-            req.tool_protocol = ToolProtocol::Native;
+            req.tool_protocol = tool_protocol;
             req.max_tokens = Some(8192);
             req.zero_cost = run.zero_cost;
             match session.send(req).await {
@@ -605,8 +641,10 @@ mod tests {
     use swarm_core::budget::ResourceBudget;
     use swarm_core::provider::ProviderErrorClass;
     use swarm_core::{AgentRole, TaskId, TaskState};
-    use swarm_providers::{coding_script, MockProvider, MockStep, Provider};
+    use swarm_providers::{coding_script, GeminiWebConfig, GeminiWebProvider, MockProvider, MockStep, Provider};
     use swarm_tools::SandboxConfig;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::{method, path};
 
     struct StaticApproval {
         decision: bool,
@@ -702,6 +740,56 @@ mod tests {
         let usage = runner.store.load_stats(&run.id).await.unwrap().usage;
         assert!(usage.inference_calls >= 3, "expected >=3 inferences, got {}", usage.inference_calls);
         assert!(usage.tool_calls >= 2, "expected >=2 tool calls, got {}", usage.tool_calls);
+    }
+
+    #[tokio::test]
+    async fn gemini_text_tool_call_runs_through_sandbox_and_closes_session() {
+        let bridge = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":"remote-1"})))
+            .expect(1).mount(&bridge).await;
+        Mock::given(method("POST")).and(path("/sessions/remote-1/messages"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                let prompt = body["prompt"].as_str().unwrap();
+                let answer = if prompt.contains("[TOOL RESULT") {
+                    "verified".to_string()
+                } else {
+                    "```swarm\n{\"tool\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"hello.txt\",\"content\":\"hello\"}}}\n```".to_string()
+                };
+                ResponseTemplate::new(200).set_body_json(json!({"text":answer,"chat_url":"https://gemini.google.com/app/fixture"}))
+            })
+            .expect(2).mount(&bridge).await;
+        Mock::given(method("DELETE")).and(path("/sessions/remote-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"closed":true})))
+            .expect(1).mount(&bridge).await;
+        let (mut runner, run, task, mut agent, _mock, dir) = fixture(vec![]).await;
+        let provider_id = ProviderId::new("gemini-web").unwrap();
+        let gemini = GeminiWebProvider::new(provider_id.clone(),
+            GeminiWebConfig::new(bridge.uri(), "Auto").billing(swarm_core::budget::BillingMode::ZeroCost)).unwrap();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(gemini));
+        runner.registry = Arc::new(registry);
+        let outcome = runner.run(&run, &task, &mut agent, &provider_id).await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }));
+        assert_eq!(std::fs::read_to_string(dir.path().join("ws/hello.txt")).unwrap(), "hello");
+        bridge.verify().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_text_tool_call_gets_one_correction_turn() {
+        let bad = MockStep {
+            text: "```swarm\n{\"tool\":{\"name\":\"write_file\",\"arguments\":\"bad\"}}\n```".into(),
+            tool_calls: Vec::new(), finish: FinishReason::MalformedTool, error: None,
+        };
+        let good = MockStep::tool_calls(vec![NativeToolCall::new("fixed", "write_file",
+            json!({"path":"repaired.txt","content":"ok"}))]);
+        let (runner, run, task, mut agent, provider, dir) =
+            fixture(vec![bad, good, MockStep::text("done")]).await;
+        let outcome = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }));
+        assert_eq!(std::fs::read_to_string(dir.path().join("ws/repaired.txt")).unwrap(), "ok");
+        assert_eq!(agent.steps, 3);
     }
 
     #[tokio::test]

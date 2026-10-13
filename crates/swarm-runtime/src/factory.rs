@@ -12,7 +12,7 @@ use swarm_core::budget::BillingMode;
 use swarm_core::config::{ProviderConfig, RunConfig};
 use swarm_core::provider::ProviderKind;
 use swarm_core::ProviderId;
-use swarm_providers::{ManagedAgentConfig, ManagedAgentProvider, MockProvider, OpenAiConfig, OpenAiProvider, Provider, ProviderRegistry};
+use swarm_providers::{GeminiWebConfig, GeminiWebProvider, ManagedAgentConfig, ManagedAgentProvider, MockProvider, OpenAiConfig, OpenAiProvider, Provider, ProviderRegistry};
 use swarm_scheduler::SchedulerConfig;
 
 use crate::error::RuntimeError;
@@ -78,6 +78,27 @@ pub fn local_provider_config() -> ProviderConfig {
     }
 }
 
+/// Browser-backed Gemini chat preset. Requires the local bridge to be running.
+pub fn gemini_web_provider_config() -> ProviderConfig {
+    ProviderConfig {
+        name: ProviderId::new("gemini-web").expect("valid provider name"),
+        kind: ProviderKind::GeminiWeb,
+        model: "4 Argon".to_string(),
+        base_url: Some("http://127.0.0.1:8765".to_string()),
+        api_key: None,
+        api_key_env: None,
+        max_output_tokens: 8192,
+        temperature: None,
+        workspace_dir: None,
+        command: Vec::new(),
+        timeout_secs: None,
+        extra_args: Vec::new(),
+        zero_cost: false,
+        billing: BillingMode::Subscription,
+        max_concurrency: Some(4),
+    }
+}
+
 /// Constructs the live provider for a single [`ProviderConfig`].
 fn provider_for(pc: &ProviderConfig) -> Result<Arc<dyn Provider>, RuntimeError> {
     match pc.kind {
@@ -114,6 +135,14 @@ fn provider_for(pc: &ProviderConfig) -> Result<Arc<dyn Provider>, RuntimeError> 
                 .billing(pc.billing)
                 .timeout(Duration::from_secs(pc.timeout_secs.unwrap_or(600).max(1)));
             let provider: Arc<dyn Provider> = Arc::new(ManagedAgentProvider::new(pc.name.clone(), config)?);
+            Ok(provider)
+        }
+        ProviderKind::GeminiWeb => {
+            let base_url = pc.base_url.as_deref().unwrap_or("http://127.0.0.1:8765");
+            let config = GeminiWebConfig::new(base_url, &pc.model)
+                .billing(pc.billing)
+                .max_concurrency(pc.max_concurrency.unwrap_or(4));
+            let provider: Arc<dyn Provider> = Arc::new(GeminiWebProvider::new(pc.name.clone(), config)?);
             Ok(provider)
         }
     }
@@ -175,5 +204,21 @@ mod tests {
         assert_eq!(managed.kind(), ProviderKind::ManagedAgent);
         let scheduler = scheduler_config(&cfg, &registry);
         assert_eq!(scheduler.provider_limits.get("managed"), Some(&1));
+    }
+
+    #[test]
+    fn gemini_web_preset_builds_as_subscription_provider() {
+        let pc = gemini_web_provider_config();
+        assert_eq!(pc.kind, ProviderKind::GeminiWeb);
+        assert_eq!(pc.model, "4 Argon");
+        assert!(!pc.zero_cost);
+        let mut cfg = RunConfig::mock("goal", 2);
+        cfg.provider = pc.name.clone();
+        cfg.providers = vec![pc];
+        cfg.zero_cost = false;
+        cfg.scheduler.zero_cost = false;
+        let registry = build_registry(&cfg).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.find(&cfg.provider).unwrap().kind(), ProviderKind::GeminiWeb);
     }
 }

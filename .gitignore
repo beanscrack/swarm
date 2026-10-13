@@ -5,3 +5,5 @@ work/
 *.db
 *.db-wal
 *.db-shm
+bridges/gemini-web/node_modules/
+bridges/gemini-web/.gemini-browser-profile/
