@@ -7,8 +7,15 @@ use swarm_core::tool::{ToolCatalog, ToolKind, ToolSchema, ToolSpec};
 
 /// Build a [`ToolSpec`] with the given output cap.
 fn spec(name: &str, kind: ToolKind, desc: &str, schema: Value, max_output: u64) -> ToolSpec {
+    let process_tool = matches!(kind, ToolKind::Bash | ToolKind::Test | ToolKind::Python | ToolKind::Git);
     let mut s = ToolSpec::new(name, kind, desc, ToolSchema::new(schema));
     s.max_output_bytes = max_output;
+    // A working directory is not OS-level confinement: these tools can still
+    // address paths outside the workspace and must be explicitly approved.
+    if process_tool {
+        s.sandboxed = false;
+        s.requires_approval = true;
+    }
     s
 }
 
@@ -193,8 +200,9 @@ mod tests {
         ];
         for name in expected {
             let s = c.get(name).unwrap_or_else(|| panic!("missing tool {name}"));
-            assert!(s.sandboxed);
-            assert!(!s.requires_approval);
+            let process_tool = matches!(name, "bash" | "run_tests" | "python" | "git");
+            assert_eq!(s.sandboxed, !process_tool);
+            assert_eq!(s.requires_approval, process_tool);
             assert!(s.input_schema.as_value().is_object());
         }
         assert_eq!(c.len(), expected.len());

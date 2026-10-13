@@ -35,7 +35,7 @@ use swarm_providers::{
     SendRequest, Session, SessionConfig, ToolProtocol,
 };
 use swarm_store::Store;
-use swarm_tools::{ToolCall, ToolExecutor};
+use swarm_tools::{ToolCall, ToolExecutor, ToolResult};
 
 use crate::prompt::initial_messages;
 use crate::reply::parse_plan;
@@ -410,7 +410,7 @@ impl AgentRunner {
             let call = ToolCall::new(tc.id.clone(), tc.name.clone(), tc.arguments.clone());
             let result = self.executor.execute(&call).await;
             let out = result.as_model_output();
-            (result.success, out, Some(result.to_record(&tc.arguments)))
+            (result.success, out, result.to_record(&tc.arguments))
         } else {
             let reason = match &validation {
                 ToolRequestValidation::Deny { reason } => {
@@ -421,29 +421,19 @@ impl AgentRunner {
                 }
                 _ => unreachable!("reached the unapproved branch"),
             };
-            (false, reason, None)
+            let mut denied = ToolResult::failure(reason.clone());
+            denied.call_id = tc.id.clone();
+            denied.name = name.clone();
+            (false, reason, denied.to_record(&tc.arguments))
         };
 
         let (model_text, truncated) = cap_for_model(&model_output);
         cp.messages.push(ChatMessage::tool(tc.id.clone(), model_text));
 
-        if let Some(rec) = record {
-            cp.tool_calls.push(rec);
-            cp.usage.add(&BudgetUsage {
-                tool_calls: 1,
-                ..BudgetUsage::default()
-            });
-            self.store
-                .record_usage(
-                    &run.id,
-                    &BudgetUsage {
-                        tool_calls: 1,
-                        ..BudgetUsage::default()
-                    },
-                    now,
-                )
-                .await?;
-        }
+        cp.tool_calls.push(record);
+        let tool_delta = BudgetUsage { tool_calls: 1, ..BudgetUsage::default() };
+        cp.usage.add(&tool_delta);
+        self.store.record_usage(&run.id, &tool_delta, now).await?;
         self.emit(
             run,
             agent,
@@ -745,6 +735,38 @@ mod tests {
             !dir.path().join("outside.txt").exists(),
             "the escaping path must be denied, not written"
         );
+        let checkpoint = runner.store.load_checkpoint(&agent.id).await.unwrap().unwrap();
+        assert_eq!(checkpoint.tool_calls.len(), 1);
+        assert!(!checkpoint.tool_calls[0].success);
+        assert_eq!(runner.store.load_stats(&run.id).await.unwrap().usage.tool_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn process_tool_requires_approval_by_default() {
+        let script = vec![
+            MockStep::tool_calls(vec![NativeToolCall::new(
+                "c1", "bash", json!({ "command": "echo hello > marker.txt" }),
+            )]),
+            MockStep::text("done"),
+        ];
+        let (mut runner, run, task, mut agent, provider, dir) = fixture(script).await;
+        runner.approval = ApprovalPolicy::AskDangerous;
+        let outcome = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }));
+        assert!(!dir.path().join("ws/marker.txt").exists());
+        let checkpoint = runner.store.load_checkpoint(&agent.id).await.unwrap().unwrap();
+        assert!(checkpoint.tool_calls[0].error.as_ref().unwrap().contains("requires approval"));
+
+        let script = vec![
+            MockStep::tool_calls(vec![NativeToolCall::new(
+                "c1", "bash", json!({ "command": "echo hello > marker.txt" }),
+            )]),
+            MockStep::text("done"),
+        ];
+        let (runner, run, task, mut agent, provider, dir) = fixture(script).await;
+        let outcome = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }));
+        assert!(dir.path().join("ws/marker.txt").exists());
     }
 
     // (e) Crash-and-restart: resume from a persisted checkpoint and build on
