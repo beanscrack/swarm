@@ -8,8 +8,9 @@
 > inferences and two successful tool calls. A second real-model run completed
 > a three-task plan and produced verified `alpha.txt` and `beta.txt` files.
 > In that run the planner made verification a separate task, which ran
-> concurrently with creation and caused redundant tool calls; plan-step
-> dependencies remain a quality improvement for multi-agent work.
+> concurrently with creation and caused redundant tool calls. Plan steps now
+> support explicit dependencies on earlier steps; whether the model declares
+> every necessary dependency remains a planner-quality concern.
 
 Goal: `swarm run "<goal>" --provider mock` creates a run, executes agents through the scheduler, tools and
 store, and exits 0 with a persisted, inspectable result. Then the same with `--provider local`

@@ -300,22 +300,27 @@ impl AgentRunner {
         let pending = all.iter().filter(|t| matches!(t.state, TaskState::Pending | TaskState::Ready)).count();
         run.budget.check_pending_tasks(pending, count)?;
         let now = now_ms();
-        let children: Vec<Task> = plan.steps.iter().enumerate().map(|(index, step)| Task {
-            id: TaskId::new(),
-            run_id: run.id.clone(),
-            parent_id: Some(task.id.clone()),
-            depth: task.depth + 1,
-            title: step.description.chars().take(120).collect(),
-            objective: step.description.clone(),
-            role: AgentRole::Worker,
-            group: format!("{}-{index}", task.id),
-            priority: step.priority,
-            depends_on: Vec::new(),
-            state: TaskState::Pending,
-            attempts: 0,
-            created_at: now,
-            updated_at: now,
-        }).collect();
+        let ids: Vec<TaskId> = (0..count).map(|_| TaskId::new()).collect();
+        let children: Vec<Task> = plan.steps.iter().enumerate().map(|(index, step)| {
+            anyhow::ensure!(step.depends_on.iter().all(|&dependency| dependency < index),
+                "step {index} has a dependency that is not an earlier step");
+            Ok(Task {
+                id: ids[index].clone(),
+                run_id: run.id.clone(),
+                parent_id: Some(task.id.clone()),
+                depth: task.depth + 1,
+                title: step.description.chars().take(120).collect(),
+                objective: step.description.clone(),
+                role: AgentRole::Worker,
+                group: format!("{}-{index}", task.id),
+                priority: step.priority,
+                depends_on: step.depends_on.iter().map(|&dependency| ids[dependency].clone()).collect(),
+                state: TaskState::Pending,
+                attempts: 0,
+                created_at: now,
+                updated_at: now,
+            })
+        }).collect::<anyhow::Result<Vec<_>>>()?;
         self.store.create_tasks(&children).await?;
         cp.child_task_ids = children.iter().map(|child| child.id.clone()).collect();
         for child in &children {
@@ -663,6 +668,20 @@ mod tests {
             .filter(|t| t.parent_id.as_ref() == Some(&task.id)).collect();
         assert_eq!(children.len(), 1);
         assert_eq!(agent.steps, 2);
+
+        let dependent = "```swarm\n{\"plan\":{\"steps\":[{\"description\":\"Create the file\"},{\"description\":\"Verify the file\",\"depends_on\":[0]}]}}\n```";
+        let (runner, mut run, mut task, mut agent, provider, _dir) =
+            fixture(vec![MockStep::text(dependent)]).await;
+        run.agent_target = 3;
+        task.role = AgentRole::Planner;
+        agent.role = AgentRole::Planner;
+        let outcome = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }), "{outcome:?}");
+        let children: Vec<_> = runner.store.list_tasks(&run.id).await.unwrap().into_iter()
+            .filter(|child| child.parent_id.as_ref() == Some(&task.id)).collect();
+        let creator = children.iter().find(|child| child.objective == "Create the file").unwrap();
+        let verifier = children.iter().find(|child| child.objective == "Verify the file").unwrap();
+        assert_eq!(verifier.depends_on, vec![creator.id.clone()]);
 
         let too_many = "```swarm\n{\"plan\":{\"steps\":[{\"description\":\"One\"},{\"description\":\"Two\"}]}}\n```";
         let (runner, mut run, mut task, mut agent, provider, _dir) =

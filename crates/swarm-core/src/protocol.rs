@@ -43,6 +43,9 @@ pub struct PlanStep {
     pub kind: Option<String>,
     /// Higher runs first when scheduling subtasks.
     pub priority: i32,
+    /// Zero-based indexes of earlier steps that must complete first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<usize>,
 }
 
 /// A plan an agent proposes for its task or for its children.

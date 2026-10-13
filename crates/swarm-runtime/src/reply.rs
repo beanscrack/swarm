@@ -37,10 +37,25 @@ pub fn parse_plan(reply: &str) -> Result<Option<AgentPlan>> {
         let priority = step.get("priority").and_then(Value::as_i64).unwrap_or(0);
         let priority = i32::try_from(priority)
             .with_context(|| format!("plan.steps[{index}].priority is out of range"))?;
+        let mut depends_on = Vec::new();
+        if let Some(value) = step.get("depends_on") {
+            let dependencies = value.as_array()
+                .ok_or_else(|| anyhow!("plan.steps[{index}].depends_on must be an array"))?;
+            for dependency in dependencies {
+                let dependency = dependency.as_u64()
+                    .and_then(|number| usize::try_from(number).ok())
+                    .ok_or_else(|| anyhow!("plan.steps[{index}].depends_on must contain indexes"))?;
+                if dependency >= index || depends_on.contains(&dependency) {
+                    bail!("plan.steps[{index}].depends_on must name distinct earlier steps");
+                }
+                depends_on.push(dependency);
+            }
+        }
         parsed.push(PlanStep {
             description: description.to_string(),
             kind: step.get("kind").and_then(Value::as_str).map(str::to_string),
             priority,
+            depends_on,
         });
     }
     let string_array = |key: &str| -> Result<Vec<String>> {
@@ -70,8 +85,14 @@ mod tests {
             .unwrap().unwrap();
         assert_eq!(plan.steps[0].description, "Build one part");
         assert_eq!(plan.steps[0].priority, 0);
+        assert!(plan.steps[0].depends_on.is_empty());
+        let dependent = parse_plan("```swarm\n{\"steps\":[{\"description\":\"Build\"},{\"description\":\"Verify\",\"depends_on\":[0]}]}\n```")
+            .unwrap().unwrap();
+        assert_eq!(dependent.steps[1].depends_on, vec![0]);
         assert!(parse_plan("No plan").unwrap().is_none());
         assert!(parse_plan("```swarm\n{broken}\n```").is_err());
         assert!(parse_plan("```swarm\n{\"steps\":[]}\n```").is_err());
+        assert!(parse_plan("```swarm\n{\"steps\":[{\"description\":\"Build\",\"depends_on\":[0]}]}\n```").is_err());
+        assert!(parse_plan("```swarm\n{\"steps\":[{\"description\":\"Build\"},{\"description\":\"Verify\",\"depends_on\":[0,0]}]}\n```").is_err());
     }
 }

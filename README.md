@@ -43,8 +43,9 @@ cargo run -p swarm-cli -- logs
 Use `--store DIR` on every command to choose another store. Inspection
 commands accept an optional run ID; otherwise they show the latest run.
 Pass `--agents N` with `N > 1` to have one planner create up to `N - 1`
-independent worker tasks. The mock provider simulates their replies; a real
-provider can execute the workers' tool calls.
+worker tasks. The planner can declare dependencies between tasks so a worker
+waits for prerequisite work to finish. The mock provider simulates their
+replies; a real provider can execute the workers' tool calls.
 
 To use a running OpenAI-compatible llama-server on `127.0.0.1:8080`:
 

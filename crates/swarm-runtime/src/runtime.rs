@@ -532,6 +532,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dependent_task_starts_after_its_predecessor_completes() {
+        let (_dir, store, rt, run) = setup(
+            vec![MockStep::text("created"), MockStep::text("verified")], 2,
+        ).await;
+        let root_id = run.root_task_id.as_ref().unwrap().clone();
+        let now = now_ms();
+        let dependent = Task {
+            id: TaskId::new(),
+            run_id: run.id.clone(),
+            parent_id: Some(root_id.clone()),
+            depth: 1,
+            title: "verify".into(),
+            objective: "verify".into(),
+            role: AgentRole::Worker,
+            group: "verification".into(),
+            priority: 0,
+            depends_on: vec![root_id.clone()],
+            state: TaskState::Pending,
+            attempts: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        store.create_task(&dependent).await.unwrap();
+        assert_eq!(rt.drive(&run.id).await.unwrap(), RunStatus::Completed);
+        let events = store.latest_events(&run.id, 10_000).await.unwrap();
+        let transition = |id: &TaskId, state: &str| events.iter()
+            .find(|event| event.kind == EventKind::TaskStateChanged
+                && event.task_id.as_ref() == Some(id)
+                && event.payload.get("state").and_then(|value| value.as_str()) == Some(state))
+            .unwrap().seq;
+        assert!(transition(&root_id, "completed") < transition(&dependent.id, "running"));
+    }
+
+    #[tokio::test]
     async fn wall_clock_budget_stops_inference_and_finalizes_tasks() {
         let (_dir, store, rt, run) = setup_with_latency(
             vec![MockStep::text("too late")], 1, Duration::from_secs(2),

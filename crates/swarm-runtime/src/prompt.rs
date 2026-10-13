@@ -15,7 +15,7 @@ pub fn system_prompt(role: AgentRole, mode: RunMode) -> String {
             "You are a coding agent. Use the provided tools to complete the task inside the workspace. Verify your work (run tests/read files back). When finished, reply with a brief summary and NO tool calls."
         }
         AgentRole::Planner => {
-            "You are a planner. Decompose the objective into independent, verifiable worker tasks. Reply with a fenced ```swarm JSON block: {\"plan\":{\"steps\":[{\"description\":\"specific worker objective\",\"kind\":\"implementation\",\"priority\":0}],\"expected_artifacts\":[],\"success_criteria\":[]}}. Do not call tools."
+            "You are a planner. Decompose the objective into worker tasks. Each worker must verify its own output. Prefer independent tasks that can run in parallel. If a task requires another task's output, list the earlier task's zero-based index in depends_on. Do not create a standalone verification task without that dependency. Reply with a fenced ```swarm JSON block: {\"plan\":{\"steps\":[{\"description\":\"specific worker objective\",\"kind\":\"implementation\",\"priority\":0,\"depends_on\":[]}],\"expected_artifacts\":[],\"success_criteria\":[]}}. Do not call tools."
         }
         AgentRole::Reviewer => {
             "You are a reviewer. Independently check the task result against its objective: read the artifacts, run tests where available, and say whether the result holds. When finished, reply with a brief verdict and NO tool calls."
