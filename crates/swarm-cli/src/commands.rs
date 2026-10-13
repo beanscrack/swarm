@@ -224,18 +224,21 @@ async fn status(args: InspectArgs) -> Result<CommandOutcome> {
         stats.usage.total_tokens(),
         stats.usage.tool_calls,
     );
-    if let Some(summary) = store
-        .latest_events(&run.id, 100)
-        .await?
-        .iter()
-        .rev()
-        .find(|e| {
-            e.kind == swarm_core::event::EventKind::Message
-                && e.task_id.as_ref() == run.root_task_id.as_ref()
-        })
-        .and_then(|e| e.payload.get("summary").and_then(|v| v.as_str()))
-    {
-        text.push_str(&format!("\nresult    {summary}"));
+    let events = store.latest_events(&run.id, 1_000).await?;
+    let workers: Vec<_> = tasks.iter()
+        .filter(|task| task.role == swarm_core::AgentRole::Worker)
+        .collect();
+    for worker in &workers {
+        if let Some(summary) = events.iter().rev()
+            .find(|e| e.kind == swarm_core::event::EventKind::Message
+                && e.task_id.as_ref() == Some(&worker.id))
+            .and_then(|e| e.payload.get("summary").and_then(|v| v.as_str())) {
+            if workers.len() == 1 {
+                text.push_str(&format!("\nresult    {summary}"));
+            } else {
+                text.push_str(&format!("\nresult    {}: {summary}", worker.title));
+            }
+        }
     }
     Ok(CommandOutcome::success(text))
 }
@@ -426,6 +429,30 @@ mod tests {
         .await
         .unwrap();
         assert!(status.text.contains("result    hello.txt created"));
+    }
+
+    #[tokio::test]
+    async fn mock_multi_agent_run_creates_and_completes_workers() {
+        let temp = TempDir::new().unwrap();
+        let store_path = temp.path().join("store");
+        let workspace = temp.path().join("work");
+        let result = execute(Cli::try_parse_from([
+            "swarm", "run", "divide the work", "--provider", "mock", "--agents", "3",
+            "--store", store_path.to_str().unwrap(), "--workspace", workspace.to_str().unwrap(),
+        ]).unwrap()).await.unwrap();
+        assert!(result.success, "{}", result.text);
+        let store = Store::open(&store_path).await.unwrap();
+        let run = select_run(&store, None).await.unwrap();
+        let tasks = store.list_tasks(&run.id).await.unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks.iter().all(|t| t.state == swarm_core::TaskState::Completed));
+        let root = tasks.iter().find(|t| t.parent_id.is_none()).unwrap();
+        assert_eq!(root.role, swarm_core::AgentRole::Planner);
+        assert_eq!(tasks.iter().filter(|t| t.parent_id.as_ref() == Some(&root.id)).count(), 2);
+        let status = execute(Cli::try_parse_from([
+            "swarm", "status", "--store", store_path.to_str().unwrap(),
+        ]).unwrap()).await.unwrap();
+        assert!(status.text.contains("result    Complete independent work item"));
     }
 
     #[test]

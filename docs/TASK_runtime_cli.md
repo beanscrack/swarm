@@ -1,5 +1,11 @@
 # Task: make `swarm run` work end to end (runtime + CLI)
 
+> Implementation status (2026-10-13): steps 0a through 6 are implemented and
+> covered by workspace tests, including the optional planner decomposition.
+> The HTTP path for the local preset is tested against an OpenAI-compatible
+> server fixture. The manual llama-server smoke test below still needs a
+> running local model.
+
 Goal: `swarm run "<goal>" --provider mock` creates a run, executes agents through the scheduler, tools and
 store, and exits 0 with a persisted, inspectable result. Then the same with `--provider local`
 (llama-server). Today `swarm-runtime` is a 6-line doc comment and `swarm-cli` is an empty `main`; everything

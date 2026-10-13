@@ -28,7 +28,8 @@ use swarm_core::message::{ChatMessage, MessageToolCall};
 use swarm_core::run::Run;
 use swarm_core::task::Task;
 use swarm_core::tool::ToolRequestValidation;
-use swarm_core::{ProviderId, StateMachine};
+use swarm_core::protocol::AgentPlan;
+use swarm_core::{AgentRole, ProviderId, StateMachine, TaskId, TaskState};
 use swarm_providers::{
     FinishReason, InferenceResponse, NativeToolCall, ProviderError, ProviderRegistry,
     SendRequest, Session, SessionConfig, ToolProtocol,
@@ -37,6 +38,7 @@ use swarm_store::Store;
 use swarm_tools::{ToolCall, ToolExecutor};
 
 use crate::prompt::initial_messages;
+use crate::reply::parse_plan;
 
 /// How a single agent turn ends.
 #[derive(Debug)]
@@ -207,6 +209,7 @@ impl AgentRunner {
             // Append the assistant reply and branch on whether it asked for tools.
             if resp.tool_calls.is_empty() {
                 if resp.finish_reason == FinishReason::Length {
+                    cp.messages.push(ChatMessage::assistant(resp.text.clone()));
                     cp.messages.push(ChatMessage::user("Continue."));
                     cp.format_retries += 1;
                     if cp.format_retries > run.budget.max_format_retries {
@@ -221,6 +224,32 @@ impl AgentRunner {
                             .await;
                     }
                     self.save(run, agent, task, &cp, now).await?;
+                    continue;
+                } else if task.role == AgentRole::Planner {
+                    match parse_plan(&resp.text) {
+                        Ok(Some(plan)) => {
+                            let count = match self.create_children(run, task, &plan, &mut cp).await {
+                                Ok(count) => count,
+                                Err(e) => return self.finish_failed(run, agent, task, e.to_string(), false).await,
+                            };
+                            cp.messages.push(ChatMessage::assistant(resp.text));
+                            self.save(run, agent, task, &cp, now).await?;
+                            return self.finish_completed(run, agent, task, format!("Planned {count} worker tasks")).await;
+                        }
+                        invalid => {
+                            cp.format_retries += 1;
+                            if cp.format_retries > run.budget.max_format_retries {
+                                return self.finish_failed(run, agent, task,
+                                    format!("planner did not provide a valid swarm plan: {:?}", invalid.err()), false).await;
+                            }
+                            cp.messages.push(ChatMessage::assistant(resp.text));
+                            cp.messages.push(ChatMessage::user(
+                                "Reply with a valid fenced ```swarm JSON plan block containing a nonempty plan.steps array."
+                            ));
+                            self.save(run, agent, task, &cp, now).await?;
+                            continue;
+                        }
+                    }
                 } else {
                     self.save(run, agent, task, &cp, now).await?;
                     return self
@@ -246,6 +275,57 @@ impl AgentRunner {
             }
             self.save(run, agent, task, &cp, now).await?;
         }
+    }
+
+    async fn create_children(
+        &self,
+        run: &Run,
+        task: &Task,
+        plan: &AgentPlan,
+        cp: &mut AgentCheckpoint,
+    ) -> anyhow::Result<usize> {
+        let all = self.store.list_tasks(&run.id).await?;
+        let existing: Vec<&Task> = all.iter()
+            .filter(|child| child.parent_id.as_ref() == Some(&task.id))
+            .collect();
+        if !existing.is_empty() {
+            cp.child_task_ids = existing.iter().map(|child| child.id.clone()).collect();
+            return Ok(existing.len());
+        }
+        let count = plan.steps.len();
+        anyhow::ensure!(count <= run.agent_target.saturating_sub(1) as usize,
+            "plan has {count} workers, above the requested agent target {}", run.agent_target);
+        run.budget.check_depth(task.depth + 1)?;
+        run.budget.check_children(count)?;
+        let pending = all.iter().filter(|t| matches!(t.state, TaskState::Pending | TaskState::Ready)).count();
+        run.budget.check_pending_tasks(pending, count)?;
+        let now = now_ms();
+        let children: Vec<Task> = plan.steps.iter().enumerate().map(|(index, step)| Task {
+            id: TaskId::new(),
+            run_id: run.id.clone(),
+            parent_id: Some(task.id.clone()),
+            depth: task.depth + 1,
+            title: step.description.chars().take(120).collect(),
+            objective: step.description.clone(),
+            role: AgentRole::Worker,
+            group: format!("{}-{index}", task.id),
+            priority: step.priority,
+            depends_on: Vec::new(),
+            state: TaskState::Pending,
+            attempts: 0,
+            created_at: now,
+            updated_at: now,
+        }).collect();
+        self.store.create_tasks(&children).await?;
+        cp.child_task_ids = children.iter().map(|child| child.id.clone()).collect();
+        for child in &children {
+            self.store.append_event(&RunEvent::new(
+                EventKind::TaskStateChanged,
+                run.id.clone(),
+                json!({ "state": "pending", "parent_task_id": task.id.as_str() }),
+            ).with_task(child.id.clone())).await?;
+        }
+        Ok(count)
     }
 
     /// One inference call with retry on retryable provider errors (500ms·2^n).
@@ -575,6 +655,32 @@ mod tests {
         let usage = runner.store.load_stats(&run.id).await.unwrap().usage;
         assert!(usage.inference_calls >= 3, "expected >=3 inferences, got {}", usage.inference_calls);
         assert!(usage.tool_calls >= 2, "expected >=2 tool calls, got {}", usage.tool_calls);
+    }
+
+    #[tokio::test]
+    async fn planner_repairs_format_and_respects_agent_target() {
+        let valid = "```swarm\n{\"plan\":{\"steps\":[{\"description\":\"Implement the first part\"}]}}\n```";
+        let script = vec![MockStep::text("no plan"), MockStep::text(valid)];
+        let (runner, mut run, mut task, mut agent, provider, _dir) = fixture(script).await;
+        run.agent_target = 2;
+        task.role = AgentRole::Planner;
+        agent.role = AgentRole::Planner;
+        let outcome = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }), "{outcome:?}");
+        let children: Vec<_> = runner.store.list_tasks(&run.id).await.unwrap().into_iter()
+            .filter(|t| t.parent_id.as_ref() == Some(&task.id)).collect();
+        assert_eq!(children.len(), 1);
+        assert_eq!(agent.steps, 2);
+
+        let too_many = "```swarm\n{\"plan\":{\"steps\":[{\"description\":\"One\"},{\"description\":\"Two\"}]}}\n```";
+        let (runner, mut run, mut task, mut agent, provider, _dir) =
+            fixture(vec![MockStep::text(too_many)]).await;
+        run.agent_target = 2;
+        task.role = AgentRole::Planner;
+        agent.role = AgentRole::Planner;
+        let outcome = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Failed { retryable: false, .. }), "{outcome:?}");
+        assert_eq!(runner.store.list_tasks(&run.id).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -2,8 +2,8 @@
 
 A Rust workspace for orchestrating swarms of LLM agents: scheduling tasks, tracking budgets and usage, and persisting runs, events, findings, and artifacts.
 
-> Status: early development. The CLI runs goals end to end; automatic task
-> decomposition and a terminal UI are still planned.
+> Status: early development. The CLI runs goals end to end and can decompose
+> multi-agent runs. A terminal UI is still planned.
 
 ## Crates
 
@@ -42,6 +42,9 @@ cargo run -p swarm-cli -- logs
 `run` writes to `.swarm/` by default and gives agents a `./work` workspace.
 Use `--store DIR` on every command to choose another store. Inspection
 commands accept an optional run ID; otherwise they show the latest run.
+Pass `--agents N` with `N > 1` to have one planner create up to `N - 1`
+independent worker tasks. The mock provider simulates their replies; a real
+provider can execute the workers' tool calls.
 
 To use a running OpenAI-compatible llama-server on `127.0.0.1:8080`:
 

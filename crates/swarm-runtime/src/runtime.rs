@@ -92,7 +92,7 @@ impl Runtime {
             depth: 0,
             title: cfg.objective.clone(),
             objective: cfg.objective.clone(),
-            role: AgentRole::Worker,
+            role: if cfg.agents > 1 { AgentRole::Planner } else { AgentRole::Worker },
             group: "main".to_string(),
             priority: 0,
             depends_on: Vec::new(),

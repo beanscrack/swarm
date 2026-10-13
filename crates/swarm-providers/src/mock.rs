@@ -274,7 +274,7 @@ impl Session for MockSession {
 }
 
 impl MockSession {
-    fn next_step(&self, _request: &SendRequest) -> Result<MockStep, ProviderError> {
+    fn next_step(&self, request: &SendRequest) -> Result<MockStep, ProviderError> {
         if let Some(template) = &self.provider.script {
             if template.is_empty() {
                 return Err(ProviderError::Session("empty mock script".into()));
@@ -288,6 +288,21 @@ impl MockSession {
             .provider
             .call_counter
             .fetch_add(1, Ordering::Relaxed);
+        if request.messages.iter().any(|m| m.content.contains("You are a planner.")) {
+            let user = request.messages.iter().find(|m| m.content.contains("Worker subtasks:"));
+            let workers = user.and_then(|m| m.content.lines()
+                .find_map(|line| line.strip_prefix("Worker subtasks: ")))
+                .and_then(|n| n.parse::<usize>().ok()).unwrap_or(1);
+            let objective = user.and_then(|m| m.content.lines()
+                .find_map(|line| line.strip_prefix("Objective: "))).unwrap_or("the objective");
+            let steps: Vec<_> = (1..=workers).map(|i| json!({
+                "description": format!("Complete independent work item {i} for: {objective}"),
+                "kind": "implementation", "priority": 0,
+            })).collect();
+            return Ok(MockStep::text(format!("```swarm\n{}\n```", json!({"plan": {
+                "steps": steps, "expected_artifacts": [], "success_criteria": []
+            }}))));
+        }
         Ok(MockStep {
             text: format!(
                 "[mock:{}] reply #{}: understood.",

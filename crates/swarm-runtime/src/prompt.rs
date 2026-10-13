@@ -15,7 +15,7 @@ pub fn system_prompt(role: AgentRole, mode: RunMode) -> String {
             "You are a coding agent. Use the provided tools to complete the task inside the workspace. Verify your work (run tests/read files back). When finished, reply with a brief summary and NO tool calls."
         }
         AgentRole::Planner => {
-            "You are a planner. Decompose the objective into a small set of independent, verifiable subtasks and describe how they fit together. When finished, reply with a brief summary and NO tool calls."
+            "You are a planner. Decompose the objective into independent, verifiable worker tasks. Reply with a fenced ```swarm JSON block: {\"plan\":{\"steps\":[{\"description\":\"specific worker objective\",\"kind\":\"implementation\",\"priority\":0}],\"expected_artifacts\":[],\"success_criteria\":[]}}. Do not call tools."
         }
         AgentRole::Reviewer => {
             "You are a reviewer. Independently check the task result against its objective: read the artifacts, run tests where available, and say whether the result holds. When finished, reply with a brief verdict and NO tool calls."
@@ -37,10 +37,12 @@ fn mode_str(mode: RunMode) -> &'static str {
 pub fn initial_messages(run: &Run, task: &Task) -> Vec<ChatMessage> {
     vec![
         ChatMessage::system(system_prompt(task.role, run.mode)),
-        ChatMessage::user(format!(
-            "Objective: {}\nTask: {}\n{}",
-            run.objective, task.title, task.objective
-        )),
+        ChatMessage::user(if task.role == AgentRole::Planner {
+            format!("Objective: {}\nTask: {}\n{}\nWorker subtasks: {}",
+                run.objective, task.title, task.objective, run.agent_target.saturating_sub(1))
+        } else {
+            format!("Objective: {}\nTask: {}\n{}", run.objective, task.title, task.objective)
+        }),
     ]
 }
 

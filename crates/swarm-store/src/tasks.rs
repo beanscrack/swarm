@@ -35,6 +35,37 @@ impl Store {
         Ok(())
     }
 
+    /// Inserts a decomposition atomically, so a failed insert cannot leave a
+    /// partially created set of child tasks.
+    pub async fn create_tasks(&self, tasks: &[Task]) -> Result<()> {
+        let mut tx = self.pool.begin().await.context("begin child tasks")?;
+        for task in tasks {
+            sqlx::query(
+                "INSERT INTO tasks (id, run_id, parent_id, depth, title, objective, role, group_name, priority, depends_on, state, attempts, lease_token, lease_expires_at, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
+            )
+            .bind(task.id.as_str())
+            .bind(task.run_id.as_str())
+            .bind(task.parent_id.as_ref().map(|t| t.as_str()))
+            .bind(task.depth as i64)
+            .bind(&task.title)
+            .bind(&task.objective)
+            .bind(task.role.as_str())
+            .bind(&task.group)
+            .bind(task.priority as i64)
+            .bind(serde_json::to_string(&task.depends_on)?)
+            .bind(task.state.as_str())
+            .bind(task.attempts as i64)
+            .bind(task.created_at)
+            .bind(task.updated_at)
+            .execute(&mut *tx)
+            .await
+            .context("insert child task")?;
+        }
+        tx.commit().await.context("commit child tasks")?;
+        Ok(())
+    }
+
     pub async fn load_task(&self, id: &TaskId) -> Result<Option<Task>> {
         let row = sqlx::query("SELECT * FROM tasks WHERE id = ?")
             .bind(id.as_str())
