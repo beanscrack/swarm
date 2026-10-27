@@ -76,16 +76,40 @@ is the layer on top. It is stored under the `chat` namespace of the same store,
 so a session survives restarts (`--new` starts a fresh one).
 
 ```
-● swarm
+⏺ swarm
   provider chatgpt-web · model auto · 1 agent · approvals on-write
   session chat-1f2e… · turn 3 · 41.2k tokens · 12 inferences · 9 tool calls
 
-● add a login page
-⏺ [a1 t1] asks for write_file
-  ⎿ step 1 · 4.2s · 1204 → 96 tokens
-✻ completed in 26.4s · 1 task · 2 inferences · 1 tool calls · 2671 tokens
-●
+❯ add a login page
+⏺ [a1 t1] write_file("app/login.py")
+  ⎿ wrote 42 lines to app/login.py
+  ⎿ step 1 · 4.2s · 1.2k → 96 tokens · auto
+✻ writing · 26s · ↓ 2.7k tokens
+✻ completed in 26.4s · 1 task · 2 inferences · 1 tool calls · 2.7k tokens
+❯
 ```
+
+The renderer (`transcript.rs`) and its palette (`style.rs`) follow Claude Code:
+the `⏺` action bullet in terracotta on a light cell, tool results as `⎿` preview
+lines at a four-space gutter, `+N` for what was cut, `↓ 1.2k` token counts, the
+`✻` working spinner, and a bordered permission panel:
+
+```
+╭─ ⚠  Allow bash? ─────────────────────────────╮
+│ bash({"command": "rm -rf build"})            │
+│                                              │
+│ ❯ 1. Yes, allow once                         │
+│   2. Yes, allow for this session             │
+│   3. No, deny this call                      │
+│                                              │
+│ runs a shell command in the workspace        │
+╰──────────────────────────────────────────────╯
+  1/2/3 to choose · y/a/n shorthand · Esc denies
+```
+
+Colours are truecolor when the terminal offers them and are dropped for pipes,
+`NO_COLOR`, `TERM=dumb` and `SWARM_UI=never`; `SWARM_UI=always` forces them for
+captures. `ctrl+o` widens previews.
 
 Keys: `enter` sends, `\` then `enter` inserts a newline, `up`/`down` and
 `ctrl+r` walk the prompt history, `tab` completes slash commands,

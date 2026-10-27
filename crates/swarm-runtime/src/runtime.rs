@@ -53,6 +53,7 @@ pub struct Runtime {
     scheduler: Scheduler,
     approval: ApprovalPolicy,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    instructions: Option<String>,
 }
 
 impl Runtime {
@@ -63,7 +64,13 @@ impl Runtime {
         scheduler: Scheduler,
     ) -> Self {
         Self { store, registry, executor, scheduler, approval: ApprovalPolicy::AskDangerous,
-            approval_handler: None }
+            approval_handler: None, instructions: None }
+    }
+
+    /// Project instructions (`AGENTS.md` / `CLAUDE.md`) for every agent prompt.
+    pub fn with_instructions(mut self, instructions: Option<String>) -> Self {
+        self.instructions = instructions;
+        self
     }
 
     /// Sets the tool approval policy used by agents in this runtime.
@@ -226,6 +233,7 @@ impl Runtime {
                 let token_c = token.clone();
                 let approval = self.approval;
                 let approval_handler = self.approval_handler.clone();
+                let instructions = self.instructions.clone();
                 in_flight.spawn(async move {
                     let prov = ProviderId::new(provider_c).expect("provider id");
                     let runner = AgentRunner {
@@ -234,6 +242,7 @@ impl Runtime {
                         executor,
                         approval,
                         approval_handler,
+                        instructions,
                     };
                     // Same `Agent` value persisted above, so `update_agent` finds the row.
                     let mut agent = agent;

@@ -30,7 +30,7 @@ use crate::approval::AllowList;
 use crate::commands::{self, ChatArgs, TurnOutcome};
 use crate::transcript::{self, Color, Header, paint};
 
-const PROMPT: &str = "\u{25cf} ";
+const PROMPT: &str = "\u{276f} ";
 const KV_NAMESPACE: &str = "chat";
 const KV_ACTIVE: &str = "active";
 const SUMMARY_CHARS: usize = 400;
@@ -458,6 +458,10 @@ fn tty_reader(
                             draw(&buffer, cursor, &mode, colors);
                         }
                     }
+                    // Claude Code uses escape for the same interrupt.
+                    KeyCode::Esc if busy => {
+                        let _ = out.send(Action::Interrupt);
+                    }
                     KeyCode::Char('d') if ctrl && buffer.is_empty() => {
                         let _ = out.send(Action::Eof);
                         break;
@@ -559,7 +563,11 @@ fn tty_reader(
                             continue;
                         }
                         history.push(&text);
-                        println!("{PROMPT}{}", text.replace('\n', "\n  "));
+                        println!(
+                            "{}{}",
+                            paint(colors, "brand", PROMPT),
+                            text.replace('\n', "\n  ")
+                        );
                         let _ = io::stdout().flush();
                         let _ = out.send(Action::Submit(text));
                     }
@@ -806,7 +814,7 @@ fn draw(buffer: &str, cursor: usize, mode: &Mode, colors: Color) {
     }
     clear_row();
     let shown = buffer.replace('\n', "\n  ");
-    let prompt = paint(colors, "meta", PROMPT);
+    let prompt = paint(colors, "brand", PROMPT);
     print!("{prompt}{shown}");
     // Park the cursor at its index (single-line editing; multiline buffers place
     // it on the last row, which is where typing continues).
@@ -867,7 +875,7 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
             paint(
                 colors,
                 "meta",
-                "  /help for commands \u{00b7} ctrl+c interrupts \u{00b7} ctrl+d quits"
+                "  /help for commands \u{00b7} ctrl+c or esc interrupts \u{00b7} ctrl+d quits"
             )
         );
     }
@@ -892,6 +900,23 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
             }
         }
         while let Some(goal) = queue.pop_front() {
+            // A `#` line is a note for AGENTS.md, never a goal.
+            if goal.trim_start().starts_with('#') {
+                match remember_note(&workspace, &goal) {
+                    Ok(chars) => println!(
+                        "{}",
+                        paint(
+                            colors,
+                            "meta",
+                            &format!("  saved to AGENTS.md (+{chars} chars)")
+                        )
+                    ),
+                    Err(error) => {
+                        eprintln!("{} {error:#}", paint(colors, "fail", "\u{2717}"));
+                    }
+                }
+                continue;
+            }
             // A piped '/command' line is a command, the same as at a prompt.
             if let Some(command) = parse_slash(&goal) {
                 match handle(
@@ -913,7 +938,10 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
             )
             .await;
             match outcome {
-                Ok(outcome) => last_result = remember(&mut session, &mut last_run, goal, &outcome),
+                Ok(outcome) => {
+                    last_result = remember(&mut session, &mut last_run, goal, &outcome);
+                    note(colors, &turn_summary_line(&outcome));
+                }
                 Err(error) => eprintln!("{} {error:#}", paint(colors, "fail", "\u{2717}")),
             }
             if args.oneshot {
@@ -969,7 +997,10 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
         .await;
         let _ = reader.mode.send(Mode::Prompt);
         match outcome {
-            Ok(outcome) => last_result = remember(&mut session, &mut last_run, text, &outcome),
+            Ok(outcome) => {
+                last_result = remember(&mut session, &mut last_run, text, &outcome);
+                note(colors, &turn_summary_line(&outcome));
+            }
             Err(error) => eprintln!("{} {error:#}", paint(colors, "fail", "\u{2717}")),
         }
         save_session(&store, &session).await?;
@@ -981,6 +1012,27 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
 fn note(colors: Color, text: &str) {
     println!("{}", paint(colors, "meta", &format!("  {text}")));
     let _ = io::stdout().flush();
+}
+
+/// Claude Code closes a turn with `✻ Cogitated for 12s`; swarm keeps that shape
+/// and appends the run's own accounting so a long session can be skimmed turn by
+/// turn without scrolling to the session footer.
+fn turn_summary_line(outcome: &TurnOutcome) -> String {
+    let plural = |count: u64, word: &str| {
+        if count == 1 {
+            format!("{count} {word}")
+        } else {
+            format!("{count} {word}s")
+        }
+    };
+    format!(
+        "\u{273b} {} for {} \u{00b7} {} \u{00b7} {} \u{00b7} {} tokens",
+        crate::style::past_verb((outcome.seconds * 10.0) as u64 ^ outcome.tokens),
+        crate::style::elapsed(outcome.seconds),
+        plural(outcome.inferences, "inference"),
+        plural(outcome.tool_calls, "tool call"),
+        crate::style::tokens(outcome.tokens)
+    )
 }
 
 fn chat_header(session: &Session, cfg: &RunConfig, workspace: &std::path::Path) -> Header {
@@ -1069,6 +1121,26 @@ async fn run_turn(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Claude Code's `#` shortcut: a line that starts with `#` is a note to keep,
+/// not a goal. It lands in the workspace's `AGENTS.md`, which the runtime puts
+/// into every agent prompt, so the next turn already knows it.
+fn remember_note(workspace: &std::path::Path, text: &str) -> Result<usize> {
+    let note = text.trim().trim_start_matches('#').trim();
+    anyhow::ensure!(!note.is_empty(), "nothing to remember");
+    let path = workspace.join("AGENTS.md");
+    let mut body = std::fs::read_to_string(&path).unwrap_or_default();
+    if body.trim().is_empty() {
+        body = String::from("# Project instructions\n");
+    }
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&format!("- {note}\n"));
+    std::fs::write(&path, &body)?;
+    Ok(note.chars().count())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1340,6 +1412,44 @@ mod tests {
         assert!(matches!(complete_slash("/allow"), Completion::Candidates(_)));
         assert_eq!(complete_slash("/zzz"), Completion::None);
         assert_eq!(complete_slash("no slash"), Completion::None);
+    }
+
+    #[test]
+    fn a_turn_closes_with_a_summary_line() {
+        let outcome = TurnOutcome {
+            run_id: swarm_core::RunId::new(),
+            status: swarm_core::RunStatus::Completed,
+            summary: String::new(),
+            error: None,
+            tasks: 0,
+            tokens: 1_234,
+            inferences: 1,
+            tool_calls: 3,
+            seconds: 12.34,
+        };
+        let line = turn_summary_line(&outcome);
+        assert!(line.starts_with("\u{273b} "), "{line}");
+        assert!(
+            line.contains(" for 12.3s \u{00b7} 1 inference \u{00b7} 3 tool calls \u{00b7} 1.2k tokens"),
+            "{line}"
+        );
+        // The verb is a pure function of the turn, so the line is reproducible.
+        assert_eq!(line, turn_summary_line(&outcome));
+    }
+
+    #[test]
+    fn a_hash_note_lands_in_agents_md() {
+        let dir = std::env::temp_dir().join(format!("swarm-memory-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::remove_file(dir.join("AGENTS.md")).ok();
+        assert_eq!(remember_note(&dir, "# use uv, not pip").unwrap(), 15);
+        assert_eq!(remember_note(&dir, "#  run pytest -q  ").unwrap(), 13);
+        let body = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(body.starts_with("# Project instructions\n"), "{body}");
+        assert!(body.contains("- use uv, not pip"), "{body}");
+        assert!(body.contains("- run pytest -q"), "{body}");
+        assert!(remember_note(&dir, "   #   ").is_err(), "an empty note is an error");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

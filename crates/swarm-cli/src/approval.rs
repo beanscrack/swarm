@@ -79,14 +79,163 @@ impl Decision {
         self != Decision::Deny
     }
 
-    /// One key press to a decision (pure, so the mapping is testable).
+    /// One key press to a decision (pure, so the mapping is testable). Number
+    /// keys pick the matching row of the panel; `y`/`a` keep the old one-keystroke
+    /// shorthand; anything else denies, matching the capital-D default below.
     pub fn from_key(ch: char) -> Self {
         match ch {
-            'y' | 'Y' => Self::AllowOnce,
-            'a' | 'A' => Self::AllowAlways,
+            'y' | 'Y' | '1' => Self::AllowOnce,
+            'a' | 'A' | '2' => Self::AllowAlways,
+            '3' | 'n' | 'N' => Self::Deny,
             _ => Self::Deny,
         }
     }
+}
+
+/// The rows of the Claude Code permission dialog: box, the exact call, the
+/// numbered choices with `❯` on the cursor row, then the reason.
+pub fn panel_lines(
+    title: &str,
+    command: &str,
+    choices: &[&str],
+    description: &str,
+    cursor: usize,
+    width: usize,
+) -> Vec<String> {
+    // Claude Code sizes the panel 46..76 cells and clamps to the terminal.
+    let inner = width.clamp(46, 76).saturating_sub(4).max(24);
+    let total = inner + 4;
+    let row = |body: &str| {
+        // Never let a long line push the right border out of alignment.
+        let body: std::borrow::Cow<'_, str> = if body.chars().count() > inner {
+            std::borrow::Cow::Owned(body.chars().take(inner).collect())
+        } else {
+            std::borrow::Cow::Borrowed(body)
+        };
+        format!("\u{2502} {body:<inner$} \u{2502}")
+    };
+    let mut out = Vec::new();
+
+    let head = format!("\u{256d}\u{2500} {title} ");
+    let mut top = head.chars().take(total.saturating_sub(1)).collect::<String>();
+    top.push_str(&"\u{2500}".repeat(total.saturating_sub(top.chars().count() + 1)));
+    top.push('\u{256e}');
+    out.push(top);
+
+    let mut wrapped = Vec::new();
+    for line in command.lines() {
+        for chunk in wrap(line, inner.saturating_sub(2)) {
+            wrapped.push(chunk);
+        }
+    }
+    let hidden = wrapped.len().saturating_sub(4);
+    wrapped.truncate(4);
+    for line in wrapped {
+        out.push(row(&line));
+    }
+    if hidden > 0 {
+        out.push(row(&format!(
+            "\u{2026} {hidden} more lines \u{00b7} ctrl+o shows detail"
+        )));
+    }
+    out.push(row(""));
+    for (index, choice) in choices.iter().enumerate() {
+        let mark = if index == cursor { "\u{276f}" } else { " " };
+        out.push(row(&format!(
+            "{mark} {}. {:<cw$}",
+            index + 1,
+            choice,
+            cw = inner.saturating_sub(5)
+        )));
+    }
+    if !description.is_empty() {
+        out.push(row(""));
+        for line in wrap(description, inner.saturating_sub(2)).into_iter().take(6) {
+            out.push(row(&line));
+        }
+    }
+    out.push(format!(
+        "\u{2570}{}\u{256f}",
+        "\u{2500}".repeat(total.saturating_sub(2))
+    ));
+    out
+}
+
+/// Naive word wrap that never splits a word shorter than the width.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word;
+        // A word wider than the panel (a long path, a base64 blob) gets broken.
+        while word.chars().count() > width {
+            let head: String = word.chars().take(width).collect();
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            lines.push(head.clone());
+            word = &word[head.len()..];
+        }
+        let room = current.chars().count();
+        if room == 0 {
+            current.push_str(word);
+        } else if room + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// The numbered rows, in Claude Code's wording.
+pub const CHOICES: [&str; 3] = [
+    "Yes, allow once",
+    "Yes, allow for this session",
+    "No, deny this call",
+];
+
+/// The full card, coloured, ready to print. Shared by the raw-mode path and
+/// the key-bus path so an interactive session and a bare `swarm run` show the
+/// same dialog.
+fn card(request: &ApprovalRequest) -> String {
+    let width = crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(76);
+    let colors = Color::detect(true);
+    let title = format!("\u{26a0}  Allow {}?", request.name);
+    let command = format!("{}({})", request.name, args_summary(&request.arguments));
+    let body = panel_lines(&title, &command, &CHOICES, &request.risk, 0, width);
+    let mut out = String::from("\n");
+    for (index, line) in body.iter().enumerate() {
+        let painted = if index == 0 {
+            paint(colors, "warn", line)
+        } else if line.contains('\u{276f}') {
+            paint(colors, "brand", line)
+        } else {
+            paint(colors, "meta", line)
+        };
+        out.push_str(&painted);
+        out.push('\n');
+    }
+    out.push_str(&paint(
+        colors,
+        "meta",
+        "  1/2/3 to choose \u{00b7} y/a/n shorthand \u{00b7} Esc denies",
+    ));
+    // The card is printed with `eprint!`, so it owns its own line ending: without
+    // this the next transcript row lands on the hint row (`...Esc denies● ...`).
+    out.push('\n');
+    out
 }
 
 pub struct ConsoleApproval {
@@ -170,15 +319,7 @@ impl ApprovalHandler for ConsoleApproval {
             let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
             if bus.send(reply_tx).is_ok() {
                 clear_line();
-                let colors = Color::detect(true);
-                let card = format!(
-                    "\n\u{23fa} {}({})\n  {} {}\n  approve? [y/N/a] ",
-                    request.name,
-                    args_summary(&request.arguments),
-                    paint(colors, "meta", "risk"),
-                    request.risk,
-                );
-                eprint!("{}", card.replace('\n', "\r\n"));
+                eprint!("{}", card(request).replace('\n', "\r\n"));
                 let _ = io::stderr().flush();
                 let decided = tokio::time::timeout(Duration::from_secs(600), reply_rx.recv()).await;
                 return self
@@ -209,16 +350,8 @@ impl ApprovalHandler for ConsoleApproval {
                 return false;
             }
         }
-        // Claude Code-style card: the exact call, its risk, then the question.
-        let colors = Color::detect(true);
-        let card = format!(
-            "\n\u{23fa} {}({})\n  {} {}\n  approve? [y/N/a] ",
-            request.name,
-            args_summary(&request.arguments),
-            paint(colors, "meta", "risk"),
-            request.risk,
-        );
-        eprint!("{}", card.replace('\n', "\r\n"));
+        // Claude Code-style panel: the exact call, its risk, numbered choices.
+        eprint!("{}", card(request).replace('\n', "\r\n"));
         let _ = io::stderr().flush();
         let decision = loop {
             match event::poll(Duration::from_millis(50)) {
@@ -247,16 +380,12 @@ impl ApprovalHandler for ConsoleApproval {
 
 impl ConsoleApproval {
     async fn resolve(&self, request: &ApprovalRequest, decision: Decision) -> bool {
-        let answer = match decision {
-            Decision::Deny => "denied".to_string(),
-            Decision::AllowOnce => "approved".to_string(),
-            Decision::AllowAlways => {
-                self.allow.allow(&request.name);
-                format!("approved (always: {})", request.name)
-            }
-        };
-        eprintln!("{}", format!("  \u{23bf} {answer}").replace('\n', "\r\n"));
-        let _ = io::stderr().flush();
+        if matches!(decision, Decision::AllowAlways) {
+            self.allow.allow(&request.name);
+        }
+        // The transcript renders the `ApprovalResolved` event as `⎿ approved`, so
+        // echoing it here too printed the row twice. The card already ended its own
+        // line, so nothing more is printed.
         decision.approved()
     }
 }
@@ -264,7 +393,8 @@ impl ConsoleApproval {
 #[cfg(test)]
 mod tests {
     use super::{
-        AllowList, ConsoleApproval, Decision, Decision::*, KeyRequest, install_key_bus, key_bus,
+        AllowList, CHOICES, ConsoleApproval, Decision, Decision::*, KeyRequest, install_key_bus,
+        key_bus, panel_lines, wrap,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -317,6 +447,63 @@ mod tests {
         assert_eq!(Decision::from_key('\r'), Decision::Deny);
         assert!(Decision::AllowAlways.approved());
         assert!(!Decision::Deny.approved());
+    }
+
+    #[test]
+    fn number_keys_pick_the_numbered_row() {
+        assert_eq!(Decision::from_key('1'), Decision::AllowOnce);
+        assert_eq!(Decision::from_key('2'), Decision::AllowAlways);
+        assert_eq!(Decision::from_key('3'), Decision::Deny);
+        assert_eq!(CHOICES.len(), 3, "three rows, three number keys");
+    }
+
+    #[test]
+    fn the_panel_is_a_box_with_numbered_choices() {
+        let lines = panel_lines(
+            "\u{26a0}  Allow write_file?",
+            "write_file({\"path\": \"a.txt\"})",
+            &CHOICES,
+            "writes a.txt",
+            0,
+            60,
+        );
+        assert!(lines[0].starts_with("\u{256d}\u{2500} \u{26a0}"), "{lines:?}");
+        assert!(lines[0].ends_with('\u{256e}'));
+        assert!(lines.last().unwrap().starts_with('\u{2570}'));
+        assert!(lines.last().unwrap().ends_with('\u{256f}'));
+        // Every row is the same printed width: a real box, not a suggestion.
+        let widths: Vec<usize> = lines.iter().map(|line| line.chars().count()).collect();
+        assert!(
+            widths.windows(2).all(|pair| pair[0] == pair[1]),
+            "ragged panel: {widths:?}"
+        );
+        let body = lines.join("\n");
+        assert!(body.contains("\u{276f} 1. Yes, allow once"), "{body}");
+        assert!(body.contains("  2. Yes, allow for this session"));
+        assert!(body.contains("  3. No, deny this call"));
+        assert!(body.contains("writes a.txt"));
+    }
+
+    #[test]
+    fn the_cursor_moves() {
+        let third = panel_lines("t", "c", &CHOICES, "", 2, 60).join("\n");
+        assert!(third.contains("\u{276f} 3. No, deny this call"), "{third}");
+        assert!(!third.contains("\u{276f} 1."), "cursor should be on row 3");
+    }
+
+    #[test]
+    fn a_long_command_is_capped_with_a_hint() {
+        let long = "x".repeat(400);
+        let body = panel_lines("t", &long, &CHOICES, "", 0, 60).join("\n");
+        assert!(body.contains("more lines"), "{body}");
+        assert!(body.contains("ctrl+o shows detail"), "{body}");
+    }
+
+    #[test]
+    fn wrapping_keeps_words_intact() {
+        let lines = wrap("allow this tool to write files under the workspace", 12);
+        assert!(lines.iter().all(|line| line.chars().count() <= 12), "{lines:?}");
+        assert!(lines.iter().any(|line| line == "write files"), "{lines:?}");
     }
 
     #[test]

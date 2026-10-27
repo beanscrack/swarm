@@ -16,12 +16,9 @@ use swarm_core::{RunId, RunStatus};
 use swarm_store::Store;
 use tokio::task::JoinHandle;
 
+use crate::style::{SPINNER, SPINNER_MS, verb};
 use crate::transcript::{Color, Header, Transcript, paint};
 
-const FRAMES: [&str; 10] = [
-    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{283e}", "\u{2826}", "\u{2827}",
-    "\u{2807}", "\u{2803}",
-];
 /// The status row is padded to this width so a shorter line wipes the longer
 /// line it replaces.
 const ROW: usize = 100;
@@ -35,20 +32,22 @@ pub fn clear_line() {
     }
 }
 
-/// In-place status line: `⠹ thinking · 12s · 300 tokens`.
+/// In-place status line: `✻ Pondering (writing · 12s · ↓ 300 tokens)` — Claude
+/// Code's shape: frame + one verb per turn, then the dim details in parens.
 struct Spinner {
     quiet: Arc<AtomicBool>,
     started: Instant,
+    verb: &'static str,
     shown: bool,
 }
 
 impl Spinner {
     fn new(quiet: Arc<AtomicBool>) -> Self {
-        Self {
-            quiet,
-            started: Instant::now(),
-            shown: false,
-        }
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.subsec_nanos() as u64)
+            .unwrap_or(0);
+        Self { quiet, started: Instant::now(), verb: verb(seed), shown: false }
     }
 
     fn tick(&mut self, activity: &str, tokens: u64) {
@@ -56,16 +55,22 @@ impl Spinner {
             self.clear();
             return;
         }
-        let frame = FRAMES[(self.started.elapsed().as_millis() / 120) as usize % FRAMES.len()];
-        let mut text = format!(
-            "{frame} {activity} \u{00b7} {}s",
-            self.started.elapsed().as_secs()
-        );
+        let elapsed = self.started.elapsed();
+        let frame = SPINNER[(elapsed.as_millis() as u64 / SPINNER_MS) as usize % SPINNER.len()];
+        let mut detail = format!("{activity} \u{00b7} {}s", elapsed.as_secs());
         if tokens > 0 {
-            text.push_str(&format!(" \u{00b7} {tokens} tokens"));
+            detail.push_str(&format!(
+                " \u{00b7} \u{2193} {} tokens",
+                crate::style::tokens(tokens)
+            ));
         }
-        let pad = " ".repeat(ROW.saturating_sub(text.chars().count()));
-        eprint!("\r{}\r", paint(Color::Ansi, "meta", &text) + &pad);
+        let line = format!(
+            "{} {}",
+            paint(Color::Ansi, "brand", &format!("{frame} {}", self.verb)),
+            paint(Color::Ansi, "meta", &format!("({detail})"))
+        );
+        // Clear to end of line so a shorter tick wipes the longer one before it.
+        eprint!("\r{line}\x1b[K\r");
         let _ = std::io::stderr().flush();
         self.shown = true;
     }

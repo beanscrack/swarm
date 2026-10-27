@@ -37,7 +37,7 @@ use swarm_providers::{
 use swarm_store::Store;
 use swarm_tools::{ToolCall, ToolExecutor, ToolResult};
 
-use crate::prompt::initial_messages;
+use crate::prompt::initial_messages_with;
 use crate::reply::parse_plan;
 use crate::approval::{ApprovalHandler, ApprovalRequest};
 
@@ -58,6 +58,8 @@ pub struct AgentRunner {
     pub executor: Arc<ToolExecutor>,
     pub approval: ApprovalPolicy,
     pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    /// Project instructions (`AGENTS.md` / `CLAUDE.md`) for the system prompt.
+    pub instructions: Option<String>,
 }
 
 /// Tool output fed back to the model is capped this large (8 KiB).
@@ -67,9 +69,9 @@ const MODEL_OUTPUT_CAP: usize = 8 * 1024;
 const MAX_RETRIES: u32 = 3;
 
 /// A fresh `AgentCheckpoint` seeded with the run/task prompt.
-fn fresh_checkpoint(run: &Run, task: &Task) -> AgentCheckpoint {
+fn fresh_checkpoint(run: &Run, task: &Task, instructions: Option<&str>) -> AgentCheckpoint {
     let mut cp = AgentCheckpoint::new();
-    cp.messages = initial_messages(run, task);
+    cp.messages = initial_messages_with(run, task, instructions);
     cp
 }
 
@@ -88,7 +90,7 @@ impl AgentRunner {
         // conversation with the run/task prompts.
         let cp = match self.store.load_checkpoint(&agent.id).await? {
             Some(existing) => existing,
-            None => fresh_checkpoint(run, task),
+            None => fresh_checkpoint(run, task, self.instructions.as_deref()),
         };
         agent.steps = cp.steps;
 
@@ -726,6 +728,7 @@ mod tests {
             executor: Arc::new(executor),
             approval: ApprovalPolicy::Never,
             approval_handler: None,
+            instructions: None,
         };
         (runner, run, task, agent, provider, dir)
     }
@@ -971,7 +974,7 @@ mod tests {
             fixture(vec![MockStep::text("done")]).await;
         // Persist a checkpoint as if one inference had already completed.
         let mut cp = AgentCheckpoint::new();
-        cp.messages = initial_messages(&run, &task);
+        cp.messages = crate::prompt::initial_messages(&run, &task);
         let base_len = cp.messages.len();
         cp.messages.push(ChatMessage::assistant("step 1 done"));
         cp.steps = 1;

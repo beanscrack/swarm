@@ -2,6 +2,7 @@
 
 mod approval;
 mod chat;
+mod style;
 mod commands;
 mod live;
 mod transcript;

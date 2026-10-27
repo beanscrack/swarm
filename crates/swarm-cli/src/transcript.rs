@@ -14,7 +14,9 @@ use std::io::{self, IsTerminal};
 use serde_json::Value;
 use swarm_core::event::{EventKind, RunEvent};
 
-const BULLET: char = '\u{23fa}'; // ⏺ assistant / tool action
+use crate::style::{tokens, PREVIEW_LINES};
+
+const BULLET: &str = crate::style::bullet(); // ● assistant / tool action
 const BRANCH: char = '\u{23bf}'; // ⎿ result
 const CROSS: char = '\u{2717}'; // ✗ failure
 const SPARK: char = '\u{273b}'; // ✻ footer flourish
@@ -49,19 +51,18 @@ impl Color {
     }
 }
 
-/// Paints a line. `role` is one of: action, result, ok, fail, meta, plain.
+/// Paints a line. `role` is one of: action, bullet, result, text, ok, fail,
+/// warn, meta, ask, brand, user, suggest. The palette itself lives in
+/// [`crate::style`], transcribed from the Claude Code bundle.
 pub fn paint(colors: Color, role: &str, text: &str) -> String {
-    let code = match (colors, role) {
-        (Color::Ansi, "action") => "1",
-        (Color::Ansi, "result") => "2",
-        (Color::Ansi, "ok") => "32",
-        (Color::Ansi, "fail") => "31",
-        (Color::Ansi, "meta") => "90",
-        (Color::Ansi, "warn") => "33",
-        (Color::Ansi, "ask") => "35",
-        _ => return text.to_string(),
-    };
-    format!("\x1b[{code}m{text}\x1b[0m")
+    crate::style::role(
+        match colors {
+            Color::Plain => crate::style::Color::Plain,
+            Color::Ansi => crate::style::Color::Ansi,
+        },
+        role,
+        text,
+    )
 }
 
 const MAX_ARGS_VALUE: usize = 56;
@@ -149,6 +150,7 @@ fn compact(text: &str, limit: usize) -> String {
 }
 
 /// Indented continuation lines, so a 40-line reply stays readable in a column.
+/// Overflow is marked Claude Code's way: `+N` for N more lines, not an ellipsis.
 fn indent(text: &str, prefix: &str, limit: usize) -> Vec<String> {
     let mut lines: Vec<String> = text.trim_end().lines().map(str::to_string).collect();
     while lines.last().is_some_and(|line| line.trim().is_empty()) {
@@ -157,7 +159,7 @@ fn indent(text: &str, prefix: &str, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         if index >= limit {
-            out.push(format!("{prefix}{}{}", ELLIPSIS, lines.len() - limit));
+            out.push(format!("{prefix}+{}", lines.len() - limit));
             break;
         }
         out.push(format!("{prefix}{}", compact(line, 200)));
@@ -261,6 +263,27 @@ impl Transcript {
         paint(self.colors, "action", text)
     }
 
+    /// Claude Code's action row: the bullet cell, then the action's own text in
+    /// grey-200, then its arguments dimmer still.
+    fn action(&self, actor: &str, head: &str, args: &str) -> String {
+        let dot = paint(self.colors, "bullet", BULLET);
+        // The actor label and the action verb need a separator: `[a1 t1]bash(...)`
+        // reads as one token, and in a plain (uncoloured) transcript the space is
+        // the only thing between them.
+        let label = if actor.is_empty() || head.is_empty() {
+            format!("{actor}{head}")
+        } else {
+            format!("{actor} {head}")
+        };
+        let label = paint(self.colors, "action", &label);
+        let detail = paint(self.colors, "meta", args);
+        if head.is_empty() && args.is_empty() {
+            format!("{dot}{label}")
+        } else {
+            format!("{dot} {label}{detail}")
+        }
+    }
+
     /// Transcript lines for one event; empty means "not shown at this level".
     /// Render one event.
     ///
@@ -312,7 +335,7 @@ impl Transcript {
                 let text = text_of("text");
                 if calls.is_empty() {
                     if !text.trim().is_empty() {
-                        out.push(self.paint_action(&format!("{BULLET}{actor}")));
+                        out.push(self.action(&actor, "", ""));
                         out.extend(indent(&text, "  ", if self.verbose { 120 } else { 24 }));
                     }
                 } else {
@@ -322,7 +345,7 @@ impl Transcript {
                     } else {
                         format!("asks for {} tools", calls.len())
                     };
-                    out.push(self.paint_action(&format!("{BULLET}{actor} {verb}")));
+                    out.push(self.action(&actor, &verb, ""));
                     if self.verbose && !summary.is_empty() {
                         out.extend(indent(&summary, "  ", 4));
                     }
@@ -336,14 +359,18 @@ impl Transcript {
                 let mut meta = format!(
                     "  {BRANCH} step {step} \u{00b7} {:.1}s \u{00b7} {} \u{2192} {} tokens",
                     latency as f64 / 1000.0,
-                    payload
-                        .get("input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0),
-                    payload
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
+                    tokens(
+                        payload
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                    ),
+                    tokens(
+                        payload
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                    )
                 );
                 if !model.is_empty() {
                     let _ = write!(meta, " \u{00b7} {model}");
@@ -362,7 +389,7 @@ impl Transcript {
                     .get("arguments")
                     .map(args_summary)
                     .unwrap_or_default();
-                vec![self.paint_action(&format!("{BULLET}{actor} {name}({args})"))]
+                vec![self.action(&actor, &name, &format!("({args})"))]
             }
             EventKind::ToolResult => {
                 let success = payload
@@ -370,26 +397,33 @@ impl Transcript {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let output = text_of("output");
-                let first = output
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or("");
                 let mark = if success { BRANCH } else { CROSS };
                 let role = if success { "result" } else { "fail" };
                 let truncated = payload
                     .get("truncated")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let tail = if truncated {
-                    format!(" {ELLIPSIS}")
-                } else {
-                    String::new()
-                };
-                vec![paint(
-                    self.colors,
-                    role,
-                    &format!("  {mark} {}{tail}", compact(first, 160)),
-                )]
+                // Claude Code keeps a short preview of the output under the
+                // branch, at 4-space indent, and marks the cut with `+N`.
+                let budget = if self.verbose { 120 } else { PREVIEW_LINES };
+                let mut body = indent(&output, "    ", budget);
+                if truncated && !body.is_empty() {
+                    let last = body.len() - 1;
+                    body[last] = format!("{} {ELLIPSIS}", body[last]);
+                }
+                let mut out = Vec::new();
+                match body.first().cloned() {
+                    Some(head) => {
+                        out.push(paint(self.colors, role, &format!("  {mark} {}", head.trim())));
+                        out.extend(
+                            body[1..]
+                                .iter()
+                                .map(|line| paint(self.colors, role, line)),
+                        );
+                    }
+                    None => out.push(paint(self.colors, role, &format!("  {mark} (empty)"))),
+                }
+                out
             }
             // The interactive card (ConsoleApproval) carries the request; the
             // transcript only records the outcome, below.
@@ -586,7 +620,7 @@ mod tests {
         );
         assert_eq!(lines.len(), 24 + 3); // bullet + 24 lines + overflow marker + meta
         assert!(lines.last().unwrap().contains("step 2"));
-        assert_eq!(lines[25], format!("  {ELLIPSIS}16"));
+        assert_eq!(lines[25], "  +16");
     }
 
     #[test]
@@ -599,6 +633,21 @@ mod tests {
         );
         assert!(lines[0].contains("asks for write_file"));
         assert!(!lines.iter().any(|line| line.contains("```")));
+    }
+
+    #[test]
+    fn actor_and_verb_are_separated() {
+        // The live transcript showed `[a1 t1]asks for bash` and
+        // `[a1 t1]bash(...)`; in a plain transcript the space is the separator.
+        let mut transcript = Transcript::new(Color::Plain, false);
+        let request = event(
+            EventKind::ToolRequested,
+            json!({"name":"bash","arguments":{"command":"echo hi"}}),
+        )
+        .with_agent(swarm_core::AgentId::new())
+        .with_task(swarm_core::TaskId::new());
+        let line = transcript.lines(&request).remove(0);
+        assert!(line.contains("[a1 t1] bash(command=echo hi"), "{line}");
     }
 
     #[test]
@@ -687,8 +736,16 @@ mod tests {
     #[test]
     fn colors_wrap_only_when_enabled() {
         assert_eq!(paint(Color::Plain, "fail", "x"), "x");
+        // Claude Code's error red, #FF6B6B, as truecolor.
         let colored = paint(Color::Ansi, "fail", "x");
-        assert!(colored.starts_with("\x1b[31m") && colored.ends_with("\x1b[0m"));
+        assert!(
+            colored.starts_with("\x1b[38;2;255;107;107m") && colored.ends_with("\x1b[0m"),
+            "{colored}"
+        );
+        // The action bullet is brand terracotta, and carries no background.
+        let bullet = paint(Color::Ansi, "bullet", crate::style::bullet());
+        assert!(bullet.contains("38;2;215;119;87"), "{bullet}");
+        assert!(!bullet.contains("48;2;"), "{bullet}");
     }
 
     #[test]

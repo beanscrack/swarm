@@ -16,6 +16,8 @@ pub use agent::{AgentOutcome, AgentRunner};
 pub use approval::{ApprovalHandler, ApprovalRequest};
 pub use error::RuntimeError;
 pub use factory::{build_registry, chatgpt_web_provider_config, gemini_web_provider_config, local_provider_config, scheduler_config};
-pub use prompt::{initial_messages, system_prompt};
+pub use prompt::{
+    initial_messages, initial_messages_with, project_instructions, system_prompt, system_prompt_with,
+};
 pub use reply::parse_plan;
 pub use runtime::Runtime;

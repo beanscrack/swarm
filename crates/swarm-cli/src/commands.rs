@@ -459,7 +459,10 @@ pub(crate) async fn drive_turn(
         .allow_network(cfg.tools.allow_network);
     let executor = Arc::new(ToolExecutor::new(sandbox));
     let runtime = Runtime::new(store.clone(), registry, executor, scheduler)
-        .with_approval(cfg.tools.approval);
+        .with_approval(cfg.tools.approval)
+        // Claude Code reads CLAUDE.md from the project root; do the same for
+        // AGENTS.md/CLAUDE.md so repo instructions reach every agent.
+        .with_instructions(swarm_runtime::project_instructions(workspace));
     let created = match existing {
         // Resuming continues the run that is already in the store; a new goal
         // creates one. The scheduler picks up persisted task state either way.
