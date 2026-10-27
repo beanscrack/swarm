@@ -21,6 +21,7 @@ use super::menu::{Menu, MenuItem, MenuKind};
 use super::registry;
 use super::screen::Frame;
 use super::text::{pad_right, spread, truncate, width};
+use super::vim::{self, Vim};
 use crate::style::{self, Color, SPINNER, SPINNER_MS, role};
 
 /// How long a "press again" prompt stays armed.
@@ -42,6 +43,10 @@ pub enum Action {
     CycleMode,
     /// Ctrl+O: transcript detail on/off.
     ToggleVerbose,
+    /// Esc pressed twice at an empty prompt: pick a point to rewind to.
+    Rewind,
+    /// `/btw <question>`: answer on the side, even while a turn runs.
+    Side(String),
 }
 
 /// Permission mode, as the footer shows it.
@@ -128,6 +133,8 @@ pub enum Effect {
     /// Commit these rows to the scrollback.
     Print(Vec<String>),
     ClearScreen,
+    /// Take the terminal's modes back and repaint the prompt area (`/redraw`).
+    Redraw,
     Suspend,
     /// Edit this text in `$EDITOR`, then hand it back.
     EditExternal(String),
@@ -138,18 +145,26 @@ pub enum Effect {
 
 /// A submitted line as the transcript shows it: a blank row, then the text on a
 /// shaded band, as Claude Code echoes your message.
+///
+/// The band runs to the edge by erasing the rest of the row in the band's
+/// colour, not by writing spaces: spaces are real cells, and when the terminal
+/// is narrowed they wrap into an extra empty row inside the transcript.
 pub fn echo_rows(colors: Color, cols: usize, text: &str) -> Vec<String> {
     let cols = cols.max(8);
+    let fill = if colors == Color::Ansi { "\x1b[K" } else { "" };
     let mut out = vec![String::new()];
     for (index, line) in text.lines().enumerate() {
         let lead = if index == 0 { PROMPT } else { "  " };
         let wrapped = super::text::wrap_hang(line, cols.saturating_sub(1), lead, "  ");
         for row in wrapped {
-            let padded = pad_right(&row, cols.saturating_sub(1));
             out.push(if index == 0 && row.starts_with(PROMPT) {
-                format!("{}{}", role(colors, "brand", PROMPT), role(colors, "echo", &padded[PROMPT.len()..]))
+                format!(
+                    "{}{}",
+                    role(colors, "brand", PROMPT),
+                    role(colors, "echo", &format!("{}{fill}", &row[PROMPT.len()..]))
+                )
             } else {
-                role(colors, "echo", &padded)
+                role(colors, "echo", &format!("{row}{fill}"))
             });
         }
     }
@@ -205,6 +220,7 @@ pub struct App {
     armed: Option<(Arm, Instant)>,
     notice: Option<(String, Instant)>,
     show_help: bool,
+    vim: Vim,
     cols: usize,
     rows: usize,
     placeholder: usize,
@@ -243,6 +259,8 @@ impl App {
             armed: None,
             notice: None,
             show_help: false,
+            // `SWARM_VIM=1` starts in vim mode; `/vim` toggles it in a session.
+            vim: Vim::new(std::env::var("SWARM_VIM").is_ok_and(|value| !value.is_empty() && value != "0")),
             cols: 80,
             rows: 24,
             placeholder: seed % PLACEHOLDERS.len(),
@@ -441,6 +459,16 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let edit_cols = self.cols.saturating_sub(PROMPT.chars().count()).max(2);
+        // Vim keys come first, except while a menu is open: the menu owns Esc,
+        // the arrows, Tab and Enter then.
+        if self.menu.is_none() {
+            match self.vim.key(&mut self.editor, key) {
+                vim::Outcome::Handled => return Vec::new(),
+                vim::Outcome::Move { down: true } => return self.down(edit_cols),
+                vim::Outcome::Move { down: false } => return self.up(edit_cols),
+                vim::Outcome::Pass => {}
+            }
+        }
         match key.code {
             // --- leaving, interrupting ---
             KeyCode::Char('c') if ctrl => {
@@ -485,7 +513,16 @@ impl App {
                     } else {
                         self.armed = Some((Arm::Esc, now + ARM_FOR));
                     }
+                    return Vec::new();
                 }
+                // Claude Code: Esc twice on an empty prompt opens the rewind picker.
+                if self.is_armed(Arm::Esc, now) {
+                    self.armed = None;
+                    self.notice = None;
+                    return vec![Effect::Action(Action::Rewind)];
+                }
+                self.armed = Some((Arm::Esc, now + ARM_FOR));
+                self.notice = Some(("Press Esc again to rewind".to_string(), now + ARM_FOR));
                 Vec::new()
             }
             KeyCode::Char('z') if ctrl => vec![Effect::Suspend],
@@ -702,6 +739,7 @@ impl App {
         let text = self.editor.expanded().trim().to_string();
         self.history.push(&text);
         self.editor.reset();
+        self.vim.reset();
         self.menu = None;
         if text.is_empty() {
             return Vec::new();
@@ -717,6 +755,7 @@ impl App {
         }
         self.history.push(&text);
         self.editor.reset();
+        self.vim.reset();
         self.menu = None;
         self.dismissed_for = None;
         if let Some(effects) = self.local_command(&text, now) {
@@ -756,6 +795,28 @@ impl App {
                     }
                 };
                 Some(self.queue_op(op))
+            }
+            "redraw" => Some(vec![Effect::Redraw]),
+            "vim" => {
+                let on = match args {
+                    "on" | "1" | "true" => true,
+                    "off" | "0" | "false" => false,
+                    "" | "toggle" => !self.vim.enabled(),
+                    _ => {
+                        self.notice = Some(("usage: /vim [on|off]".into(), now + NOTICE_FOR));
+                        return Some(Vec::new());
+                    }
+                };
+                self.vim.set_enabled(on);
+                let line = if on {
+                    "vim keys on \u{00b7} esc for normal mode, i to insert, /vim off to leave"
+                } else {
+                    "vim keys off"
+                };
+                Some(vec![Effect::Print(vec![self.paint("subtle", &format!("  {line}"))])])
+            }
+            "btw" if !args.is_empty() => {
+                Some(vec![Effect::Print(self.echo(text)), Effect::Action(Action::Side(args.to_string()))])
             }
             "busy" => {
                 match args {
@@ -1035,7 +1096,7 @@ impl App {
 
     fn shortcut_sheet(&self, cols: usize) -> Vec<String> {
         let rows = [
-            ("! for bash mode", "esc esc to clear input", "ctrl+r search history"),
+            ("! for bash mode", "esc esc clears or rewinds", "ctrl+r search history"),
             ("/ for commands", "shift+tab cycles approvals", "ctrl+o transcript detail"),
             ("@ for file paths", "\\ then enter for a newline", "ctrl+g edit in $EDITOR"),
             ("# to save a note", "tab queues while running", "ctrl+l clear the screen"),
@@ -1077,6 +1138,9 @@ impl App {
             }
         };
         let mut right = Vec::new();
+        if let Some(label) = self.vim.label() {
+            right.push(label.to_string());
+        }
         if let Some(goal) = &self.info.goal {
             right.push(goal.clone());
         }
@@ -1316,6 +1380,19 @@ mod tests {
     }
 
     #[test]
+    fn escape_twice_on_an_empty_prompt_asks_to_rewind() {
+        let mut app = app();
+        assert!(press(&mut app, KeyCode::Esc).is_empty(), "the first press only asks");
+        assert!(view_text(&app).contains("Press Esc again to rewind"));
+        assert_eq!(press(&mut app, KeyCode::Esc), vec![Effect::Action(Action::Rewind)]);
+        // Typing in between cancels it, so a stray Esc never opens the picker.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Backspace);
+        assert!(press(&mut app, KeyCode::Esc).is_empty());
+    }
+
+    #[test]
     fn escape_twice_discards_a_draft_into_history() {
         let mut app = app();
         type_text(&mut app, "keep me");
@@ -1325,6 +1402,124 @@ mod tests {
         assert!(app.editor_text().is_empty());
         press(&mut app, KeyCode::Up);
         assert_eq!(app.editor_text(), "keep me", "the discarded draft is recallable");
+    }
+
+    fn vim_app() -> App {
+        let mut app = app();
+        app.vim.set_enabled(true);
+        app
+    }
+
+    #[test]
+    fn vim_keys_edit_the_prompt_and_enter_still_sends_it() {
+        let mut app = vim_app();
+        assert!(view_text(&app).contains("-- INSERT --"));
+        type_text(&mut app, "fix the bug");
+        press(&mut app, KeyCode::Esc);
+        assert!(view_text(&app).contains("-- NORMAL --"));
+        // Back a word, delete it, say something else.
+        type_text(&mut app, "bcw");
+        assert_eq!(app.editor_text(), "fix the ", "cw changed the word");
+        type_text(&mut app, "typo");
+        assert_eq!(app.editor_text(), "fix the typo", "and now typing is typing again");
+        press(&mut app, KeyCode::Esc);
+        type_text(&mut app, "0dw");
+        assert_eq!(app.editor_text(), "the typo");
+        let effects = press(&mut app, KeyCode::Enter);
+        assert_eq!(submitted(&effects), Some("the typo"), "Enter sends from normal mode too");
+        assert!(view_text(&app).contains("-- INSERT --"), "the next prompt starts in insert mode");
+    }
+
+    #[test]
+    fn letters_typed_in_normal_mode_do_not_land_in_the_prompt() {
+        let mut app = vim_app();
+        press(&mut app, KeyCode::Esc);
+        // h, e, l are motions and q, z, g are not commands at all: none is text.
+        type_text(&mut app, "helqzg");
+        assert_eq!(app.editor_text(), "", "these are commands, not text");
+        // (An `o` would open a line, as in vim, and `i` or `a` would start typing.)
+    }
+
+    #[test]
+    fn escape_keeps_its_other_jobs_in_normal_mode() {
+        let mut app = vim_app();
+        let now = Instant::now();
+        app.on_msg(Msg::Busy(true), now);
+        // First Esc leaves insert mode; the second is the usual "stop the turn".
+        assert!(press(&mut app, KeyCode::Esc).is_empty());
+        assert_eq!(press(&mut app, KeyCode::Esc), vec![Effect::Action(Action::Interrupt)]);
+        app.on_msg(Msg::Busy(false), now);
+        // On an empty idle prompt, a further Esc Esc rewinds.
+        assert!(press(&mut app, KeyCode::Esc).is_empty());
+        assert_eq!(press(&mut app, KeyCode::Esc), vec![Effect::Action(Action::Rewind)]);
+    }
+
+    #[test]
+    fn an_open_menu_keeps_the_keys_and_vim_is_off_until_asked_for() {
+        let mut app = vim_app();
+        type_text(&mut app, "/he");
+        assert!(app.menu.is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.menu.is_none(), "Esc closed the menu rather than entering normal mode");
+        assert!(view_text(&app).contains("-- INSERT --"));
+        let mut plain = app_with_default_keys();
+        type_text(&mut plain, "abc");
+        press(&mut plain, KeyCode::Esc);
+        assert!(!view_text(&plain).contains("--"), "without /vim there is no mode line");
+    }
+
+    fn app_with_default_keys() -> App {
+        let mut app = app();
+        app.vim.set_enabled(false);
+        app
+    }
+
+    #[test]
+    fn the_vim_command_toggles_and_works_while_a_turn_runs() {
+        let mut app = app_with_default_keys();
+        let now = Instant::now();
+        app.on_msg(Msg::Busy(true), now);
+        type_text(&mut app, "/vim");
+        let effects = press(&mut app, KeyCode::Enter);
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::Print(rows) if rows[0].contains("vim keys on"))), "{effects:?}");
+        assert!(app.queued().is_empty(), "not queued behind the turn");
+        assert!(view_text(&app).contains("-- INSERT --"));
+        type_text(&mut app, "/vim off");
+        press(&mut app, KeyCode::Enter);
+        assert!(!view_text(&app).contains("-- INSERT --"));
+        type_text(&mut app, "/vim sideways");
+        press(&mut app, KeyCode::Enter);
+        assert!(view_text(&app).contains("usage: /vim [on|off]"));
+    }
+
+    #[test]
+    fn btw_is_answered_on_the_side_even_while_a_turn_runs() {
+        let mut app = app();
+        let now = Instant::now();
+        app.on_msg(Msg::Busy(true), now);
+        type_text(&mut app, "/btw why is it slow?");
+        let effects = press(&mut app, KeyCode::Enter);
+        assert!(
+            effects.contains(&Effect::Action(Action::Side("why is it slow?".into()))),
+            "not queued behind the turn: {effects:?}"
+        );
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::Print(rows) if rows.iter().any(|row| row.contains("/btw")))));
+        assert!(app.queued().is_empty());
+        // Without a question it is not a side question; the session explains the usage.
+        type_text(&mut app, "/btw");
+        assert!(press(&mut app, KeyCode::Enter).iter().all(|effect| !matches!(effect, Effect::Action(Action::Side(_)))));
+    }
+
+    #[test]
+    fn redraw_works_even_while_a_turn_runs() {
+        let mut app = app();
+        let now = Instant::now();
+        type_text(&mut app, "/redraw");
+        assert_eq!(press(&mut app, KeyCode::Enter), vec![Effect::Redraw]);
+        app.on_msg(Msg::Busy(true), now);
+        type_text(&mut app, "/repaint");
+        assert_eq!(press(&mut app, KeyCode::Enter), vec![Effect::Redraw], "an alias, and not queued behind the turn");
+        assert!(app.queued().is_empty());
     }
 
     #[test]
@@ -1783,6 +1978,18 @@ mod tests {
         assert_eq!(app.editor_text(), "");
         ctrl(&mut app, 'y');
         assert_eq!(app.editor_text(), ">> hello ", "yank restores the kill");
+    }
+
+    #[test]
+    fn the_echo_band_is_filled_by_erasing_not_by_writing_spaces() {
+        // Written spaces are cells that wrap when the terminal is narrowed, leaving
+        // an empty row inside the transcript; an erase leaves nothing to wrap.
+        let rows = echo_rows(Color::Ansi, 80, "fix the bug");
+        let band = &rows[1];
+        assert!(band.contains("\x1b[K"), "the band reaches the edge by erasing: {band:?}");
+        assert_eq!(width(band), "\u{276f} fix the bug".chars().count(), "no padding cells: {band:?}");
+        let plain = echo_rows(Color::Plain, 80, "fix the bug");
+        assert_eq!(plain[1], "\u{276f} fix the bug", "plain output has no escapes and no padding");
     }
 
     #[test]

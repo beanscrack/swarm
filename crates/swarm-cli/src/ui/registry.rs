@@ -1,6 +1,8 @@
 //! The slash-command table: one source for the popup menu, `/help`, prefix
 //! expansion and "did you mean".
 
+use std::sync::RwLock;
+
 /// One slash command.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SlashSpec {
@@ -19,6 +21,8 @@ pub enum Group {
     Run,
     Setup,
     Info,
+    /// Commands the user defined as markdown files.
+    Custom,
 }
 
 impl Group {
@@ -28,6 +32,7 @@ impl Group {
             Group::Run => "Work",
             Group::Setup => "Setup",
             Group::Info => "Inspect",
+            Group::Custom => "Custom",
         }
     }
 }
@@ -44,14 +49,20 @@ pub const COMMANDS: &[SlashSpec] = &[
     cmd!(Session, "new", [], "", "Start a fresh session"),
     cmd!(Session, "compact", [], "", "Fold older turns into a short digest"),
     cmd!(Session, "resume", [], "[run]", "Pick up a previous run"),
+    cmd!(Session, "rewind", ["checkpoint"], "[n] [code|chat|both]", "Roll files and conversation back to before a request"),
     cmd!(Session, "undo", [], "[n]", "Drop the last turn from context and edit it again"),
     cmd!(Session, "retry", [], "", "Drop the last turn and send it again"),
+    cmd!(Session, "btw", [], "<question>", "Ask a side question without interrupting or joining the conversation"),
     cmd!(Session, "copy", [], "", "Copy the last result to the clipboard"),
     cmd!(Session, "export", [], "[file]", "Write this session to a markdown file"),
     cmd!(Session, "exit", ["quit", "q"], "", "Leave the session"),
     cmd!(Run, "goal", [], "[text|status|pause|resume|clear]", "Keep working until a goal is met"),
+    cmd!(Run, "subgoal", [], "[text|rm <n>|clear]", "Add a condition the goal must also meet"),
     cmd!(Run, "plan", [], "<task>", "Plan a task read-only before changing anything"),
     cmd!(Run, "init", [], "", "Create AGENTS.md with project instructions"),
+    cmd!(Run, "review", [], "[what to review]", "Review uncommitted changes (or what you name); edits nothing"),
+    cmd!(Run, "security-review", [], "[what to review]", "Review the pending changes for security problems"),
+    cmd!(Run, "loop", [], "[5m <prompt>|stop]", "Run a prompt on an interval while the session is idle"),
     cmd!(Run, "queue", [], "[list|rm <n>|clear]", "Show or edit goals waiting to run"),
     cmd!(Run, "busy", [], "[queue|interrupt]", "What Enter does while a turn is running"),
     cmd!(Run, "agents", [], "[n]", "Swarm size for the next turns"),
@@ -59,27 +70,48 @@ pub const COMMANDS: &[SlashSpec] = &[
     cmd!(Setup, "permissions", ["approve", "perm"], "[ask|danger|all]", "Tool approval policy"),
     cmd!(Setup, "allow", [], "[tool]", "List or allow a tool for this session"),
     cmd!(Setup, "allow-all", ["yolo"], "", "Stop asking for approval this session"),
+    cmd!(Setup, "focus", [], "[on|off]", "Show only your prompts, answers and failures"),
+    cmd!(Setup, "vim", [], "[on|off]", "Vim keys in the prompt (SWARM_VIM=1 starts with them)"),
+    cmd!(Setup, "redraw", ["repaint"], "", "Repaint the prompt area if the terminal got scrambled"),
     cmd!(Setup, "verbose", [], "[on|off]", "Toggle full transcript detail (ctrl+o)"),
+    cmd!(Setup, "reload", [], "", "Re-read custom commands from .swarm/commands"),
     cmd!(Setup, "memory", [], "[edit]", "Show or edit AGENTS.md"),
     cmd!(Setup, "config", [], "", "Show the effective configuration"),
     cmd!(Info, "status", [], "[run]", "Session setup, or the state of a run"),
     cmd!(Info, "cost", ["usage"], "", "Tokens, calls and time for this session"),
     cmd!(Info, "context", [], "", "How much conversation travels with each goal"),
+    cmd!(Info, "todos", ["todo"], "", "The checklist the agent is keeping"),
     cmd!(Info, "tasks", [], "[run]", "Tasks in a run"),
     cmd!(Info, "logs", ["transcript"], "[run]", "Replay a run's transcript"),
     cmd!(Info, "runs", [], "", "Recent runs in this store"),
     cmd!(Info, "history", ["turns"], "", "Turns in this session"),
+    cmd!(Info, "hooks", [], "", "Hooks (shell commands) running at tool calls and prompts"),
     cmd!(Info, "tools", [], "", "Tools the agent may call"),
     cmd!(Info, "diff", [], "[--stat]", "Show uncommitted changes in the workspace"),
     cmd!(Info, "doctor", [], "", "Check the setup for problems"),
 ];
 
+static CUSTOM: RwLock<Vec<&'static SlashSpec>> = RwLock::new(Vec::new());
+
+/// Replace the user-defined commands (see [`crate::custom`]).
+pub fn set_custom(specs: Vec<&'static SlashSpec>) {
+    if let Ok(mut custom) = CUSTOM.write() {
+        *custom = specs;
+    }
+}
+
+/// Every command: the built-ins, then the user's.
+pub fn all() -> Vec<&'static SlashSpec> {
+    let custom = CUSTOM.read().map(|custom| custom.clone()).unwrap_or_default();
+    COMMANDS.iter().chain(custom).collect()
+}
+
 /// Commands whose name or alias starts with `prefix` (no leading slash),
 /// best first: exact names, then registry order.
 pub fn matching(prefix: &str) -> Vec<&'static SlashSpec> {
     let prefix = prefix.to_ascii_lowercase();
-    let mut hits: Vec<(u8, usize, &'static SlashSpec)> = COMMANDS
-        .iter()
+    let mut hits: Vec<(u8, usize, &'static SlashSpec)> = all()
+        .into_iter()
         .enumerate()
         .filter_map(|(index, spec)| {
             if spec.name == prefix {
@@ -112,24 +144,32 @@ pub enum Resolved {
 
 pub fn resolve(word: &str) -> Resolved {
     let word = word.to_ascii_lowercase();
-    if let Some(spec) = COMMANDS
+    let specs = all();
+    if let Some(spec) = specs
         .iter()
         .find(|spec| spec.name == word || spec.aliases.contains(&word.as_str()))
     {
         return Resolved::Exact(spec);
     }
     if !word.is_empty() {
-        let hits: Vec<&'static SlashSpec> = COMMANDS
+        let mut hits: Vec<&'static SlashSpec> = specs
             .iter()
+            .copied()
             .filter(|spec| spec.name.starts_with(&word))
             .collect();
+        // A command you added must not take a short form away from a built-in
+        // (`/cl` stays `/clear` when you have a `/clear-cache`).
+        let builtin: Vec<&'static SlashSpec> = hits.iter().copied().filter(|spec| spec.group != Group::Custom).collect();
+        if builtin.len() == 1 {
+            hits = builtin;
+        }
         match hits.len() {
             1 => return Resolved::Unique(hits[0]),
             n if n > 1 => return Resolved::Ambiguous(hits.iter().map(|spec| spec.name).collect()),
             _ => {}
         }
     }
-    let mut scored: Vec<(usize, &'static str)> = COMMANDS
+    let mut scored: Vec<(usize, &'static str)> = specs
         .iter()
         .flat_map(|spec| std::iter::once(spec.name).chain(spec.aliases.iter().copied()))
         .map(|name| (distance(&word, name), name))
@@ -197,6 +237,26 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_command_does_not_steal_a_builtins_short_form() {
+        static CUSTOM_SPEC: SlashSpec = SlashSpec {
+            name: "zzcopy-everything",
+            aliases: &[],
+            args: "",
+            desc: "custom",
+            group: Group::Custom,
+        };
+        let _lock = crate::custom::TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_custom(vec![&CUSTOM_SPEC]);
+        // `cop` is only `copy` among built-ins; `zzcop` only the custom one.
+        assert!(matches!(resolve("cop"), Resolved::Unique(spec) if spec.name == "copy"));
+        assert!(matches!(resolve("zzcop"), Resolved::Unique(spec) if spec.name == "zzcopy-everything"));
+        // Several built-ins stay ambiguous, and an exact custom name is exact.
+        assert!(matches!(resolve("c"), Resolved::Ambiguous(_)));
+        assert!(matches!(resolve("zzcopy-everything"), Resolved::Exact(_)));
+        set_custom(Vec::new());
+    }
+
+    #[test]
     fn an_ambiguous_prefix_lists_candidates() {
         match resolve("c") {
             Resolved::Ambiguous(names) => {
@@ -224,7 +284,7 @@ mod tests {
 
     #[test]
     fn menu_matching_puts_exact_names_first() {
-        let all = matching("");
+        let all: Vec<_> = matching("").into_iter().filter(|spec| spec.group != Group::Custom).collect();
         assert_eq!(all.len(), COMMANDS.len());
         let hits = matching("c");
         assert!(hits.iter().all(|spec| spec.name.starts_with('c')

@@ -4,6 +4,8 @@ mod approval;
 mod chat;
 mod style;
 mod commands;
+mod custom;
+mod hooks;
 mod live;
 mod transcript;
 mod ui;

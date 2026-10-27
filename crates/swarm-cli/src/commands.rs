@@ -433,6 +433,10 @@ pub(crate) struct TurnEnv {
     pub allow: Arc<AllowList>,
     pub mode: Arc<SharedMode>,
     pub verbose: bool,
+    /// Show only the assistant's words, failures and denials (no tool rows).
+    pub focus: bool,
+    /// Shell hooks around tool calls.
+    pub hooks: Option<Arc<crate::hooks::Hooks>>,
     /// Print the run banner first (`swarm run`; a chat turn has its own header).
     pub banner: bool,
 }
@@ -502,8 +506,13 @@ pub(crate) async fn drive_turn(
             env.banner.then_some(&header),
             env.ui.clone(),
             env.verbose,
+            env.focus,
         )
     });
+    let runtime = match &env.hooks {
+        Some(hooks) => runtime.with_tool_hooks(hooks.clone()),
+        None => runtime,
+    };
     let runtime = if cfg.tools.approval == ApprovalPolicy::Never {
         runtime
     } else {
@@ -559,6 +568,8 @@ async fn drive_standalone(
         allow: allow_list(),
         mode: SharedMode::new(mode_of(cfg.tools.approval)),
         verbose,
+        focus: false,
+        hooks: None,
         banner: true,
     };
     let current = Arc::new(Mutex::new(None));

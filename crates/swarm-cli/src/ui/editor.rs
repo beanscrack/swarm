@@ -318,6 +318,45 @@ impl Editor {
         row.end
     }
 
+    // ---- what a modal layer (vim keys) needs ----------------------------
+
+    /// Put the cursor at `pos` (rounded back to a grapheme boundary).
+    pub fn set_cursor(&mut self, pos: usize) {
+        let mut pos = pos.min(self.text.len());
+        while !self.text.is_char_boundary(pos) {
+            pos -= 1;
+        }
+        self.cursor = if pos == self.text.len() { pos } else { self.prev_boundary(self.next_boundary(pos)) };
+        self.typing = false;
+    }
+
+    /// Byte range of the cursor's logical line, its newline excluded.
+    pub fn line_bounds(&self) -> (usize, usize) {
+        (self.line_start(self.cursor), self.line_end(self.cursor))
+    }
+
+    pub fn prev_grapheme(&self, from: usize) -> usize {
+        self.prev_boundary(from)
+    }
+
+    pub fn next_grapheme(&self, from: usize) -> usize {
+        self.next_boundary(from)
+    }
+
+    /// Delete `start..end`, keeping it as the kill register's text.
+    pub fn cut_range(&mut self, start: usize, end: usize) {
+        self.cut(start.min(self.text.len()), end.min(self.text.len()));
+    }
+
+    /// The kill register, as `p` pastes it.
+    pub fn kill_text(&self) -> &str {
+        &self.kill
+    }
+
+    pub fn set_kill(&mut self, text: &str) {
+        self.kill = text.to_string();
+    }
+
     fn prev_boundary(&self, from: usize) -> usize {
         self.text[..from]
             .grapheme_indices(true)

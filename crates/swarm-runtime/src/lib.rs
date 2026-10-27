@@ -8,12 +8,14 @@ mod agent;
 mod approval;
 mod error;
 mod factory;
+mod hooks;
 mod prompt;
 mod reply;
 mod runtime;
 
 pub use agent::{AgentOutcome, AgentRunner};
 pub use approval::{ApprovalHandler, ApprovalRequest};
+pub use hooks::{HookCall, ToolHooks};
 pub use error::RuntimeError;
 pub use factory::{build_registry, chatgpt_web_provider_config, gemini_web_provider_config, local_provider_config, scheduler_config};
 pub use prompt::{

@@ -129,7 +129,7 @@ exact command or diff before anything runs:
 | --- | --- |
 | `enter` | send (a partial `/command` is completed first) |
 | `shift+enter`, `ctrl+j`, `\` then `enter` | newline (`shift+enter` needs a terminal with the kitty keyboard protocol; the others work everywhere) |
-| `esc` | stop the running turn; closes a menu first; pressed twice it clears the prompt (the draft stays in history) |
+| `esc` | stop the running turn; closes a menu first; pressed twice it clears a typed prompt (the draft stays in history), or on an empty prompt opens `/rewind` |
 | `ctrl+c` | clear the prompt, else stop the turn, else press twice to exit |
 | `ctrl+d` | delete forward, or exit on an empty prompt (press twice) |
 | `shift+tab` | cycle permission mode: default → ask every tool → auto → plan |
@@ -159,12 +159,14 @@ the whole text is sent. Typing `/` opens a command menu, `@` a file menu.
 | Session | Work | Setup | Inspect |
 | --- | --- | --- | --- |
 | `/help [filter]` | `/goal [text\|status\|pause\|resume\|clear]` | `/model [name]` | `/status [run]` |
-| `/clear` `/new` | `/plan <task>` | `/permissions [ask\|all\|auto\|plan]` | `/cost` |
-| `/compact` | `/init` | `/allow [tool]` `/allow-all` | `/context` |
-| `/resume [run]` | `/queue [list\|rm n\|clear]` | `/verbose` | `/tasks [run]` `/logs [run]` |
-| `/undo [n]` `/retry` | `/busy [queue\|interrupt]` | `/memory [edit]` | `/runs` `/history` |
-| `/copy` `/export [file]` | `/agents [n]` | `/config` | `/tools` `/diff` `/doctor` |
-| `/exit` | | | |
+| `/clear` `/new` | `/subgoal [text\|rm n\|clear]` | `/permissions [ask\|all\|auto\|plan]` | `/cost` |
+| `/compact` | `/plan <task>` | `/allow [tool]` `/allow-all` | `/context` |
+| `/resume [run]` | `/review [what]` `/security-review [what]` | `/verbose` `/focus` | `/todos` |
+| `/rewind [n] [code\|chat\|both]` | `/loop [5m <prompt>\|stop]` | `/redraw` | `/tasks [run]` `/logs [run]` |
+| `/undo [n]` `/retry` | `/init` | `/reload` | `/runs` `/history` |
+| `/btw <question>` | `/queue [list\|rm n\|clear]` | `/memory [edit]` | `/hooks` |
+| `/copy` `/export [file]` | `/busy [queue\|interrupt]` | `/config` | `/tools` `/diff` `/doctor` |
+| `/exit` | `/agents [n]` | | |
 
 An unambiguous prefix works (`/comp`), and a typo gets a suggestion
 (`/hepl` → did you mean `/help`).
@@ -192,6 +194,103 @@ command there too). The final result is printed to stdout. Colours are dropped
 for pipes, `NO_COLOR` and `TERM=dumb`; `SWARM_UI=always` forces them and
 `SWARM_UI=never` disables them. `SWARM_KEYBOARD=legacy` skips the keyboard
 protocol query for terminals that mishandle it.
+
+### Rewind
+
+`/rewind` (or `esc esc` on an empty prompt) goes back to before one of your
+requests: pick the request, then whether to restore the code, the conversation,
+or both. Every file the agent wrote or edited is recorded with what it held
+before, so restoring puts those files back, and removes files the agent created.
+A file you (or a shell command) changed since the agent wrote it is left alone
+and listed, never overwritten. Shell commands the agent ran are not undone.
+Without a terminal: `/rewind 2 code` goes back two requests, files only
+(`code`, `chat` or `both`, default both). The request comes back in the prompt.
+A turn you interrupted counts too, since it may already have edited files.
+
+### The agent's checklist
+
+For work with several steps the agent keeps a checklist (`todo_write`), drawn as
+it changes: `☒` done, `◐` in progress (the status line names it while it
+runs), `☐` to do. `/todos` shows the current list. It is carried into your next
+request, so the agent picks up where it left off. Nothing needs approval for it.
+
+### Custom commands
+
+A markdown file is a command: `.swarm/commands/fix-tests.md` becomes
+`/fix-tests`, and a folder is a namespace (`review/api.md` is `/review:api`).
+Looked up in `<store>/commands` (default `./.swarm/commands`),
+`<workspace>/.swarm/commands`, `<workspace>/.claude/commands` (so a project's
+Claude Code commands work), `~/.swarm/commands` and `~/.claude/commands`, in
+that order. They appear in the `/` menu and `/help`, marked `(project)` or
+`(user)`.
+
+```markdown
+---
+description: Fix a failing test
+argument-hint: <test name>
+---
+Run `$1`, find why it fails, fix the code (not the test), and run it again.
+Anything else I typed: $ARGUMENTS
+```
+
+`$ARGUMENTS` is everything after the command, `$1`..`$9` its words (quote a
+phrase to keep it together), and `@path` attaches a file. With none of them in
+the body, the arguments are appended. The file is read each time you use it, so
+edits apply at once; `/reload` picks up new files. A built-in command always
+wins a name clash.
+
+### Hooks
+
+Shell commands that run at fixed points, as in Claude Code. In
+`~/.swarm/settings.json` or `.swarm/settings.json`:
+
+```json
+{ "hooks": {
+    "PreToolUse":  [{ "matcher": "bash|write_file",
+                      "hooks": [{ "type": "command", "command": "./check.sh", "timeout": 10 }] }],
+    "PostToolUse": [{ "matcher": "Edit", "hooks": [{ "type": "command", "command": "cargo fmt" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "git branch --show-current" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "notify-send 'swarm is done'" }] }]
+} }
+```
+
+The command receives the event as JSON on stdin (`hook_event_name`,
+`session_id`, `cwd`, and `tool_name` / `tool_input` / `tool_response` or
+`prompt`). Exit `0` passes; exit `2` blocks, with stderr as the reason (a
+blocked tool call never reaches the approval prompt, and the model is told why;
+after a tool call, stderr is passed to the model as feedback); any other exit is
+noted and ignored. It may also print `{"decision": "block", "reason": "…"}`.
+For `UserPromptSubmit`, stdout is added to your prompt as context. A `matcher`
+is tool names separated by `|` (swarm's or Claude Code's, so `bash` and `Bash`
+both work), or `*` for all. `Stop` runs once after a request and its `/goal`
+turns. `/hooks` lists what is in force.
+
+A project's own `settings.json` can come from whoever wrote the project, so its
+hooks run only after you approve the exact commands in a dialog at startup.
+The approval is stored in `~/.swarm/trusted-hooks` against the file's path and
+content, so changing a command asks again. Without a terminal, project hooks are
+skipped.
+
+### Also
+
+* `/btw <question>` answers from the conversation so far without joining it,
+  and works while a turn is running (one model call, no tools).
+* `/subgoal <condition>` adds a condition the active `/goal` must also meet; the
+  judge and every continuation prompt include it. `/subgoal rm 2`, `/subgoal clear`.
+* `/loop 5m <prompt>` runs a prompt every 5 minutes (`10s`..`24h`) while the
+  session is idle, up to 50 times, and stops itself if a run fails or is
+  interrupted. What you type always goes first. The prompt may be a `/command`.
+* `/focus` hides tool activity that went well, leaving your prompts, the
+  answers, failures and denials. The footer's file counts stay right.
+* `/review [what]` and `/security-review [what]` ask for a read-only review of
+  the uncommitted changes (or what you name), with findings by severity.
+* `/vim` turns on vim keys in the prompt (`SWARM_VIM=1` starts with them):
+  `esc` for normal mode, `i a I A o O` to insert, `h l w b e 0 ^ $` and
+  counts to move, `d c y` with a motion (`dw`, `c$`, `3dd`, `yy`), `x X D C s S`,
+  `p P`, `u`. `enter` still sends, and `esc` in normal mode keeps its usual
+  jobs (stop a turn, clear, rewind). The mode shows in the footer.
+* `/redraw` repaints the prompt area and takes the terminal's input modes back,
+  if something scrambled the screen. It works while a turn runs.
 
 ### How it stays unbroken
 

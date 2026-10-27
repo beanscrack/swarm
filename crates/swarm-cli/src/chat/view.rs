@@ -80,8 +80,9 @@ pub fn help(colors: Color, filter: Option<&str>) -> Vec<String> {
     let dim = |text: &str| role(colors, "subtle", text);
     let mut out = Vec::new();
     let mut shown = 0;
-    for group in [Group::Session, Group::Run, Group::Setup, Group::Info] {
-        let specs: Vec<_> = registry::COMMANDS
+    let every = registry::all();
+    for group in [Group::Session, Group::Run, Group::Setup, Group::Info, Group::Custom] {
+        let specs: Vec<_> = every
             .iter()
             .filter(|spec| spec.group == group)
             .filter(|spec| match &filter {
@@ -325,7 +326,7 @@ mod tests {
     #[test]
     fn export_is_a_readable_markdown_document() {
         let mut session = Session::new("chat-1");
-        session.push(Turn { goal: "add a login page".into(), status: "completed".into(), summary: "Created login.py".into(), run_id: "run_1".into() });
+        session.push(Turn { goal: "add a login page".into(), status: "completed".into(), summary: "Created login.py".into(), run_id: "run_1".into(), todos: None });
         session.digest = Some("- earlier work".into());
         session.totals.tokens = 99;
         let md = export_markdown(&session);

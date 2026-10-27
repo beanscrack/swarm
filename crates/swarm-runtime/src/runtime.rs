@@ -31,6 +31,7 @@ use swarm_tools::ToolExecutor;
 use crate::agent::{AgentOutcome, AgentRunner};
 use crate::approval::ApprovalHandler;
 use crate::error::RuntimeError;
+use crate::hooks::ToolHooks;
 
 /// Lease-renewal tick: `DEFAULT_LEASE_TTL_MS / 3`, so in-flight leases are
 /// renewed well before they would expire.
@@ -53,6 +54,7 @@ pub struct Runtime {
     scheduler: Scheduler,
     approval: ApprovalPolicy,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    hooks: Option<Arc<dyn ToolHooks>>,
     instructions: Option<String>,
 }
 
@@ -64,7 +66,7 @@ impl Runtime {
         scheduler: Scheduler,
     ) -> Self {
         Self { store, registry, executor, scheduler, approval: ApprovalPolicy::AskDangerous,
-            approval_handler: None, instructions: None }
+            approval_handler: None, hooks: None, instructions: None }
     }
 
     /// Project instructions (`AGENTS.md` / `CLAUDE.md`) for every agent prompt.
@@ -82,6 +84,12 @@ impl Runtime {
     /// Supplies an interactive approval handler shared by every agent.
     pub fn with_approval_handler(mut self, handler: Arc<dyn ApprovalHandler>) -> Self {
         self.approval_handler = Some(handler);
+        self
+    }
+
+    /// Lets the host look at every tool call before and after it runs.
+    pub fn with_tool_hooks(mut self, hooks: Arc<dyn ToolHooks>) -> Self {
+        self.hooks = Some(hooks);
         self
     }
 
@@ -233,6 +241,7 @@ impl Runtime {
                 let token_c = token.clone();
                 let approval = self.approval;
                 let approval_handler = self.approval_handler.clone();
+                let hooks = self.hooks.clone();
                 let instructions = self.instructions.clone();
                 in_flight.spawn(async move {
                     let prov = ProviderId::new(provider_c).expect("provider id");
@@ -242,6 +251,7 @@ impl Runtime {
                         executor,
                         approval,
                         approval_handler,
+                        hooks,
                         instructions,
                     };
                     // Same `Agent` value persisted above, so `update_agent` finds the row.

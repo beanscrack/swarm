@@ -53,6 +53,10 @@ pub struct FileChange {
     pub before: Option<String>,
     /// The call created the file.
     pub created: bool,
+    /// [`content_hash`] of what the call left in the file, so a later rewind
+    /// can tell the file still holds the agent's work and not a hand edit.
+    #[serde(default)]
+    pub after: Option<u64>,
 }
 
 impl FileChange {
@@ -60,8 +64,23 @@ impl FileChange {
         Self {
             before: before.filter(|text| text.len() <= CHANGE_CAP_BYTES),
             created,
+            after: None,
         }
     }
+
+    /// Record what the call wrote.
+    pub fn with_after(mut self, written: &str) -> Self {
+        self.after = Some(content_hash(written));
+        self
+    }
+}
+
+/// FNV-1a over the text's bytes: stable across runs and releases (unlike
+/// `DefaultHasher`), which matters because the value is stored in events.
+pub fn content_hash(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// The outcome of executing one tool call.

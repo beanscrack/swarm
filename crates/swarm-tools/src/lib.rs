@@ -15,9 +15,10 @@ mod catalog;
 mod error;
 mod executor;
 mod sandbox;
+pub mod todo;
 
 pub use catalog::builtin_catalog;
-pub use error::{FileChange, ToolError, ToolResult};
+pub use error::{FileChange, ToolError, ToolResult, content_hash};
 pub use executor::{ToolCall, ToolExecutor};
 pub use sandbox::{
     DEFAULT_COMMAND_TIMEOUT, DEFAULT_OUTPUT_CAP, SandboxConfig, cap_output, resolve_within,

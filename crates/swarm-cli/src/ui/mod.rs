@@ -13,6 +13,7 @@ pub mod registry;
 pub mod screen;
 pub mod term;
 pub mod text;
+pub mod vim;
 
 pub use app::{Action, Info, Mode, Status, echo_rows};
 pub use dialog::{Accent, DialogSpec};

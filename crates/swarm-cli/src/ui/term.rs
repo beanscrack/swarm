@@ -423,6 +423,15 @@ async fn run(
             let frame = app.view(cols as usize, rows as usize, Instant::now());
             let _ = screen.resize(cols as usize, rows as usize, &frame);
         }
+        if out.redraw {
+            // Something wrote to the terminal behind our back, or a multiplexer
+            // reattached: take the input modes back, then repaint from scratch.
+            let _ = guard.reclaim();
+            let (cols, rows) = size().unwrap_or((80, 24));
+            app.set_size(cols as usize, rows as usize);
+            let frame = app.view(cols as usize, rows as usize, Instant::now());
+            let _ = screen.resize(cols as usize, rows as usize, &frame);
+        }
         if let Some(text) = out.edit.take() {
             if let Some(edited) = edit_externally(&guard, &mut screen, &text) {
                 out.effects(app.on_msg(Msg::Prefill(edited), now));
@@ -491,6 +500,7 @@ struct Pending {
     actions: Vec<Action>,
     print: Vec<String>,
     clear: bool,
+    redraw: bool,
     suspend: bool,
     edit: Option<String>,
     edit_file: Option<PathBuf>,
@@ -514,6 +524,7 @@ impl Pending {
                 Effect::Action(action) => self.actions.push(action),
                 Effect::Print(lines) => self.print.extend(lines),
                 Effect::ClearScreen => self.clear = true,
+                Effect::Redraw => self.redraw = true,
                 Effect::Suspend => self.suspend = true,
                 Effect::EditExternal(text) => self.edit = Some(text),
                 Effect::EditFile(path) => self.edit_file = Some(path),

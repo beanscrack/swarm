@@ -163,6 +163,11 @@ impl UiApproval {
 #[async_trait]
 impl ApprovalHandler for UiApproval {
     async fn approve(&self, request: &ApprovalRequest) -> bool {
+        // A checklist changes nothing, so it is never worth a prompt, and
+        // planning (which may not change anything) still gets to keep one.
+        if request.name == "todo_write" {
+            return true;
+        }
         let _turn = self.gate.lock().await;
         // Plan mode is read-only no matter what was allowed earlier.
         if self.mode.get() == Mode::Plan {
@@ -478,5 +483,14 @@ mod tests {
         assert!(approval.approve(&request("read_file", json!({"path": "a"}), "")).await);
         assert!(!approval.approve(&request("bash", json!({"command": "ls"}), "")).await, "even an allowed tool");
         assert!(!approval.approve(&request("write_file", json!({}), "")).await);
+    }
+
+    #[tokio::test]
+    async fn a_checklist_is_never_worth_a_prompt() {
+        let todos = json!({"todos": [{"content": "a", "status": "pending"}]});
+        for mode in [Mode::Default, Mode::AskAll, Mode::Plan] {
+            let approval = UiApproval::new(UiHandle::plain(Color::Plain), AllowList::new(), SharedMode::new(mode), PathBuf::from("."));
+            assert!(approval.approve(&request("todo_write", todos.clone(), "")).await, "{mode:?}");
+        }
     }
 }

@@ -8,10 +8,13 @@ use swarm_core::RunId;
 
 use super::goal::{self, Goal, GoalStatus};
 use super::session::{Session, Turn, clip};
-use super::{Chat, Flow, INIT_PROMPT, Request, view};
+use super::{
+    Chat, Flow, INIT_PROMPT, REVIEW_PROMPT, REVIEW_REPORT, REVIEW_SCOPE, Request, SECURITY_FOCUS, mentions, view,
+};
 use crate::commands;
+use crate::custom;
 use crate::style::{self, role};
-use crate::ui::registry::{self, Resolved};
+use crate::ui::registry::{self, Group, Resolved};
 use crate::ui::{DialogSpec, Mode, Ui};
 
 impl Chat {
@@ -36,6 +39,9 @@ impl Chat {
                 return Ok(Flow::Continue);
             }
         };
+        if spec.group == Group::Custom {
+            return self.cmd_custom(ui, spec.name, args).await;
+        }
         match spec.name {
             "help" => self.ui.print(view::help(self.colors, (!args.is_empty()).then_some(args))),
             "exit" => return Ok(Flow::Quit),
@@ -50,11 +56,15 @@ impl Chat {
                 });
             }
             "resume" => self.cmd_resume(args).await?,
+            "rewind" => self.cmd_rewind(args).await?,
             "undo" => self.cmd_undo(args),
             "retry" => return self.cmd_retry(ui).await,
             "copy" => self.cmd_copy(),
             "export" => self.cmd_export(args)?,
+            "btw" => self.cmd_btw(args).await,
+            "loop" => self.cmd_loop(args),
             "goal" => return self.cmd_goal(ui, args).await,
+            "subgoal" => self.cmd_subgoal(args).await,
             "plan" => {
                 if args.is_empty() {
                     self.say("usage: /plan <task>  explores read-only first, then asks before changing anything");
@@ -64,6 +74,15 @@ impl Chat {
                 }
             }
             "init" => return self.work(ui, Request { display: "/init".into(), prompt: INIT_PROMPT.into() }).await,
+            "review" | "security-review" => {
+                let security = spec.name == "security-review";
+                let target = if args.is_empty() { REVIEW_SCOPE.to_string() } else { format!("Review this: {args}.") };
+                let focus = if security { format!("{SECURITY_FOCUS}\n\n") } else { String::new() };
+                let prompt = format!("{REVIEW_PROMPT}\n\n{target}\n\n{focus}{REVIEW_REPORT}");
+                let display = if args.is_empty() { format!("/{}", spec.name) } else { format!("/{} {args}", spec.name) };
+                return self.work(ui, Request { display, prompt }).await;
+            }
+            "reload" => self.cmd_reload(),
             "agents" => self.cmd_agents(args),
             "model" => self.cmd_model(args),
             "permissions" => self.cmd_permissions(args).await,
@@ -81,11 +100,24 @@ impl Chat {
                 self.push_info();
                 self.say(format!("transcript detail: {}", if self.verbose { "on" } else { "off" }));
             }
+            "focus" => {
+                self.focus = match args {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    _ => !self.focus,
+                };
+                self.say(if self.focus {
+                    "focus view on \u{00b7} tool activity is hidden unless it fails; /focus turns it off"
+                } else {
+                    "focus view off"
+                });
+            }
             "memory" => self.cmd_memory(args)?,
             "config" => self.cmd_config(),
             "status" => self.cmd_status(args).await?,
             "cost" => self.cmd_cost(),
             "context" => self.cmd_context(),
+            "todos" => self.cmd_todos()?,
             "tasks" => self.cmd_inspect("tasks", args).await?,
             "logs" => self.cmd_inspect("logs", args).await?,
             "runs" => self.cmd_runs().await?,
@@ -94,19 +126,62 @@ impl Chat {
                 let names = commands::tool_names(&self.cfg, &self.workspace)?;
                 self.say(format!("tools ({}): {}", names.len(), names.join(", ")));
             }
+            "hooks" => self.cmd_hooks(),
             "diff" => self.cmd_diff(args).await,
             "doctor" => self.cmd_doctor().await,
             // `/queue` and `/busy` are handled by the UI before they get here.
-            "queue" | "busy" => self.say("this command works in the interactive prompt"),
+            "queue" | "busy" | "redraw" | "vim" => self.say("this command works in the interactive prompt"),
             other => self.say(format!("/{other} is not implemented")),
         }
         Ok(Flow::Continue)
+    }
+
+    /// A command from a markdown file: its body, filled in, is the request.
+    async fn cmd_custom(&mut self, ui: &mut Ui, name: &str, args: &str) -> Result<Flow> {
+        let Some(command) = custom::find(name) else {
+            self.say(format!("/{name} is gone \u{00b7} /reload re-reads the command files"));
+            return Ok(Flow::Continue);
+        };
+        let body = match custom::body_of(&command) {
+            Ok(body) if !body.trim().is_empty() => body,
+            Ok(_) => {
+                self.say(format!("/{name} is empty: {}", command.path.display()));
+                return Ok(Flow::Continue);
+            }
+            Err(error) => {
+                self.say(format!("could not read {}: {error}", command.path.display()));
+                return Ok(Flow::Continue);
+            }
+        };
+        let expansion = mentions::expand(&self.workspace, &custom::expand(&body, args));
+        if !expansion.notes.is_empty() {
+            self.say_lines(expansion.notes.clone());
+        }
+        let display = if args.is_empty() { format!("/{name}") } else { format!("/{name} {args}") };
+        self.work(ui, Request { display, prompt: expansion.text }).await
+    }
+
+    /// `/reload`: look for command files again.
+    fn cmd_reload(&mut self) {
+        let dirs = custom::dirs(&self.store_dir, &self.workspace);
+        let scan = custom::scan(&dirs);
+        let names: Vec<String> = scan.commands.iter().map(|command| format!("/{}", command.name)).collect();
+        custom::install(scan.commands);
+        if names.is_empty() {
+            self.say("no custom commands \u{00b7} add markdown files to .swarm/commands/ (/fix-tests = fix-tests.md)");
+        } else {
+            self.say(format!("{} custom command(s): {}", names.len(), names.join("  ")));
+        }
+        for (name, why) in scan.skipped {
+            self.say(format!("skipped {name}: {why}"));
+        }
     }
 
     /// `/clear` forgets the conversation; `/new` also starts a new session id.
     fn cmd_clear(&mut self, fresh: bool) {
         if fresh {
             self.session = Session::with_id();
+            self.hooks.set_session(&self.session.id);
             self.allow.clear();
         } else {
             self.session.turns.clear();
@@ -149,6 +224,7 @@ impl Chat {
             status: run.status.to_string(),
             summary,
             run_id: run.id.to_string(),
+            todos: None,
         });
         self.last_run = Some(run.id.clone());
         self.say(format!("loaded {} ({}) into this session as context", run.id, run.status));
@@ -187,7 +263,9 @@ impl Chat {
         match self.session.pop_request() {
             Some(turn) => {
                 self.say(format!("retrying: {}", clip(&turn.goal, 70)));
-                self.work(ui, Request::user(&turn.goal)).await
+                // Through the front door, so a retried `/command` runs again
+                // as a command instead of being sent to the model as text.
+                Box::pin(self.dispatch(ui, &turn.goal)).await
             }
             None => {
                 self.say("nothing to retry");
@@ -279,6 +357,48 @@ impl Chat {
                 Ok(Flow::Continue)
             }
         }
+    }
+
+    /// `/subgoal`: extra conditions the active goal's judge also checks.
+    async fn cmd_subgoal(&mut self, args: &str) {
+        let Some(goal) = self.goal.as_mut().filter(|goal| goal.status != GoalStatus::Done) else {
+            self.say("no goal to add to \u{00b7} /goal <condition> sets one");
+            return;
+        };
+        match goal::parse_subcommand(args) {
+            goal::SubCommand::List => {
+                let lines = if goal.criteria.is_empty() {
+                    vec!["no extra conditions \u{00b7} /subgoal <text> adds one the goal must also meet".to_string()]
+                } else {
+                    goal.criteria.iter().enumerate().map(|(index, text)| format!("{}. {text}", index + 1)).collect()
+                };
+                self.say_lines(lines);
+                return;
+            }
+            goal::SubCommand::Add(text) => {
+                if goal.criteria.len() >= goal::MAX_CRITERIA {
+                    self.say(format!("a goal can carry {} extra conditions; /subgoal rm <n> frees one", goal::MAX_CRITERIA));
+                    return;
+                }
+                let text = clip(&text, goal::CRITERION_CHARS);
+                goal.criteria.push(text.clone());
+                let count = goal.criteria.len();
+                self.say(format!("added condition {count}: {text}"));
+            }
+            goal::SubCommand::Remove(n) => {
+                if n == 0 || n > goal.criteria.len() {
+                    self.say(format!("no condition {n} \u{00b7} /subgoal lists them"));
+                    return;
+                }
+                let gone = goal.criteria.remove(n - 1);
+                self.say(format!("removed: {gone}"));
+            }
+            goal::SubCommand::Clear => {
+                let count = std::mem::take(&mut goal.criteria).len();
+                self.say(format!("removed {count} condition(s)"));
+            }
+        }
+        self.save().await;
     }
 
     fn cmd_agents(&mut self, args: &str) {
@@ -648,17 +768,6 @@ fn host_port(url: &str) -> Option<String> {
     }
 }
 
-impl Goal {
-    /// The request that picks a paused goal back up.
-    pub fn resume_prompt(&self) -> String {
-        format!(
-            "Continue working toward the goal: {}\n\nWork had been paused. Take the next step; when \
-             everything is done, verify it and summarise.",
-            self.text
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,10 +780,5 @@ mod tests {
         assert_eq!(host_port("http://localhost"), Some("localhost:80".into()));
         assert_eq!(host_port("not a url"), None);
         assert_eq!(host_port("http://"), None);
-    }
-
-    #[test]
-    fn a_resume_prompt_names_the_goal() {
-        assert!(Goal::new("ship it").resume_prompt().contains("ship it"));
     }
 }

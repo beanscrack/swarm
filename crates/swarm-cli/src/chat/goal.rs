@@ -32,6 +32,9 @@ pub struct Goal {
     pub bad_replies: u32,
     /// Why it paused or finished.
     pub note: String,
+    /// Extra conditions added with `/subgoal`; the judge wants all of them.
+    #[serde(default)]
+    pub criteria: Vec<String>,
 }
 
 /// The judge's reading of the latest turn.
@@ -88,7 +91,18 @@ impl Goal {
             max_turns: DEFAULT_MAX_TURNS,
             bad_replies: 0,
             note: String::new(),
+            criteria: Vec::new(),
         }
+    }
+
+    /// The goal and its `/subgoal` conditions, as one block of prompt text.
+    pub fn statement(&self) -> String {
+        if self.criteria.is_empty() {
+            return self.text.clone();
+        }
+        let list: Vec<String> =
+            self.criteria.iter().enumerate().map(|(index, text)| format!("{}. {text}", index + 1)).collect();
+        format!("{}\n\nIt is only achieved when all of these also hold:\n{}", self.text, list.join("\n"))
     }
 
     pub fn is_active(&self) -> bool {
@@ -115,6 +129,9 @@ impl Goal {
         if !self.note.is_empty() {
             line.push_str(&format!(" \u{2014} {}", self.note));
         }
+        for (index, text) in self.criteria.iter().enumerate() {
+            line.push_str(&format!("\n    {}. {text}", index + 1));
+        }
         line
     }
 
@@ -136,7 +153,16 @@ impl Goal {
         format!(
             "{}\n\nWork until this is completely achieved. Check your work as you go, and finish \
              with a short summary of what is now true.",
-            self.text
+            self.statement()
+        )
+    }
+
+    /// The request that picks a paused goal back up.
+    pub fn resume_prompt(&self) -> String {
+        format!(
+            "Continue working toward the goal: {}\n\nWork had been paused. Take the next step; when \
+             everything is done, verify it and summarise.",
+            self.statement()
         )
     }
 
@@ -145,7 +171,7 @@ impl Goal {
         format!(
             "Continue working toward the goal: {}\n\nThe last check found that {}. Take the next \
              step; when everything is done, verify it and summarise.",
-            self.text, reason
+            self.statement(), reason
         )
     }
 
@@ -190,6 +216,35 @@ impl Goal {
     }
 }
 
+/// Most extra conditions a goal may carry, and the longest one.
+pub const MAX_CRITERIA: usize = 10;
+pub const CRITERION_CHARS: usize = 300;
+
+/// What the user typed after `/subgoal`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubCommand {
+    List,
+    Add(String),
+    /// 1-based position, as the list shows it.
+    Remove(usize),
+    Clear,
+}
+
+/// `/subgoal` alone lists; `rm <n>` and `clear` edit; anything else is a new
+/// condition.
+pub fn parse_subcommand(args: &str) -> SubCommand {
+    let args = args.trim();
+    let mut words = args.splitn(2, char::is_whitespace);
+    let first = words.next().unwrap_or("").to_ascii_lowercase();
+    let rest = words.next().unwrap_or("").trim();
+    match (first.as_str(), rest.parse::<usize>()) {
+        ("", _) | ("list", _) | ("show", _) => SubCommand::List,
+        ("clear", _) if rest.is_empty() => SubCommand::Clear,
+        ("rm" | "remove" | "del" | "delete", Ok(n)) => SubCommand::Remove(n),
+        _ => SubCommand::Add(args.to_string()),
+    }
+}
+
 /// The judge's system and user messages for one turn. It sees the goal, the
 /// assistant's last reply, and a report of what the turn did (the reply alone
 /// can claim more than the work shows).
@@ -197,13 +252,13 @@ pub fn judge_messages(goal: &Goal, reply: &str, work: &str) -> (String, String) 
     let system = "You are a strict reviewer deciding whether a goal has been fully achieved. \
         Answer with exactly one line of JSON and nothing else: \
         {\"verdict\": \"done\" | \"continue\" | \"blocked\", \"reason\": \"one short sentence\"}. \
-        Say \"done\" only when the assistant's reply and the work report together show the goal is \
-        complete and verified. Say \"blocked\" only when it cannot proceed without something from \
+        Say \"done\" only when the assistant's reply and the work report together show the goal \
+        (and every extra condition listed with it) is complete and verified. Say \"blocked\" only when it cannot proceed without something from \
         the user. Otherwise say \"continue\"."
         .to_string();
     let user = format!(
         "Goal:\n{}\n\nWhat the last turn did: {}\n\nAssistant's last reply:\n{}",
-        cut(&goal.text, GOAL_CHARS),
+        cut(&goal.statement(), GOAL_CHARS),
         if work.is_empty() { "nothing recorded" } else { work },
         cut(reply, REPLY_CHARS),
     );
@@ -240,6 +295,33 @@ pub fn parse_verdict(reply: &str) -> Option<Verdict> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subgoals_are_parsed_and_folded_into_every_prompt() {
+        assert_eq!(parse_subcommand(""), SubCommand::List);
+        assert_eq!(parse_subcommand("list"), SubCommand::List);
+        assert_eq!(parse_subcommand("rm 2"), SubCommand::Remove(2));
+        assert_eq!(parse_subcommand("clear"), SubCommand::Clear);
+        assert_eq!(parse_subcommand("clear the cache too"), SubCommand::Add("clear the cache too".into()));
+        assert_eq!(parse_subcommand("rm the old files"), SubCommand::Add("rm the old files".into()));
+        assert_eq!(parse_subcommand("tests are green"), SubCommand::Add("tests are green".into()));
+
+        let mut goal = Goal::new("ship the parser");
+        assert_eq!(goal.statement(), "ship the parser", "no criteria, no change to the prompts");
+        goal.criteria = vec!["tests are green".into(), "docs mention it".into()];
+        for prompt in [goal.kickoff_prompt(), goal.resume_prompt(), goal.continuation_prompt("docs are missing")] {
+            assert!(prompt.contains("1. tests are green") && prompt.contains("2. docs mention it"), "{prompt}");
+        }
+        let (_, user) = judge_messages(&goal, "done!", "edited 1 file");
+        assert!(user.contains("2. docs mention it"), "the judge sees the conditions: {user}");
+        assert!(goal.describe().contains("1. tests are green"));
+        // An old saved goal with no `criteria` field still loads.
+        let old: Goal = serde_json::from_str(
+            r#"{"text":"x","status":"Active","turns_used":1,"max_turns":20,"bad_replies":0,"note":""}"#,
+        )
+        .unwrap();
+        assert!(old.criteria.is_empty());
+    }
 
     #[test]
     fn the_command_forms() {

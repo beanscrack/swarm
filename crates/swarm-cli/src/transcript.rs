@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 use swarm_core::event::{EventKind, RunEvent};
+use swarm_tools::todo::{self, Todo, TodoStatus};
 
 pub use crate::style::{Color, ui_enabled};
 use crate::style::{PREVIEW_LINES, tokens};
@@ -229,6 +230,8 @@ impl TurnStats {
 pub struct Transcript {
     colors: Color,
     verbose: bool,
+    /// Show only the assistant's words, failures and denials.
+    focus: bool,
     width: usize,
     agents: HashMap<String, String>,
     tasks: HashMap<String, String>,
@@ -244,6 +247,7 @@ impl Transcript {
         Self {
             colors,
             verbose,
+            focus: false,
             width: 100,
             agents: HashMap::new(),
             tasks: HashMap::new(),
@@ -251,6 +255,11 @@ impl Transcript {
             stats: TurnStats::default(),
             last_text: String::new(),
         }
+    }
+
+    /// Focus view (`/focus`): the tool activity that went well is not printed.
+    pub fn set_focus(&mut self, focus: bool) {
+        self.focus = focus;
     }
 
     /// The terminal width rows are wrapped and diffs are cut to.
@@ -407,7 +416,7 @@ impl Transcript {
                     // A short remark before a tool call is worth showing as the
                     // assistant's own words; the call itself follows.
                     let remark = text.trim();
-                    if !remark.is_empty() && !remark.starts_with("```") {
+                    if !self.focus && !remark.is_empty() && !remark.starts_with("```") {
                         out.extend(self.assistant_text(&actor, remark));
                     }
                 }
@@ -434,11 +443,27 @@ impl Transcript {
                 "fail",
                 &format!("{CROSS}{actor} {}", first_of(payload, &["error", "message"])),
             )],
+            EventKind::ToolRequested if self.focus => Vec::new(),
             EventKind::ToolRequested => {
                 let name = text_of("name");
                 let args = payload.get("arguments").cloned().unwrap_or(Value::Null);
                 let (display, detail) = tool_heading(&name, &args, self.verbose);
                 vec![self.action(&actor, &display, &detail)]
+            }
+            EventKind::ToolResult if self.focus => {
+                // Still rendered, so the turn's file and line counts stay right.
+                let rows = self.tool_result(payload);
+                if payload.get("success").and_then(Value::as_bool).unwrap_or(false) {
+                    return Vec::new();
+                }
+                // A failure is shown with the call that failed, since the call
+                // itself was held back.
+                let name = text_of("name");
+                let args = payload.get("arguments").cloned().unwrap_or(Value::Null);
+                let (display, detail) = tool_heading(&name, &args, false);
+                let mut out = vec![self.action(&actor, &display, &detail)];
+                out.extend(rows);
+                out
             }
             EventKind::ToolResult => self.tool_result(payload),
             // The permission dialog carries the request; the transcript only
@@ -446,6 +471,9 @@ impl Transcript {
             EventKind::ApprovalRequested => Vec::new(),
             EventKind::ApprovalResolved => {
                 let approved = payload.get("approved").and_then(Value::as_bool).unwrap_or(false);
+                if self.focus && approved {
+                    return Vec::new();
+                }
                 vec![format!(
                     "{}{}",
                     paint(self.colors, "subtle", GUTTER),
@@ -611,6 +639,22 @@ impl Transcript {
                     vec![format!("Read {lines}{} line{}", if capped { "+" } else { "" }, if lines == 1 && !capped { "" } else { "s" })],
                 )
             }
+            "todo_write" => {
+                let Ok(todos) = todo::parse(&args) else {
+                    return self.result("result", vec!["Updated the todo list".to_string()]);
+                };
+                if todos.is_empty() {
+                    return self.result("subtle", vec!["Todo list cleared".to_string()]);
+                }
+                todo_rows(self.colors, &todos)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let lead = if index == 0 { paint(self.colors, "subtle", GUTTER) } else { BELOW.to_string() };
+                        format!("{lead}{row}")
+                    })
+                    .collect()
+            }
             "list_files" => {
                 self.stats.searches += 1;
                 let entries = output.lines().filter(|line| !line.trim().is_empty()).count();
@@ -667,6 +711,19 @@ impl Transcript {
     }
 }
 
+/// The checklist, one row per item: done items dim, the one in progress
+/// highlighted, the rest plain.
+pub fn todo_rows(colors: Color, todos: &[Todo]) -> Vec<String> {
+    todos
+        .iter()
+        .map(|item| match item.status {
+            TodoStatus::Completed => paint(colors, "subtle", &format!("\u{2612} {}", item.content)),
+            TodoStatus::InProgress => paint(colors, "action", &format!("\u{25d0} {}", item.doing())),
+            TodoStatus::Pending => format!("\u{2610} {}", item.content),
+        })
+        .collect()
+}
+
 /// `3 additions and 1 removal`, as Claude Code words an update.
 fn change_phrase(view: &DiffView) -> String {
     let count = |n: usize, one: &str, many: &str| {
@@ -716,6 +773,7 @@ fn tool_heading(name: &str, args: &Value, verbose: bool) -> (String, String) {
         }),
         "search_files" => ("Search".into(), format!("\"{}\"", compact(&text("pattern"), 60))),
         "create_directory" => ("Mkdir".into(), text("path")),
+        "todo_write" => ("Update Todos".into(), String::new()),
         other => (other.to_string(), args_summary(args)),
     }
 }
@@ -798,6 +856,70 @@ mod tests {
         assert_eq!(head("search_files", json!({"pattern": "TODO"})), format!("{BULLET} Search(\"TODO\")"));
         assert_eq!(head("git", json!({"args": ["status", "-s"]})), format!("{BULLET} Git(status -s)"));
         assert_eq!(head("mystery", json!({"x": 1})), format!("{BULLET} mystery(x=1)"));
+    }
+
+    #[test]
+    fn a_todo_update_draws_the_checklist() {
+        let args = json!({"todos": [
+            {"content": "Read the code", "status": "completed"},
+            {"content": "Fix the parser", "status": "in_progress", "activeForm": "Fixing the parser"},
+            {"content": "Run the tests", "status": "pending"},
+        ]});
+        let heading = render(EventKind::ToolRequested, json!({"name": "todo_write", "arguments": args}));
+        assert_eq!(heading[0], format!("{BULLET} Update Todos"));
+        let rows = render(EventKind::ToolResult, json!({"name": "todo_write", "success": true, "arguments": args, "output": "ok"}));
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].starts_with(GUTTER) && rows[0].contains("\u{2612} Read the code"), "{rows:?}");
+        assert!(rows[1].starts_with(BELOW) && rows[1].contains("\u{25d0} Fixing the parser"), "in progress shows its active form: {rows:?}");
+        assert!(rows[2].contains("\u{2610} Run the tests"), "{rows:?}");
+        let cleared = render(
+            EventKind::ToolResult,
+            json!({"name": "todo_write", "success": true, "arguments": {"todos": []}, "output": "ok"}),
+        );
+        assert!(cleared[0].contains("Todo list cleared"), "{cleared:?}");
+        let bad = render(
+            EventKind::ToolResult,
+            json!({"name": "todo_write", "success": false, "arguments": {"todos": "x"}, "output": "todo_write: 'todos' must be an array"}),
+        );
+        assert!(bad[0].contains("must be an array"), "a rejected update says why: {bad:?}");
+    }
+
+    #[test]
+    fn focus_hides_tool_activity_that_went_well_but_not_what_failed() {
+        let mut transcript = Transcript::new(Color::Plain, false);
+        transcript.set_focus(true);
+        let mut feed = |kind: EventKind, payload: Value| transcript.lines(&event(kind, payload)).join("\n");
+        assert_eq!(feed(EventKind::ToolRequested, json!({"name": "bash", "arguments": {"command": "ls"}})), "");
+        assert_eq!(
+            feed(EventKind::ToolResult, json!({"name": "bash", "success": true, "arguments": {"command": "ls"}, "output": "a.txt"})),
+            "",
+            "a call that worked leaves no row",
+        );
+        assert_eq!(feed(EventKind::ApprovalResolved, json!({"approved": true})), "");
+        let denied = feed(EventKind::ApprovalResolved, json!({"approved": false}));
+        assert!(denied.contains("denied"), "a denial is always shown: {denied}");
+        let failed = feed(
+            EventKind::ToolResult,
+            json!({"name": "bash", "success": false, "arguments": {"command": "make"}, "output": "make: *** no rule"}),
+        );
+        assert!(failed.contains("Bash(make)") && failed.contains("no rule"), "a failure names the call: {failed}");
+        let said = feed(EventKind::InferenceCompleted, json!({"text": "All done.", "tool_calls": []}));
+        assert!(said.contains("All done."), "the answer is the point: {said}");
+        let remark = feed(EventKind::InferenceCompleted, json!({"text": "Let me look around.", "tool_calls": ["bash"]}));
+        assert_eq!(remark, "", "chatter before a tool call is hidden too");
+    }
+
+    #[test]
+    fn focus_still_counts_the_edits_it_does_not_show() {
+        let mut transcript = Transcript::new(Color::Plain, false);
+        transcript.set_focus(true);
+        let rows = transcript.lines(&event(
+            EventKind::ToolResult,
+            json!({"name": "write_file", "success": true, "arguments": {"path": "a.txt", "content": "x\n"},
+                   "output": "ok", "change": {"before": null, "created": true}}),
+        ));
+        assert!(rows.is_empty());
+        assert_eq!(transcript.stats().files_edited.len(), 1, "the footer's file count is unaffected");
     }
 
     #[test]

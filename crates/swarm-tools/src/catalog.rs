@@ -120,6 +120,33 @@ pub fn builtin_catalog() -> ToolCatalog {
     ));
 
     c.register(spec(
+        "todo_write",
+        ToolKind::Custom,
+        "Keep a checklist for the task. Use it for work with three or more steps: list the steps first, \
+         mark exactly one `in_progress` while you do it, and mark it `completed` the moment it is done. \
+         Send the whole list every time; an empty list clears it. It changes no files.",
+        json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string", "description": "The step, as an instruction (\"Fix the parser\")"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            "activeForm": {"type": "string", "description": "The step while underway (\"Fixing the parser\")"}
+                        },
+                        "required": ["content", "status"]
+                    }
+                }
+            },
+            "required": ["todos"]
+        }),
+        8 * 1024,
+    ));
+
+    c.register(spec(
         "create_directory",
         ToolKind::Write,
         "Create a directory (and parents) inside the workspace.",
@@ -193,6 +220,7 @@ mod tests {
             "edit_file",
             "list_files",
             "search_files",
+            "todo_write",
             "create_directory",
             "run_tests",
             "python",

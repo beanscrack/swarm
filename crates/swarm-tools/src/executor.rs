@@ -112,6 +112,7 @@ impl ToolExecutor {
             "edit_file" => self.tool_edit_file(&call.arguments),
             "list_files" => self.tool_list_files(&call.arguments),
             "search_files" => self.tool_search_files(&call.arguments),
+            "todo_write" => self.tool_todo_write(&call.arguments),
             "create_directory" => self.tool_create_directory(&call.arguments),
             "run_tests" => self.tool_run_tests(&call.arguments).await,
             "python" => self.tool_python(&call.arguments).await,
@@ -255,7 +256,7 @@ impl ToolExecutor {
         match std::fs::write(&abs, &content) {
             Ok(()) => {
                 let mut result = ToolResult::ok(format!("wrote {} byte(s) to {path}", content.len()));
-                result.change = Some(FileChange::capture(before, created));
+                result.change = Some(FileChange::capture(before, created).with_after(&content));
                 result
             }
             Err(e) => ToolResult::failure(format!("write_file: {e}")),
@@ -304,10 +305,22 @@ impl ToolExecutor {
                     "edited {path} ({} replacement(s))",
                     if replace_all { count } else { 1 }
                 ));
-                result.change = Some(FileChange::capture(Some(original), false));
+                result.change = Some(FileChange::capture(Some(original), false).with_after(&updated));
                 result
             }
             Err(e) => ToolResult::failure(format!("edit_file: {e}")),
+        }
+    }
+
+    /// The list is kept in the run's events, not here; this only checks it.
+    fn tool_todo_write(&self, input: &Value) -> ToolResult {
+        match crate::todo::parse(input) {
+            Ok(todos) if todos.is_empty() => ToolResult::ok("Todo list cleared."),
+            Ok(todos) => ToolResult::ok(format!(
+                "Todo list updated ({}). Keep it current: mark each item completed as soon as it is done.",
+                crate::todo::progress(&todos)
+            )),
+            Err(error) => ToolResult::failure(error),
         }
     }
 
@@ -595,6 +608,7 @@ mod tests {
         let change = created.change.expect("write_file records a change");
         assert!(change.created, "a new file is flagged as created");
         assert_eq!(change.before, None);
+        assert_eq!(change.after, Some(crate::content_hash("one\n")), "what was written is fingerprinted");
 
         let overwritten = ex
             .execute(&call("2", "write_file", json!({"path": "n.txt", "content": "two\n"})))
@@ -610,7 +624,9 @@ mod tests {
                 json!({"path": "n.txt", "find": "two", "replace": "three"}),
             ))
             .await;
-        assert_eq!(edited.change.expect("change").before.as_deref(), Some("two\n"));
+        let change = edited.change.expect("change");
+        assert_eq!(change.before.as_deref(), Some("two\n"));
+        assert_eq!(change.after, Some(crate::content_hash("three\n")));
 
         let failed = ex
             .execute(&call("4", "edit_file", json!({"path": "n.txt", "find": "absent", "replace": "x"})))
@@ -618,6 +634,29 @@ mod tests {
         assert!(!failed.success && failed.change.is_none(), "a failed edit changed nothing");
         let read = ex.execute(&call("5", "read_file", json!({"path": "n.txt"}))).await;
         assert!(read.change.is_none(), "reads change nothing");
+    }
+
+    #[tokio::test]
+    async fn todo_write_checks_the_list_and_touches_nothing() {
+        let dir = tempdir().unwrap();
+        let ex = executor_in(&dir);
+        let ok = ex
+            .execute(&call(
+                "1",
+                "todo_write",
+                json!({"todos": [{"content": "a", "status": "completed"}, {"content": "b", "status": "pending"}]}),
+            ))
+            .await;
+        assert!(ok.success && ok.content.contains("1 of 2 done"), "{}", ok.content);
+        assert!(ok.change.is_none());
+        let bad = ex.execute(&call("2", "todo_write", json!({"todos": [{"content": "a", "status": "nope"}]}))).await;
+        assert!(!bad.success && bad.error.as_deref().unwrap_or("").contains("status"), "{bad:?}");
+        let cleared = ex.execute(&call("3", "todo_write", json!({"todos": []}))).await;
+        assert!(cleared.success && cleared.content.contains("cleared"));
+        assert!(matches!(
+            ex.validate("todo_write", &json!({"todos": []})),
+            ToolRequestValidation::AutoApprove { .. }
+        ), "a checklist needs no approval");
     }
 
     #[tokio::test]

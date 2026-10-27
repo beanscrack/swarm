@@ -37,6 +37,7 @@ impl LiveTail {
         header: Option<&Header>,
         ui: UiHandle,
         verbose: bool,
+        focus: bool,
     ) -> Self {
         if let Some(header) = header {
             ui.print(Transcript::new(ui.colors(), verbose).banner(header));
@@ -44,7 +45,7 @@ impl LiveTail {
         let stop = Arc::new(AtomicBool::new(false));
         let join = {
             let stop = Arc::clone(&stop);
-            tokio::spawn(async move { Self::pump(store, run_id, ui, verbose, stop).await })
+            tokio::spawn(async move { Self::pump(store, run_id, ui, verbose, focus, stop).await })
         };
         Self { stop, join: Some(join) }
     }
@@ -54,11 +55,15 @@ impl LiveTail {
         run_id: RunId,
         ui: UiHandle,
         verbose: bool,
+        focus: bool,
         stop: Arc<AtomicBool>,
     ) -> TurnStats {
         let mut transcript = Transcript::new(ui.colors(), verbose);
+        transcript.set_focus(focus);
         let mut cursor = 0u64;
         let mut activity = "starting";
+        // The checklist item being worked on, for the status line.
+        let mut doing: Option<String> = None;
         let mut tokens = 0u64;
         let mut tasks: Option<(u32, u32)> = None;
         let mut ticks = 0u32;
@@ -72,6 +77,21 @@ impl LiveTail {
                 let number = |key: &str| event.payload.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
                 tokens += number("input_tokens") + number("output_tokens");
                 rows.extend(transcript.lines(event));
+                if event.kind == EventKind::ToolResult
+                    && event.payload.get("name").and_then(serde_json::Value::as_str) == Some("todo_write")
+                    && event.payload.get("success").and_then(serde_json::Value::as_bool) == Some(true)
+                {
+                    doing = event
+                        .payload
+                        .get("arguments")
+                        .and_then(|args| swarm_tools::todo::parse(args).ok())
+                        .and_then(|todos| {
+                            todos
+                                .iter()
+                                .find(|todo| todo.status == swarm_tools::todo::TodoStatus::InProgress)
+                                .map(|todo| crate::chat::clip(todo.doing(), 48))
+                        });
+                }
                 activity = match event.kind {
                     EventKind::InferenceStarted | EventKind::InferenceCompleted => "thinking",
                     EventKind::ToolRequested => "running tool",
@@ -91,7 +111,12 @@ impl LiveTail {
                 }
             }
             if changed || ticks == 1 {
-                ui.status(Status { activity: activity.to_string(), tokens, tasks });
+                // An approval wait stays explicit; otherwise name the step in progress.
+                let shown = match &doing {
+                    Some(step) if activity != "waiting for approval" => step.clone(),
+                    _ => activity.to_string(),
+                };
+                ui.status(Status { activity: shown, tokens, tasks });
             }
             let finished = ticks.is_multiple_of(5)
                 && matches!(
@@ -159,6 +184,7 @@ mod tests {
             None,
             UiHandle::plain(crate::style::Color::Plain),
             false,
+            false,
         );
         store
             .append_event(&RunEvent::new(
@@ -180,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn an_idle_tail_can_be_stopped_at_once() {
         let (_temp, store, run_id) = store_with_run().await;
-        let tail = LiveTail::start(store, run_id, None, UiHandle::plain(crate::style::Color::Plain), false);
+        let tail = LiveTail::start(store, run_id, None, UiHandle::plain(crate::style::Color::Plain), false, false);
         let started = std::time::Instant::now();
         let stats = tail.finish().await;
         assert!(started.elapsed() < Duration::from_secs(2));

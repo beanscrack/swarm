@@ -11,10 +11,15 @@
 //! to it directly: it sends rows and state through a [`UiHandle`] and reacts to
 //! the [`Action`]s the user's keys produce.
 
+mod aside;
 mod goal;
+mod hooks_ui;
 mod mentions;
+mod repeat;
+mod rewind;
 mod session;
 mod slash;
+mod todos;
 mod view;
 
 use std::collections::VecDeque;
@@ -35,12 +40,14 @@ use swarm_store::Store;
 
 use crate::approval::{AllowList, SharedMode, mode_of, policy_of};
 use crate::commands::{self, ChatArgs, TurnEnv, TurnOutcome};
+use crate::custom;
+use crate::hooks::Hooks;
 use crate::style::{self, Color};
 use crate::transcript::{self, Transcript};
 use crate::ui::{Accent, Action, DialogSpec, Info, Mode, StartOptions, Status, Ui, UiHandle, echo_rows};
 use goal::{Goal, Step, Verdict};
 pub use session::{Session, Turn};
-use session::clip;
+pub(crate) use session::clip;
 
 const KV_NAMESPACE: &str = "chat";
 const KV_ACTIVE: &str = "active";
@@ -55,6 +62,21 @@ const INIT_PROMPT: &str = "Look through this project and create (or update) AGEN
 workspace root with the instructions a new contributor or coding agent needs: what the project is, \
 how to build, test and run it, the layout, and the conventions the code follows. Read the code \
 before writing; keep it short and specific, and do not invent commands you have not seen.";
+
+const REVIEW_PROMPT: &str = "Review code like a careful senior engineer, and change nothing: do not \
+write, edit or delete any file.";
+
+const REVIEW_SCOPE: &str = "Run `git status` and `git diff` (and `git diff --staged`) to see what has \
+changed. If there are no uncommitted changes, review the latest commit with `git show`.";
+
+const REVIEW_REPORT: &str = "Read the code around each change before judging it. Report concrete \
+problems only, each with the file and line, why it is a problem, and a suggested fix, most severe first. \
+If you find nothing wrong, say so plainly instead of inventing nits.";
+
+const SECURITY_FOCUS: &str = "Look for security problems: injection (shell, SQL, template), path \
+traversal, missing authentication or authorization checks, secrets committed or logged, unsafe \
+deserialization, server-side request forgery, unsafe use of user input, weak cryptography, and \
+dependencies added without need. Rate each finding by how exploitable it is.";
 
 /// Whether the session continues after handling something.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,11 +106,15 @@ enum TurnEnd {
 
 pub(crate) struct Chat {
     pub(crate) store: Arc<Store>,
+    /// Where the store lives on disk; custom commands are looked up beside it.
+    pub(crate) store_dir: PathBuf,
     pub(crate) cfg: RunConfig,
     pub(crate) workspace: PathBuf,
     pub(crate) session: Session,
     pub(crate) goal: Option<Goal>,
     pub(crate) verbose: bool,
+    /// `/focus`: tool activity that went well is not printed.
+    pub(crate) focus: bool,
     pub(crate) mode: Mode,
     pub(crate) shared_mode: Arc<SharedMode>,
     pub(crate) allow: Arc<AllowList>,
@@ -102,6 +128,11 @@ pub(crate) struct Chat {
     /// The id of a run that was stopped, for the exit message.
     interrupted: Option<String>,
     pub(crate) turns_run: u32,
+    /// `/loop`: a prompt to run again while idle.
+    pub(crate) loop_job: Option<repeat::Loop>,
+    pub(crate) hooks: Arc<Hooks>,
+    /// Hook files that were skipped or had mistakes in them, for `/hooks`.
+    pub(crate) hook_notes: Vec<String>,
 }
 
 impl Chat {
@@ -112,7 +143,10 @@ impl Chat {
             agents: self.cfg.agents,
             mode: self.mode,
             tokens: self.session.totals.tokens,
-            goal: self.goal.as_ref().and_then(Goal::chip),
+            goal: [self.goal.as_ref().and_then(Goal::chip), self.loop_chip()]
+                .into_iter()
+                .flatten()
+                .reduce(|a, b| format!("{a}  {b}")),
         }
     }
 
@@ -248,6 +282,7 @@ impl Chat {
                         self.ui.busy(false);
                         return Ok(Flow::Quit);
                     }
+                    Some(Action::Side(question)) => self.cmd_btw(&question).await,
                     _ => {}
                 },
             }
@@ -273,6 +308,7 @@ impl Chat {
             status: if code == Some(0) { "completed" } else { "failed" }.to_string(),
             summary: clip(&output, 300),
             run_id: String::new(),
+            todos: None,
         });
         self.ui.busy(false);
         self.save().await;
@@ -282,13 +318,20 @@ impl Chat {
     /// Run a request, and then keep going while an active goal says it is not
     /// done. The UI stays "busy" throughout, so anything typed meanwhile queues.
     pub(crate) async fn work(&mut self, ui: &mut Ui, first: Request) -> Result<Flow> {
+        let first = match self.prompt_hook(first).await {
+            Ok(request) => request,
+            Err(reason) => {
+                self.ui.print(vec![style::role(self.colors, "fail", &format!("\u{2717} blocked by a hook: {reason}"))]);
+                return Ok(Flow::Continue);
+            }
+        };
         self.ui.busy(true);
         let mut request = first;
         let mut flow = Flow::Continue;
         loop {
             match self.turn(ui, &request).await {
                 TurnEnd::Done(outcome) => {
-                    self.finish_turn(&request, &outcome);
+                    self.finish_turn(&request, &outcome).await;
                     if !outcome.succeeded() {
                         if let Some(goal) = self.goal.as_mut().filter(|goal| goal.is_active()) {
                             goal.pause("the turn failed");
@@ -313,6 +356,18 @@ impl Chat {
                         Some(id) => format!("Interrupted \u{00b7} /resume {id}"),
                         None => "Interrupted".to_string(),
                     };
+                    // The stopped run may already have edited files, and the next
+                    // request should know it was cut short: keep it as a turn.
+                    if let Some(run_id) = &id {
+                        let todos = self.todos_of(run_id).await;
+                        self.session.push(Turn {
+                            goal: request.display.clone(),
+                            status: "interrupted".to_string(),
+                            summary: "stopped by the user before it finished".to_string(),
+                            run_id: run_id.clone(),
+                            todos,
+                        });
+                    }
                     self.interrupted = id;
                     self.ui.print(vec![style::role(self.colors, "warn", &format!("  \u{23bf}  {hint}"))]);
                     if let Some(goal) = self.goal.as_mut().filter(|goal| goal.is_active()) {
@@ -334,6 +389,9 @@ impl Chat {
                     break;
                 }
             }
+        }
+        if flow != Flow::Quit {
+            self.stop_hook().await;
         }
         self.push_info();
         self.ui.busy(false);
@@ -358,6 +416,8 @@ impl Chat {
             allow: Arc::clone(&self.allow),
             mode: Arc::clone(&self.shared_mode),
             verbose: self.verbose,
+            focus: self.focus,
+            hooks: Some(Arc::clone(&self.hooks)).filter(|hooks| !hooks.is_empty()),
             banner: false,
         };
         let current: Arc<Mutex<Option<RunId>>> = Arc::new(Mutex::new(None));
@@ -394,20 +454,24 @@ impl Chat {
                     Some(Action::Quit) | None => return TurnEnd::Quit,
                     Some(Action::CycleMode) => self.cycle_mode(),
                     Some(Action::ToggleVerbose) => self.toggle_verbose(),
-                    // The UI queues what is typed during a turn; nothing else arrives.
-                    Some(Action::Submit(_)) => {}
+                    Some(Action::Side(question)) => self.cmd_btw(&question).await,
+                    // The UI queues what is typed during a turn, and Esc stops it
+                    // rather than rewinding; nothing else arrives.
+                    Some(Action::Submit(_)) | Some(Action::Rewind) => {}
                 },
             }
         }
     }
 
-    fn finish_turn(&mut self, request: &Request, outcome: &TurnOutcome) {
+    async fn finish_turn(&mut self, request: &Request, outcome: &TurnOutcome) {
         self.last_run = Some(outcome.run_id.clone());
+        let todos = self.todos_of(&outcome.run_id.to_string()).await;
         self.session.push(Turn {
             goal: request.display.clone(),
             status: outcome.status.to_string(),
             summary: outcome.summary.clone(),
             run_id: outcome.run_id.to_string(),
+            todos,
         });
         self.session.totals.add(outcome);
         self.last_result = outcome.summary.clone();
@@ -458,12 +522,16 @@ impl Chat {
         let verdict = loop {
             tokio::select! {
                 verdict = &mut judging => break verdict,
-                action = ui.recv() => if matches!(action, Some(Action::Interrupt) | Some(Action::Quit) | None) {
-                    if let Some(goal) = self.goal.as_mut() {
-                        goal.pause("interrupted");
+                action = ui.recv() => match action {
+                    Some(Action::Interrupt) | Some(Action::Quit) | None => {
+                        if let Some(goal) = self.goal.as_mut() {
+                            goal.pause("interrupted");
+                        }
+                        self.say("\u{23f8} Goal paused \u{2014} interrupted while checking. /goal resume to continue.");
+                        return None;
                     }
-                    self.say("\u{23f8} Goal paused \u{2014} interrupted while checking. /goal resume to continue.");
-                    return None;
+                    Some(Action::Side(question)) => self.cmd_btw(&question).await,
+                    _ => {}
                 },
             }
         };
@@ -595,6 +663,7 @@ async fn load_session(store: &Store, args: &ChatArgs) -> Result<Session> {
             status: run.status.to_string(),
             summary,
             run_id: run.id.to_string(),
+            todos: None,
         });
         session
     };
@@ -649,13 +718,18 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
         Ui::plain(colors)
     };
     let mode = mode_of(cfg.tools.approval);
+    let store_dir = commands::store_path(&args);
+    custom::install(custom::scan(&custom::dirs(&store_dir, &workspace)).commands);
+    let (hooks, hook_notes) = hooks_ui::load(&ui.handle(), &store_dir, &workspace, &session.id).await;
     let mut chat = Chat {
         store,
+        store_dir,
         cfg,
         workspace,
         session,
         goal,
         verbose: args.verbose,
+        focus: false,
         mode,
         shared_mode: SharedMode::new(mode),
         allow: commands::allow_list(),
@@ -668,9 +742,15 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
         started: Instant::now(),
         interrupted: None,
         turns_run: 0,
+        loop_job: None,
+        hooks,
+        hook_notes,
     };
     chat.last_run = chat.session.turns.last().and_then(|turn| RunId::parse(&turn.run_id).ok());
     chat.welcome();
+    if !chat.hook_notes.is_empty() {
+        chat.say_lines(chat.hook_notes.iter().map(|note| format!("hooks: {note}")).collect());
+    }
     chat.push_info();
 
     let mut pending: VecDeque<String> = VecDeque::new();
@@ -701,7 +781,26 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
         quit = true;
     }
     while !quit {
-        let Some(action) = ui.recv().await else { break };
+        let due = chat.loop_job.as_ref().map(|job| job.next);
+        let action = tokio::select! {
+            // What you type always goes before the timer.
+            biased;
+            action = ui.recv() => match action {
+                Some(action) => action,
+                None => break,
+            },
+            () = async {
+                match due {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if chat.run_loop(&mut ui).await == Flow::Quit {
+                    break;
+                }
+                continue;
+            }
+        };
         match action {
             Action::Submit(text) => {
                 if chat.submit(&mut ui, text).await == Flow::Quit {
@@ -711,6 +810,12 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
             Action::Quit => break,
             Action::CycleMode => chat.cycle_mode(),
             Action::ToggleVerbose => chat.toggle_verbose(),
+            Action::Rewind => {
+                if let Err(error) = chat.cmd_rewind("").await {
+                    chat.fail(&error);
+                }
+            }
+            Action::Side(question) => chat.cmd_btw(&question).await,
             Action::Interrupt => {}
         }
     }
@@ -768,11 +873,13 @@ mod tests {
         let mode = mode_of(cfg.tools.approval);
         let chat = Chat {
             store,
+            store_dir: dir.path().join("store"),
             cfg,
             workspace,
             session: Session::new("chat-test"),
             goal: None,
             verbose: false,
+            focus: false,
             mode,
             shared_mode: SharedMode::new(mode),
             allow: commands::allow_list(),
@@ -785,6 +892,9 @@ mod tests {
             started: Instant::now(),
             interrupted: None,
             turns_run: 0,
+            loop_job: None,
+            hooks: Arc::new(Hooks::new(Vec::new(), PathBuf::new(), "chat-test")),
+            hook_notes: Vec::new(),
         };
         Rig { chat, ui, rows, _dir: dir }
     }
@@ -833,6 +943,75 @@ mod tests {
         assert!(rig.chat.session.turns.is_empty());
         rig.chat.submit(&mut rig.ui, "/undo".into()).await;
         assert!(rig.text().contains("nothing to undo"));
+    }
+
+    /// Pretend the agent edited `files` during the newest turn: write them as
+    /// the agent left them and record the edits the way the runtime does.
+    async fn record_edits(rig: &Rig, edits: &[(&str, Option<&str>, &str)]) {
+        let run = RunId::parse(&rig.chat.session.turns.last().unwrap().run_id).unwrap();
+        for (path, before, after) in edits {
+            std::fs::write(rig.chat.workspace.join(path), after).unwrap();
+            let event = RunEvent::new(
+                EventKind::ToolResult,
+                run.clone(),
+                json!({"name": "write_file", "success": true, "arguments": {"path": path},
+                       "change": {"before": before, "created": before.is_none(),
+                                  "after": swarm_tools::content_hash(after)}}),
+            );
+            rig.chat.store.append_event(&event).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rewind_restores_files_and_the_conversation() {
+        let mut rig = rig(None).await;
+        std::fs::write(rig.chat.workspace.join("keep.txt"), "v1\n").unwrap();
+        rig.chat.submit(&mut rig.ui, "first".into()).await;
+        rig.chat.submit(&mut rig.ui, "second".into()).await;
+        record_edits(&rig, &[("keep.txt", Some("v1\n"), "v2\n"), ("new.txt", None, "fresh\n")]).await;
+        rig.chat.submit(&mut rig.ui, "third".into()).await;
+
+        // Code only: the files go back, the conversation stays.
+        rig.chat.submit(&mut rig.ui, "/rewind 2 code".into()).await;
+        let work = &rig.chat.workspace;
+        assert_eq!(std::fs::read_to_string(work.join("keep.txt")).unwrap(), "v1\n");
+        assert!(!work.join("new.txt").exists(), "a file the agent created is removed");
+        assert_eq!(rig.chat.session.turns.len(), 3);
+        assert!(rig.text().contains("restored 1 file(s), removed 1 file(s) the agent created"), "{}", rig.text());
+        assert!(rig.text().contains("shell commands the agent ran are not undone"), "{}", rig.text());
+
+        // Conversation: back to before "second", which was asked after "first".
+        rig.chat.submit(&mut rig.ui, "/rewind 2 chat".into()).await;
+        let goals: Vec<&str> = rig.chat.session.turns.iter().map(|turn| turn.goal.as_str()).collect();
+        assert_eq!(goals, ["first"]);
+        assert!(rig.text().contains("rewound 2 turn(s)"), "{}", rig.text());
+    }
+
+    #[tokio::test]
+    async fn rewind_leaves_a_hand_edited_file_alone() {
+        let mut rig = rig(None).await;
+        rig.chat.submit(&mut rig.ui, "edit it".into()).await;
+        record_edits(&rig, &[("mine.txt", Some("old\n"), "agent\n")]).await;
+        std::fs::write(rig.chat.workspace.join("mine.txt"), "my own change\n").unwrap();
+        rig.chat.submit(&mut rig.ui, "/rewind 1".into()).await;
+        assert_eq!(std::fs::read_to_string(rig.chat.workspace.join("mine.txt")).unwrap(), "my own change\n");
+        assert!(rig.text().contains("left mine.txt alone"), "{}", rig.text());
+        assert!(rig.chat.session.turns.is_empty(), "the conversation still rewound");
+    }
+
+    #[tokio::test]
+    async fn rewind_explains_itself_without_a_terminal() {
+        let mut rig = rig(None).await;
+        rig.chat.submit(&mut rig.ui, "/rewind".into()).await;
+        assert!(rig.text().contains("nothing to rewind to yet"), "{}", rig.text());
+        rig.chat.submit(&mut rig.ui, "alpha".into()).await;
+        rig.chat.submit(&mut rig.ui, "/rewind".into()).await;
+        assert!(rig.text().contains("1. alpha"), "{}", rig.text());
+        rig.chat.submit(&mut rig.ui, "/rewind 9".into()).await;
+        assert!(rig.text().contains("only 1 request(s)"), "{}", rig.text());
+        rig.chat.submit(&mut rig.ui, "/rewind sideways".into()).await;
+        assert!(rig.text().contains("unknown rewind option `sideways`"), "{}", rig.text());
+        assert_eq!(rig.chat.session.turns.len(), 1, "nothing was rewound by mistake");
     }
 
     #[tokio::test]
@@ -894,6 +1073,233 @@ mod tests {
         assert!(rig.text().contains("attached @notes.txt (1 line)"), "{}", rig.text());
         assert!(rig.chat.last_result.contains("plugh"), "{}", rig.chat.last_result);
         assert_eq!(rig.chat.session.turns[0].goal, "what does @notes.txt say?", "history keeps what was typed");
+    }
+
+    #[tokio::test]
+    async fn a_custom_command_sends_its_filled_in_body_and_retries_as_a_command() {
+        let _lock = crate::custom::TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut rig = rig(Some("cat")).await;
+        let commands = rig.chat.store_dir.join("commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(
+            commands.join("zzfix.md"),
+            "---\ndescription: Fix a file\nargument-hint: <file>\n---\nPlease fix $1 and explain what was wrong.",
+        )
+        .unwrap();
+        rig.chat.submit(&mut rig.ui, "/reload".into()).await;
+        assert!(rig.text().contains("1 custom command(s): /zzfix"), "{}", rig.text());
+        assert!(rig.text().contains("/zzfix") && crate::ui::registry::matching("zzf").len() == 1);
+
+        rig.chat.submit(&mut rig.ui, "/zzfix src/main.rs".into()).await;
+        assert!(rig.chat.last_result.contains("Please fix src/main.rs and explain"), "{}", rig.chat.last_result);
+        assert_eq!(rig.chat.session.turns[0].goal, "/zzfix src/main.rs", "history keeps what was typed");
+
+        // The file is read again on each use, so an edit applies at once.
+        std::fs::write(commands.join("zzfix.md"), "Second thoughts about $ARGUMENTS").unwrap();
+        rig.chat.submit(&mut rig.ui, "/retry".into()).await;
+        assert!(rig.chat.last_result.contains("Second thoughts about src/main.rs"), "{}", rig.chat.last_result);
+        assert_eq!(rig.chat.session.turns.len(), 1, "the retry replaced the turn it re-ran");
+
+        // A command whose file is gone says so instead of sending "/zzfix" to the model.
+        std::fs::remove_file(commands.join("zzfix.md")).unwrap();
+        rig.chat.submit(&mut rig.ui, "/zzfix again".into()).await;
+        assert!(rig.text().contains("could not read"), "{}", rig.text());
+        assert_eq!(rig.chat.session.turns.len(), 1);
+        crate::custom::install(Vec::new());
+    }
+
+    fn with_hooks(rig: &mut Rig, settings: &str) {
+        let (entries, _, warnings) = crate::hooks::parse(settings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        rig.chat.hooks = Arc::new(Hooks::new(entries, rig.chat.workspace.clone(), "chat-test"));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_hook_can_stop_a_request_or_add_context_to_it() {
+        let mut rig = rig(Some("cat")).await;
+        rig.chat.submit(&mut rig.ui, "/hooks".into()).await;
+        assert!(rig.text().contains("no hooks"), "{}", rig.text());
+
+        with_hooks(
+            &mut rig,
+            r#"{"hooks": {"UserPromptSubmit": [{"hooks": [
+                {"command": "grep -q secret && echo 'no secrets in prompts' >&2 && exit 2; echo 'today is Tuesday'"}]}]}}"#,
+        );
+        rig.chat.submit(&mut rig.ui, "what day is it?".into()).await;
+        assert!(rig.chat.last_result.contains("what day is it?"), "{}", rig.chat.last_result);
+        assert!(rig.chat.last_result.contains("Context from a hook:\ntoday is Tuesday"), "{}", rig.chat.last_result);
+        assert_eq!(rig.chat.session.turns[0].goal, "what day is it?", "history keeps what was typed, not the context");
+
+        rig.chat.submit(&mut rig.ui, "the secret is 42".into()).await;
+        assert!(rig.text().contains("blocked by a hook: no secrets in prompts"), "{}", rig.text());
+        assert_eq!(rig.chat.session.turns.len(), 1, "a blocked prompt never ran");
+        // The scripted UI only hands out input while it is not busy, so this
+        // arriving at all shows a blocked prompt left it idle.
+        let next = tokio::time::timeout(Duration::from_millis(500), rig.ui.recv()).await;
+        assert!(matches!(next, Ok(Some(Action::Quit))), "the prompt is usable again: {next:?}");
+
+        rig.chat.submit(&mut rig.ui, "/hooks".into()).await;
+        assert!(rig.text().contains("1 hook(s):") && rig.text().contains("UserPromptSubmit:"), "{}", rig.text());
+    }
+
+    #[tokio::test]
+    async fn a_stop_hook_runs_once_per_request_even_for_a_goal_with_many_turns() {
+        let mut rig = rig(Some(r#"cat >/dev/null; echo '{"verdict": "continue", "reason": "more"}'"#)).await;
+        let counter = rig.chat.workspace.join("stops");
+        with_hooks(
+            &mut rig,
+            &format!(r#"{{"hooks": {{"Stop": [{{"hooks": [{{"command": "echo x >> {}"}}]}}]}}}}"#, counter.display()),
+        );
+        rig.chat.goal = Some(Goal::new("keep going"));
+        rig.chat.goal.as_mut().unwrap().max_turns = 3;
+        rig.chat.submit(&mut rig.ui, "work on it".into()).await;
+        assert!(rig.chat.session.turns.len() >= 3, "the goal ran several turns");
+        let stops = std::fs::read_to_string(&counter).unwrap();
+        assert_eq!(stops.lines().count(), 1, "one Stop for the whole request: {stops:?}");
+        rig.chat.submit(&mut rig.ui, "/hooks".into()).await;
+    }
+
+    #[tokio::test]
+    async fn the_checklist_is_read_back_from_the_run_and_shown_by_todos() {
+        let mut rig = rig(None).await;
+        rig.chat.submit(&mut rig.ui, "/todos".into()).await;
+        assert!(rig.text().contains("no todo list"), "{}", rig.text());
+        rig.chat.submit(&mut rig.ui, "plan the work".into()).await;
+        let run_id = rig.chat.session.turns[0].run_id.clone();
+        let run = RunId::parse(&run_id).unwrap();
+        let write = |todos: serde_json::Value| {
+            RunEvent::new(
+                EventKind::ToolResult,
+                run.clone(),
+                json!({"name": "todo_write", "success": true, "arguments": {"todos": todos}, "output": "ok"}),
+            )
+        };
+        rig.chat.store.append_event(&write(json!([{"content": "old", "status": "pending"}]))).await.unwrap();
+        rig.chat
+            .store
+            .append_event(&write(json!([
+                {"content": "write the parser", "status": "completed"},
+                {"content": "test the parser", "status": "in_progress", "activeForm": "Testing the parser"}
+            ])))
+            .await
+            .unwrap();
+        let todos = rig.chat.todos_of(&run_id).await.expect("the run kept a list");
+        assert_eq!(todos.len(), 2, "the last update is the list");
+        rig.chat.session.turns[0].todos = Some(todos);
+        rig.chat.submit(&mut rig.ui, "/todos".into()).await;
+        let text = rig.text();
+        assert!(text.contains("Todos (1 of 2 done)"), "{text}");
+        assert!(text.contains("write the parser") && text.contains("Testing the parser"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn btw_answers_without_joining_the_conversation() {
+        let mut rig = rig(None).await;
+        rig.chat.submit(&mut rig.ui, "build the thing".into()).await;
+        let before = rig.chat.session.clone();
+        rig.chat.submit(&mut rig.ui, "/btw what did we just do?".into()).await;
+        let text = rig.text();
+        assert!(text.contains("btw: what did we just do?"), "{text}");
+        assert!(text.contains("understood"), "the model's answer is shown: {text}");
+        assert!(text.contains("not added to the conversation"), "{text}");
+        assert_eq!(rig.chat.session, before, "nothing was recorded, not even tokens");
+        rig.chat.submit(&mut rig.ui, "/btw".into()).await;
+        assert!(rig.text().contains("usage: /btw <question>"), "{}", rig.text());
+    }
+
+    #[tokio::test]
+    async fn a_loop_runs_its_prompt_reschedules_and_stops_itself() {
+        use tokio::time::Instant as At;
+        let mut rig = rig(None).await;
+        rig.chat.submit(&mut rig.ui, "/loop 5m check the build".into()).await;
+        assert!(rig.text().contains("/loop needs the interactive prompt"), "{}", rig.text());
+        assert!(rig.chat.loop_job.is_none());
+
+        let every = Duration::from_secs(300);
+        rig.chat.loop_job = Some(repeat::Loop { every, prompt: "check the build".into(), next: At::now(), runs: 0 });
+        assert_eq!(rig.chat.loop_chip().as_deref(), Some("\u{21bb} loop 5m"));
+        assert!(rig.chat.info().goal.as_deref().is_some_and(|chip| chip.contains("loop 5m")), "shown in the footer");
+        let flow = rig.chat.run_loop(&mut rig.ui).await;
+        assert_eq!(flow, Flow::Continue);
+        assert_eq!(rig.chat.session.turns.len(), 1);
+        assert_eq!(rig.chat.session.turns[0].goal, "check the build", "run as if typed");
+        let job = rig.chat.loop_job.as_ref().expect("a finished run keeps the loop going");
+        assert_eq!(job.runs, 1);
+        assert!(job.next > At::now() + Duration::from_secs(290), "the next run is a full interval away");
+
+        // The last allowed run says so and stops.
+        rig.chat.loop_job.as_mut().unwrap().runs = repeat::MAX_RUNS - 1;
+        rig.chat.run_loop(&mut rig.ui).await;
+        assert!(rig.chat.loop_job.is_none());
+        assert!(rig.text().contains("loop stopped after 50 runs"), "{}", rig.text());
+
+        // Status and stop.
+        rig.chat.submit(&mut rig.ui, "/loop".into()).await;
+        assert!(rig.text().contains("no loop"), "{}", rig.text());
+    }
+
+    #[tokio::test]
+    async fn a_loop_stops_when_a_run_fails() {
+        use tokio::time::Instant as At;
+        let mut rig = rig(Some("exit 1")).await;
+        rig.chat.loop_job = Some(repeat::Loop {
+            every: Duration::from_secs(60),
+            prompt: "poke it".into(),
+            next: At::now(),
+            runs: 0,
+        });
+        rig.chat.run_loop(&mut rig.ui).await;
+        assert!(rig.chat.loop_job.is_none(), "an unattended loop does not keep failing");
+        assert!(rig.text().contains("loop stopped: that run did not finish"), "{}", rig.text());
+    }
+
+    #[tokio::test]
+    async fn subgoals_extend_the_active_goal_and_survive_a_restart() {
+        let mut rig = rig(Some(r#"cat >/dev/null; echo '{"verdict": "done", "reason": "ok"}'"#)).await;
+        rig.chat.submit(&mut rig.ui, "/subgoal tests are green".into()).await;
+        assert!(rig.text().contains("no goal to add to"), "{}", rig.text());
+        rig.chat.goal = Some(Goal::new("ship it"));
+        rig.chat.submit(&mut rig.ui, "/subgoal tests are green".into()).await;
+        rig.chat.submit(&mut rig.ui, "/subgoal docs mention it".into()).await;
+        rig.chat.submit(&mut rig.ui, "/subgoal".into()).await;
+        assert!(rig.text().contains("1. tests are green") && rig.text().contains("2. docs mention it"), "{}", rig.text());
+        rig.chat.submit(&mut rig.ui, "/subgoal rm 1".into()).await;
+        rig.chat.submit(&mut rig.ui, "/subgoal rm 9".into()).await;
+        assert!(rig.text().contains("no condition 9"), "{}", rig.text());
+        let saved = rig.chat.store.kv_get(KV_NAMESPACE, KV_GOAL).await.unwrap().unwrap();
+        let reloaded: Goal = serde_json::from_str(&saved).unwrap();
+        assert_eq!(reloaded.criteria, vec!["docs mention it".to_string()], "saved with the goal");
+        rig.chat.submit(&mut rig.ui, "/subgoal clear".into()).await;
+        assert!(rig.chat.goal.as_ref().unwrap().criteria.is_empty());
+    }
+
+    #[tokio::test]
+    async fn focus_toggles_and_a_turn_still_completes_in_it() {
+        let mut rig = rig(None).await;
+        assert!(!rig.chat.focus);
+        rig.chat.submit(&mut rig.ui, "/focus".into()).await;
+        assert!(rig.chat.focus && rig.text().contains("focus view on"), "{}", rig.text());
+        rig.chat.submit(&mut rig.ui, "/focus off".into()).await;
+        assert!(!rig.chat.focus);
+        rig.chat.submit(&mut rig.ui, "/focus on".into()).await;
+        assert!(rig.chat.focus);
+        // (The rig has no terminal, so no transcript rows print; what the focus
+        // view shows is covered by the transcript tests.)
+        rig.chat.submit(&mut rig.ui, "say hi".into()).await;
+        assert!(rig.chat.last_result.contains("understood"), "{}", rig.chat.last_result);
+    }
+
+    #[tokio::test]
+    async fn review_asks_for_findings_and_forbids_edits() {
+        let mut rig = rig(Some("cat")).await;
+        rig.chat.submit(&mut rig.ui, "/review".into()).await;
+        let sent = rig.chat.last_result.clone();
+        assert!(sent.contains("git diff") && sent.contains("change nothing"), "{sent}");
+        rig.chat.submit(&mut rig.ui, "/security-review src/auth.rs".into()).await;
+        let sent = rig.chat.last_result.clone();
+        assert!(sent.contains("src/auth.rs") && sent.contains("injection"), "{sent}");
+        assert!(!sent.contains("git status"), "an explicit target replaces the default scope");
+        assert_eq!(rig.chat.session.turns[1].goal, "/security-review src/auth.rs");
     }
 
     #[tokio::test]
@@ -997,7 +1403,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("store")).await.unwrap();
         let mut session = Session::new("chat-test");
-        session.push(Turn { goal: "g".into(), status: "completed".into(), summary: "s".into(), run_id: String::new() });
+        session.push(Turn { goal: "g".into(), status: "completed".into(), summary: "s".into(), run_id: String::new(), todos: None });
         store.kv_set(KV_NAMESPACE, KV_ACTIVE, &session.to_json()).await.unwrap();
         let goal = Goal::new("finish the work");
         store.kv_set(KV_NAMESPACE, KV_GOAL, &serde_json::to_string(&goal).unwrap()).await.unwrap();

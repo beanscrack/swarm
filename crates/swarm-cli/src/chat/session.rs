@@ -9,6 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use swarm_tools::todo::{Todo, TodoStatus};
+
 use crate::commands::TurnOutcome;
 
 pub const SUMMARY_CHARS: usize = 400;
@@ -23,6 +25,9 @@ pub struct Turn {
     pub status: String,
     pub summary: String,
     pub run_id: String,
+    /// The checklist as the turn left it, if the agent kept one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todos: Option<Vec<Todo>>,
 }
 
 /// Session totals shown by `/cost`.
@@ -55,6 +60,29 @@ pub struct Session {
 impl Session {
     pub fn new(id: impl Into<String>) -> Self {
         Self { id: id.into(), turns: Vec::new(), digest: None, totals: Totals::default() }
+    }
+
+    /// The checklist as the latest turn that kept one left it.
+    pub fn todos(&self) -> &[Todo] {
+        self.turns.iter().rev().find_map(|turn| turn.todos.as_deref()).unwrap_or(&[])
+    }
+
+    /// What the next request is told about unfinished checklist items.
+    fn todo_block(&self) -> String {
+        let todos = self.todos();
+        if todos.iter().all(|todo| todo.status == TodoStatus::Completed) {
+            return String::new();
+        }
+        let mut block = String::from("\n\nChecklist so far (continue from it and keep it current with todo_write):");
+        for todo in todos.iter().take(20) {
+            let mark = match todo.status {
+                TodoStatus::Completed => "[x]",
+                TodoStatus::InProgress => "[~]",
+                TodoStatus::Pending => "[ ]",
+            };
+            block.push_str(&format!("\n{mark} {}", clip(&todo.content, 100)));
+        }
+        block
     }
 
     pub fn with_id() -> Self {
@@ -95,7 +123,9 @@ impl Session {
         if self.turns.is_empty() && self.digest.is_none() {
             return String::new();
         }
-        let overhead = PREAMBLE.chars().count() + LABEL.chars().count() + TRAILER.chars().count();
+        let todo_block = self.todo_block();
+        let overhead =
+            PREAMBLE.chars().count() + LABEL.chars().count() + TRAILER.chars().count() + todo_block.chars().count();
         let budget = max_chars.saturating_sub(overhead);
         // Each turn gets a share of the budget, so even one turn cannot blow it.
         let per_row = (budget / 3).clamp(40, SUMMARY_CHARS);
@@ -128,7 +158,7 @@ impl Session {
         if dropped > 0 {
             body.push_str(&format!("({dropped} older turn(s) omitted)\n"));
         }
-        format!("{PREAMBLE}{LABEL}{body}{}{TRAILER}", kept.join("\n"))
+        format!("{PREAMBLE}{LABEL}{body}{}{todo_block}{TRAILER}", kept.join("\n"))
     }
 
     /// Fold everything but the newest `keep` turns into the digest.
@@ -179,11 +209,52 @@ mod tests {
 
     fn turn(goal: &str, summary: &str) -> Turn {
         Turn {
+            todos: None,
             goal: goal.to_string(),
             status: "completed".to_string(),
             summary: summary.to_string(),
             run_id: "0".repeat(26),
         }
+    }
+
+    fn todo(content: &str, status: TodoStatus) -> Todo {
+        Todo { content: content.into(), status, active_form: String::new() }
+    }
+
+    #[test]
+    fn the_checklist_is_the_latest_one_and_the_next_request_hears_about_unfinished_items() {
+        let mut session = Session::new("s");
+        assert!(session.todos().is_empty());
+        assert!(!session.render(2000).contains("Checklist"));
+        let mut first = turn("plan it", "planned");
+        first.todos = Some(vec![todo("a", TodoStatus::Pending)]);
+        session.push(first);
+        session.push(turn("chat", "no checklist update here"));
+        assert_eq!(session.todos().len(), 1, "a later turn without one keeps it");
+        let mut third = turn("do it", "did half");
+        third.todos = Some(vec![todo("a", TodoStatus::Completed), todo("b", TodoStatus::InProgress), todo("c", TodoStatus::Pending)]);
+        session.push(third);
+        let text = session.render(4000);
+        assert!(text.contains("[x] a") && text.contains("[~] b") && text.contains("[ ] c"), "{text}");
+        assert!(text.ends_with("New request: "), "the request still comes last");
+        // Nothing left to do: nothing to say.
+        let mut done = turn("finish", "finished");
+        done.todos = Some(vec![todo("a", TodoStatus::Completed)]);
+        session.push(done);
+        assert!(!session.render(4000).contains("Checklist"));
+        // Rewinding past it takes the checklist with it.
+        session.turns.truncate(1);
+        assert_eq!(session.todos()[0].content, "a");
+        session.turns.clear();
+        assert!(session.todos().is_empty());
+    }
+
+    #[test]
+    fn a_saved_session_from_before_checklists_still_loads() {
+        let old = r#"{"id":"s","turns":[{"goal":"g","status":"completed","summary":"s","run_id":"r"}],"digest":null,"totals":{"tokens":1,"inferences":1,"tool_calls":0,"seconds":0.5}}"#;
+        let session = Session::from_json(old).expect("loads");
+        assert!(session.turns[0].todos.is_none());
+        assert!(!session.to_json().contains("todos"), "and does not grow a field it does not use");
     }
 
     #[test]

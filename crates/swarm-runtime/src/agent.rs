@@ -40,6 +40,7 @@ use swarm_tools::{ToolCall, ToolExecutor, ToolResult};
 use crate::prompt::initial_messages_with;
 use crate::reply::parse_plan;
 use crate::approval::{ApprovalHandler, ApprovalRequest};
+use crate::hooks::{HookCall, ToolHooks};
 
 /// How a single agent turn ends.
 #[derive(Debug)]
@@ -58,6 +59,8 @@ pub struct AgentRunner {
     pub executor: Arc<ToolExecutor>,
     pub approval: ApprovalPolicy,
     pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    /// The host's look at each call before and after it runs.
+    pub hooks: Option<Arc<dyn ToolHooks>>,
     /// Project instructions (`AGENTS.md` / `CLAUDE.md`) for the system prompt.
     pub instructions: Option<String>,
 }
@@ -462,8 +465,15 @@ impl AgentRunner {
                 if self.approval != ApprovalPolicy::Never => Some(risk.clone()),
             _ => None,
         };
+        // Hooks see a call that is allowed to be made at all, before the user
+        // is asked about it: a block is cheaper than a prompt.
+        let hook_call = HookCall { run_id: run.id.clone(), name: name.clone(), arguments: tc.arguments.clone() };
+        let hook_block = match (&self.hooks, &validation) {
+            (_, ToolRequestValidation::Deny { .. }) | (None, _) => None,
+            (Some(hooks), _) => hooks.before(&hook_call).await,
+        };
         let mut approval_denial = None;
-        let approved = if matches!(validation, ToolRequestValidation::Deny { .. }) {
+        let approved = if matches!(validation, ToolRequestValidation::Deny { .. }) || hook_block.is_some() {
             false
         } else if let Some(risk) = approval_risk {
             self.emit(run, agent, task, EventKind::ApprovalRequested,
@@ -491,11 +501,20 @@ impl AgentRunner {
         let (success, model_output, record, change) = if approved {
             let call = ToolCall::new(tc.id.clone(), tc.name.clone(), tc.arguments.clone());
             let result = self.executor.execute(&call).await;
-            let out = result.as_model_output();
+            let mut out = result.as_model_output();
+            if let Some(note) = match &self.hooks {
+                Some(hooks) => hooks.after(&hook_call, result.success, &out).await,
+                None => None,
+            } {
+                out.push_str(&format!("\n\n[hook] {note}"));
+            }
             let change = result.change.clone();
             (result.success, out, result.to_record(&tc.arguments), change)
         } else {
             let reason = match &validation {
+                _ if hook_block.is_some() => {
+                    format!("blocked by a hook: {}", hook_block.as_deref().unwrap_or_default())
+                }
                 ToolRequestValidation::Deny { reason } => {
                     format!("tool call denied: {reason}")
                 }
@@ -732,6 +751,7 @@ mod tests {
             executor: Arc::new(executor),
             approval: ApprovalPolicy::Never,
             approval_handler: None,
+            hooks: None,
             instructions: None,
         };
         (runner, run, task, agent, provider, dir)
@@ -918,6 +938,74 @@ mod tests {
         assert_eq!(checkpoint.tool_calls.len(), 1);
         assert!(!checkpoint.tool_calls[0].success);
         assert_eq!(runner.store.load_stats(&run.id).await.unwrap().usage.tool_calls, 1);
+    }
+
+    /// Blocks anything named `blocked`, and tacks a note on to everything else.
+    struct TestHooks {
+        before_seen: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolHooks for TestHooks {
+        async fn before(&self, call: &HookCall) -> Option<String> {
+            self.before_seen.fetch_add(1, Ordering::SeqCst);
+            (call.arguments["command"].as_str().is_some_and(|command| command.contains("forbidden")))
+                .then(|| "no forbidden commands here".to_string())
+        }
+
+        async fn after(&self, call: &HookCall, success: bool, output: &str) -> Option<String> {
+            assert_eq!(call.name, "bash");
+            assert!(success, "the hook is told how the call went, got output {output:?}");
+            Some("remember to run the linter".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_can_block_a_call_and_annotate_another() {
+        let script = vec![
+            MockStep::tool_calls(vec![NativeToolCall::new(
+                "c1", "bash", json!({ "command": "echo forbidden > blocked.txt" }),
+            )]),
+            MockStep::tool_calls(vec![NativeToolCall::new(
+                "c2", "bash", json!({ "command": "echo fine > fine.txt" }),
+            )]),
+            MockStep::text("done"),
+        ];
+        let (mut runner, run, task, mut agent, provider, dir) = fixture(script).await;
+        let hooks = Arc::new(TestHooks { before_seen: AtomicUsize::new(0) });
+        runner.hooks = Some(hooks.clone());
+        let outcome = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert!(matches!(outcome, AgentOutcome::Completed { .. }), "a blocked call does not end the turn");
+        assert!(!dir.path().join("ws/blocked.txt").exists(), "the blocked command never ran");
+        assert!(dir.path().join("ws/fine.txt").exists(), "the other one did");
+        assert_eq!(hooks.before_seen.load(Ordering::SeqCst), 2);
+        let events = runner.store.latest_events(&run.id, 100).await.unwrap();
+        let results: Vec<&serde_json::Value> =
+            events.iter().filter(|event| event.kind == EventKind::ToolResult).map(|event| &event.payload).collect();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["success"], false);
+        assert!(
+            results[0]["output"].as_str().unwrap().contains("blocked by a hook: no forbidden commands here"),
+            "the model is told why: {}", results[0]["output"]
+        );
+        assert!(results[1]["output"].as_str().unwrap().contains("[hook] remember to run the linter"));
+    }
+
+    #[tokio::test]
+    async fn a_hook_blocks_before_anyone_is_asked_to_approve() {
+        let script = vec![
+            MockStep::tool_calls(vec![NativeToolCall::new(
+                "c1", "bash", json!({ "command": "echo forbidden" }),
+            )]),
+            MockStep::text("done"),
+        ];
+        let (mut runner, run, task, mut agent, provider, _dir) = fixture(script).await;
+        runner.approval = ApprovalPolicy::AskAll;
+        let approval = Arc::new(StaticApproval { decision: true, calls: AtomicUsize::new(0) });
+        runner.approval_handler = Some(approval.clone());
+        runner.hooks = Some(Arc::new(TestHooks { before_seen: AtomicUsize::new(0) }));
+        runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert_eq!(approval.calls.load(Ordering::SeqCst), 0, "the user was not bothered with a call a hook stopped");
     }
 
     #[tokio::test]
