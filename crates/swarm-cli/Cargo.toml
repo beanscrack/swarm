@@ -25,11 +25,18 @@ async-trait = { workspace = true }
 toml = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+pulldown-cmark = { workspace = true }
+similar = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 swarm-providers = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+vt100 = { workspace = true }
 
 [[bin]]
 name = "swarm"

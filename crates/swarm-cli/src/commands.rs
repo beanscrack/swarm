@@ -2,7 +2,6 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -16,8 +15,9 @@ use swarm_scheduler::Scheduler;
 use swarm_store::Store;
 use swarm_tools::{SandboxConfig, ToolExecutor};
 
-use crate::approval::AllowList;
+use crate::approval::{AllowList, SharedMode, UiApproval, mode_of};
 use crate::transcript;
+use crate::ui::{Action, StartOptions, Ui, UiHandle};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -58,7 +58,7 @@ pub struct StoreArgs {
 }
 
 #[derive(Debug, Args)]
-struct RunArgs {
+pub struct RunArgs {
     goal: String,
     #[arg(long)]
     provider: Option<String>,
@@ -85,7 +85,7 @@ struct RunArgs {
 }
 
 #[derive(Debug, Args)]
-struct InspectArgs {
+pub struct InspectArgs {
     run_id: Option<String>,
     #[command(flatten)]
     store: StoreArgs,
@@ -135,7 +135,7 @@ pub struct ChatArgs {
 
 /// Arguments for resuming an unfinished run.
 #[derive(Debug, Args)]
-struct ResumeArgs {
+pub struct ResumeArgs {
     pub run_id: String,
     #[command(flatten)]
     store: StoreArgs,
@@ -158,7 +158,7 @@ struct ResumeArgs {
 }
 
 #[derive(Debug, Args)]
-struct LogsArgs {
+pub struct LogsArgs {
     run_id: Option<String>,
     #[command(flatten)]
     store: StoreArgs,
@@ -193,7 +193,7 @@ impl CommandOutcome {
 }
 
 /// `swarm` with no subcommand: the interactive session on a TTY, help otherwise.
-fn default_chat_args() -> ChatArgs {
+pub(crate) fn default_chat_args() -> ChatArgs {
     ChatArgs {
         goal: None,
         store: StoreArgs { store: PathBuf::from(".swarm") },
@@ -406,6 +406,8 @@ pub(crate) struct TurnOutcome {
     pub inferences: u64,
     pub tool_calls: u64,
     pub seconds: f64,
+    /// What the turn did (files edited, commands run), from the transcript.
+    pub stats: transcript::TurnStats,
 }
 
 impl TurnOutcome {
@@ -425,13 +427,21 @@ impl TurnOutcome {
     }
 }
 
-/// Run one goal to completion: create a durable run, show the live transcript,
-/// wire the console approval handler, drive the scheduler, collect the numbers.
+/// What a turn needs from the session around it.
+pub(crate) struct TurnEnv {
+    pub ui: UiHandle,
+    pub allow: Arc<AllowList>,
+    pub mode: Arc<SharedMode>,
+    pub verbose: bool,
+    /// Print the run banner first (`swarm run`; a chat turn has its own header).
+    pub banner: bool,
+}
+
+/// Run one goal to completion: create a durable run, stream its transcript to
+/// the UI, wire the approval dialog, drive the scheduler, collect the numbers.
 ///
-/// `quiet` is shared with the approval card (and the session's key reader, so
-/// it stops stealing keystrokes while a prompt is up). `current` receives the
-/// run id as soon as it exists: if the caller drops this future (Ctrl+C) the
-/// run stays in the store and `/resume <id>` picks it up.
+/// `current` receives the run id as soon as it exists: if the caller drops this
+/// future (Ctrl+C) the run stays in the store and `/resume <id>` picks it up.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_turn(
     store: &Arc<Store>,
@@ -441,9 +451,7 @@ pub(crate) async fn drive_turn(
     mode: RunMode,
     existing: Option<&RunId>,
     live: bool,
-    verbose: bool,
-    allow: &Arc<AllowList>,
-    quiet: Arc<AtomicBool>,
+    env: &TurnEnv,
     current: Arc<Mutex<Option<RunId>>>,
 ) -> Result<TurnOutcome> {
     let mut cfg = cfg.clone();
@@ -473,9 +481,11 @@ pub(crate) async fn drive_turn(
         *slot = Some(created.id.clone());
     }
 
-    // Claude Code-style live view: banner, streamed transcript, one footer line.
-    // Piped output and `--plain` keep the original one-line summary.
-    let tty = transcript::ui_enabled(io::stdout().is_terminal() && io::stderr().is_terminal());
+    // Claude Code-style live view. Piped output and `--plain` keep the
+    // original one-line summary.
+    let show = live
+        && (env.ui.is_live()
+            || transcript::ui_enabled(io::stdout().is_terminal() && io::stderr().is_terminal()));
     let header = transcript::Header {
         run_id: created.id.to_string(),
         goal: created.objective.clone(),
@@ -485,29 +495,97 @@ pub(crate) async fn drive_turn(
         approvals: cfg.tools.approval.to_string(),
         agents: created.agent_target,
     };
-    let tail = (tty && live).then(|| {
-        crate::live::LiveTail::start_shared(
+    let tail = show.then(|| {
+        crate::live::LiveTail::start(
             store.clone(),
             created.id.clone(),
-            &header,
-            tty,
-            verbose,
-            Arc::clone(&quiet),
+            env.banner.then_some(&header),
+            env.ui.clone(),
+            env.verbose,
         )
     });
     let runtime = if cfg.tools.approval == ApprovalPolicy::Never {
         runtime
     } else {
-        runtime.with_approval_handler(Arc::new(
-            crate::approval::ConsoleApproval::with_list(Arc::clone(&quiet), Arc::clone(allow)),
-        ))
+        runtime.with_approval_handler(Arc::new(UiApproval::new(
+            env.ui.clone(),
+            Arc::clone(&env.allow),
+            Arc::clone(&env.mode),
+            workspace.to_path_buf(),
+        )))
     };
     let started = Instant::now();
     let state = runtime.drive(&created.id).await?;
-    if let Some(tail) = tail {
-        tail.finish().await;
+    let stats = match tail {
+        Some(tail) => tail.finish().await,
+        None => transcript::TurnStats::default(),
+    };
+    let mut outcome = summarize_turn(store, &created.id, state, started.elapsed().as_secs_f64()).await?;
+    outcome.stats = stats;
+    Ok(outcome)
+}
+
+/// A turn for `swarm run` / `swarm resume`: on a terminal it gets the same
+/// single-owner UI as the chat (status line, permission dialog, Esc to stop);
+/// elsewhere it prints plainly.
+#[allow(clippy::too_many_arguments)]
+async fn drive_standalone(
+    store: &Arc<Store>,
+    cfg: &RunConfig,
+    workspace: &Path,
+    objective: &str,
+    mode: RunMode,
+    existing: Option<&RunId>,
+    plain: bool,
+    verbose: bool,
+) -> Result<TurnOutcome> {
+    let tty = io::stdout().is_terminal() && io::stdin().is_terminal() && transcript::ui_enabled(true);
+    let colors = crate::style::Color::detect(tty);
+    let mut ui = if tty && !plain {
+        Ui::start(StartOptions {
+            colors,
+            history_path: None,
+            workspace: workspace.to_path_buf(),
+            input: false,
+        })
+        .ok()
+    } else {
+        None
+    };
+    let handle = ui.as_ref().map(Ui::handle).unwrap_or_else(|| UiHandle::plain(colors));
+    handle.busy(true);
+    let env = TurnEnv {
+        ui: handle.clone(),
+        allow: allow_list(),
+        mode: SharedMode::new(mode_of(cfg.tools.approval)),
+        verbose,
+        banner: true,
+    };
+    let current = Arc::new(Mutex::new(None));
+    let drive = drive_turn(store, cfg, workspace, objective, mode, existing, !plain, &env, Arc::clone(&current));
+    tokio::pin!(drive);
+    let result = loop {
+        tokio::select! {
+            outcome = &mut drive => break outcome,
+            action = async {
+                match ui.as_mut() {
+                    Some(ui) => ui.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => if matches!(action, Some(Action::Interrupt) | Some(Action::Quit) | None) {
+                let id = current.lock().ok().and_then(|slot| slot.as_ref().map(|id| id.to_string()));
+                break Err(match id {
+                    Some(id) => anyhow!("interrupted \u{00b7} run {id} is in the store: swarm resume {id}"),
+                    None => anyhow!("interrupted"),
+                });
+            },
+        }
+    };
+    handle.busy(false);
+    if let Some(ui) = ui {
+        ui.shutdown().await;
     }
-    summarize_turn(store, &created.id, state, started.elapsed().as_secs_f64()).await
+    result
 }
 
 /// Collect the transcript-relevant numbers and final text for one run.
@@ -540,6 +618,7 @@ pub(crate) async fn summarize_turn(
         inferences: stats.usage.inference_calls,
         tool_calls: stats.usage.tool_calls,
         seconds,
+        stats: transcript::TurnStats::default(),
     })
 }
 
@@ -569,18 +648,15 @@ async fn run(args: RunArgs) -> Result<CommandOutcome> {
         .with_context(|| format!("create workspace {}", workspace.display()))?;
     let store = Arc::new(Store::open(&args.store.store).await?);
     let tty = transcript::ui_enabled(io::stdout().is_terminal() && io::stderr().is_terminal());
-    let outcome = drive_turn(
+    let outcome = drive_standalone(
         &store,
         &cfg,
         &workspace,
         &args.goal,
         RunMode::Coding,
         None,
-        !args.plain,
+        args.plain,
         args.verbose,
-        &allow_list(),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(Mutex::new(None)),
     )
     .await?;
     Ok(CommandOutcome {
@@ -620,18 +696,15 @@ async fn resume(args: ResumeArgs) -> Result<CommandOutcome> {
     std::fs::create_dir_all(&workspace)
         .with_context(|| format!("create workspace {}", workspace.display()))?;
     let tty = transcript::ui_enabled(io::stdout().is_terminal() && io::stderr().is_terminal());
-    let outcome = drive_turn(
+    let outcome = drive_standalone(
         &store,
         &cfg,
         &workspace,
         &run.objective,
         run.mode,
         Some(&id),
-        !args.plain,
+        args.plain,
         args.verbose,
-        &allow_list(),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(Mutex::new(None)),
     )
     .await?;
     Ok(CommandOutcome {
@@ -774,6 +847,9 @@ async fn logs(args: LogsArgs) -> Result<CommandOutcome> {
             args.verbose,
         )
     });
+    if let Some(renderer) = renderer.as_mut() {
+        renderer.set_width(crate::style::term_width());
+    }
     let initial = store.latest_events(&run.id, 100).await?;
     let mut cursor = initial.last().map_or(0, |e| e.seq);
     let render = |renderer: &mut Option<transcript::Transcript>,

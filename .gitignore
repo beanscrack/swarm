@@ -1,4 +1,5 @@
 target/
+.toolchain/
 .swarm/
 .swarm-test/
 work/

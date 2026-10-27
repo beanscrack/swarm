@@ -38,15 +38,11 @@ pub const ERROR: &str = "#FF6B6B";
 pub const SUCCESS: &str = "#69DB7C";
 /// "did you mean" suggestions and the select pointer (`color:"suggestion"`).
 pub const SUGGESTION: &str = "#93A7F7";
-/// The input box's top rule (`promptBorder`, rgb(153,153,153)).
-pub const PROMPT_BORDER: &str = "#999999";
-/// Inverse text inside a panel (Claude Code inverts, it does not recolour).
-pub const SELECTED_BG: &str = "#626262";
+/// Prompt rules: dim, so they frame the input rather than shout.
+pub const RULE: &str = "#6C6C6C";
+/// Plan mode accent (`planMode`, teal).
+pub const PLAN: &str = "#4EBA9F";
 
-/// Claude Code's left gutter is 2 cells (`Box{minWidth:2}`, `paddingLeft:2`).
-pub const INDENT: &str = "  ";
-/// `  ⎿  ` — two-space gutter, branch, two spaces, body at column 6.
-pub const BRANCH_GUTTER: &str = "  \u{23bf} ";
 /// Lines of a tool's input/output shown before collapsing the rest.
 pub const PREVIEW_LINES: usize = 8;
 /// Claude Code's spinner: six frames played forward then reversed (`mod_frames`
@@ -56,12 +52,6 @@ pub const SPINNER: [&str; 12] = [
     "\u{2736}", "*", "\u{2722}", "\u{00b7}",
 ];
 pub const SPINNER_MS: u64 = 100;
-/// Hermes' braille spinner at 100 ms, used where a frame must not change width.
-pub const BRAILLE: [&str; 10] = [
-    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
-    "\u{2807}", "\u{280f}",
-];
-pub const BRAILLE_MS: u64 = 100;
 /// The assistant bullet: `⏺` on macOS, `●` everywhere else
 /// (`Ro = macos ? "⏺" : "●"`), coloured `BRAND`.
 pub const fn bullet() -> &'static str {
@@ -106,13 +96,16 @@ pub fn past_verb(seed: u64) -> &'static str {
 }
 
 /// One random tip per session, Claude Code style.
-pub const TIPS: [&str; 6] = [
-    "b to expand all tool results, ctrl+o for full detail",
-    "ctrl+c interrupts the run; /resume <id> picks the run back up",
-    "/allow <tool> pins a tool for the rest of the session",
-    "shift+tab cycles approvals: ask dangerous, ask all, ask never",
-    "swarm logs <run> --transcript replays any finished run",
-    "type /help for every command",
+pub const TIPS: [&str; 9] = [
+    "shift+tab cycles approvals: ask, ask every tool, auto, plan",
+    "esc stops a running turn; anything you type meanwhile is queued",
+    "@path attaches a file, ! runs a shell command, # saves a note",
+    "/goal <condition> keeps working across turns until it is met",
+    "ctrl+r searches your prompt history, ctrl+g edits it in $EDITOR",
+    "/undo takes back the last turn, /retry sends it again",
+    "/resume lists earlier runs, swarm logs <run> --transcript replays one",
+    "/compact folds older turns into a short digest",
+    "/plan <task> explores read-only first and asks before changing anything",
 ];
 
 /// Turns `#RRGGBB` into its channels. Panics on malformed input: these are
@@ -231,9 +224,25 @@ pub fn role(colors: Color, name: &str, text: &str) -> String {
         "user" => Srgb::strong(BRAND),
         "echo" => Srgb::fg(TEXT).on(USER_BG),
         "suggest" => Srgb::fg(SUGGESTION),
+        // Plain quiet text for the footer, hints and queued rows: unlike
+        // `meta` (Claude Code's bold-italic-dim result styling) it is just grey.
+        "subtle" => Srgb::fg(SUBTLE),
+        // The rules above and below the prompt.
+        "rule" => Srgb::fg(RULE),
+        // The highlighted row of a menu or dialog.
+        "select" => Srgb::strong(SUGGESTION),
+        "perm" => Srgb::fg(PERMISSION),
+        "permbold" => Srgb::strong(PERMISSION),
+        "plan" => Srgb::fg(PLAN),
+        "code" => Srgb::fg(SUGGESTION),
         _ => return text.to_string(),
     };
     style.paint(colors, text)
+}
+
+/// Columns of the controlling terminal, 80 when there is none to ask.
+pub fn term_width() -> usize {
+    crossterm::terminal::size().map(|(cols, _)| cols as usize).unwrap_or(80).max(20)
 }
 
 /// `547` / `1.2k` / `1.2M` — Claude Code's token formatter.
@@ -268,29 +277,6 @@ pub fn gauge(fraction: f64, cells: usize) -> String {
     format!("[{out}] {}%", (clamped * 100.0).round() as u32)
 }
 
-/// Tail-truncate with Claude Code's `+N` marker (not Hermes' `...`).
-pub fn tail_truncate(text: &str, limit: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= limit {
-        return text.to_string();
-    }
-    let mut out: String = chars[..limit.max(1)].iter().collect();
-    out.push('+');
-    out.push_str(&(chars.len() - limit).to_string());
-    out
-}
-
-/// Head-truncate a long path so the tail (the interesting part) survives.
-pub fn head_truncate(text: &str, limit: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= limit {
-        return text.to_string();
-    }
-    let mut out = String::from('+');
-    out.extend(chars[chars.len() - limit..].iter());
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,13 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn truncation_markers_are_additive_not_ellipsis() {
-        assert_eq!(tail_truncate("abcdefghij", 4), "abcd+6");
-        assert_eq!(tail_truncate("abc", 4), "abc");
-        assert_eq!(head_truncate("/very/long/path/file.py", 8), "+/file.py");
-    }
-
-    #[test]
     fn colours_are_exact_noops_when_disabled() {
         assert_eq!(role(Color::Plain, "brand", "swarm"), "swarm");
         let painted = role(Color::Ansi, "brand", "swarm");
@@ -356,9 +335,6 @@ mod tests {
         }
         assert_eq!(SPINNER[0], SPINNER[SPINNER.len() - 1]);
         assert_eq!(SPINNER[1], SPINNER[SPINNER.len() - 2]);
-        for frame in BRAILLE {
-            assert!(frame.chars().count() == 1, "frame {frame:?} is not one cell");
-        }
     }
 
     #[test]

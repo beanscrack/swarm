@@ -17,7 +17,7 @@ mod executor;
 mod sandbox;
 
 pub use catalog::builtin_catalog;
-pub use error::{ToolError, ToolResult};
+pub use error::{FileChange, ToolError, ToolResult};
 pub use executor::{ToolCall, ToolExecutor};
 pub use sandbox::{
     DEFAULT_COMMAND_TIMEOUT, DEFAULT_OUTPUT_CAP, SandboxConfig, cap_output, resolve_within,

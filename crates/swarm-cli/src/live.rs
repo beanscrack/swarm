@@ -1,163 +1,77 @@
-//! Live transcript streaming for `swarm run`: tails the run's event log while
-//! the runtime appends to it, renders the transcript, and shows a Claude
-//! Code-style status line while the model is thinking.
+//! Live transcript for a run: tails the run's event log while the runtime
+//! appends to it and hands rendered rows to the UI.
 //!
-//! Transcript lines go to stdout (pipes and redirects stay clean); the status
-//! line is the only stderr traffic and only on a TTY. The status line yields to
-//! the approval prompt through the shared `quiet` flag.
+//! This module never touches the terminal. Rows go to the [`UiHandle`] (the
+//! single owner of the screen, or plain stdout when there is no terminal) and
+//! progress goes to its status line, so the spinner, the transcript and a
+//! permission dialog can never fight over a row.
 
-use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use swarm_core::event::EventKind;
-use swarm_core::{RunId, RunStatus};
+use swarm_core::state::{StateMachine, TaskState};
+use swarm_core::RunId;
 use swarm_store::Store;
 use tokio::task::JoinHandle;
 
-use crate::style::{SPINNER, SPINNER_MS, verb};
-use crate::transcript::{Color, Header, Transcript, paint};
+use crate::transcript::{Header, Transcript, TurnStats};
+use crate::ui::{Status, UiHandle};
 
-/// The status row is padded to this width so a shorter line wipes the longer
-/// line it replaces.
-const ROW: usize = 100;
-
-/// Wipe the in-place status row (the approval prompt calls this before printing
-/// its card so no spinner fragments are left behind).
-pub fn clear_line() {
-    if crate::transcript::ui_enabled(std::io::stderr().is_terminal()) {
-        eprint!("\r{}\r", " ".repeat(ROW));
-        let _ = std::io::stderr().flush();
-    }
-}
-
-/// In-place status line: `✻ Pondering (writing · 12s · ↓ 300 tokens)` — Claude
-/// Code's shape: frame + one verb per turn, then the dim details in parens.
-struct Spinner {
-    quiet: Arc<AtomicBool>,
-    started: Instant,
-    verb: &'static str,
-    shown: bool,
-}
-
-impl Spinner {
-    fn new(quiet: Arc<AtomicBool>) -> Self {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.subsec_nanos() as u64)
-            .unwrap_or(0);
-        Self { quiet, started: Instant::now(), verb: verb(seed), shown: false }
-    }
-
-    fn tick(&mut self, activity: &str, tokens: u64) {
-        if self.quiet.load(Ordering::Relaxed) {
-            self.clear();
-            return;
-        }
-        let elapsed = self.started.elapsed();
-        let frame = SPINNER[(elapsed.as_millis() as u64 / SPINNER_MS) as usize % SPINNER.len()];
-        let mut detail = format!("{activity} \u{00b7} {}s", elapsed.as_secs());
-        if tokens > 0 {
-            detail.push_str(&format!(
-                " \u{00b7} \u{2193} {} tokens",
-                crate::style::tokens(tokens)
-            ));
-        }
-        let line = format!(
-            "{} {}",
-            paint(Color::Ansi, "brand", &format!("{frame} {}", self.verb)),
-            paint(Color::Ansi, "meta", &format!("({detail})"))
-        );
-        // Clear to end of line so a shorter tick wipes the longer one before it.
-        eprint!("\r{line}\x1b[K\r");
-        let _ = std::io::stderr().flush();
-        self.shown = true;
-    }
-
-    fn clear(&mut self) {
-        if self.shown {
-            clear_line();
-            self.shown = false;
-        }
-    }
-}
+const POLL: Duration = Duration::from_millis(100);
+/// Task counts cost a query, so they refresh about once a second.
+const TASK_EVERY: u32 = 10;
 
 /// A running tail of one run's event log.
 pub struct LiveTail {
     stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    join: Option<JoinHandle<TurnStats>>,
 }
 
 impl LiveTail {
-    /// Print the run banner, then tail events in the background.
-    ///
-    /// `quiet` is the flag the caller shares with the approval prompt, so the
-    /// status row and the approval card never fight over the same line.
-    pub fn start_shared(
+    /// Optionally print the run banner, then tail events in the background.
+    pub fn start(
         store: Arc<Store>,
         run_id: RunId,
-        header: &Header,
-        tty: bool,
+        header: Option<&Header>,
+        ui: UiHandle,
         verbose: bool,
-        quiet: Arc<AtomicBool>,
     ) -> Self {
-        let transcript = Transcript::new(Color::detect(tty), verbose);
-        for line in transcript.banner(header) {
-            println!("{line}");
+        if let Some(header) = header {
+            ui.print(Transcript::new(ui.colors(), verbose).banner(header));
         }
-        let _ = std::io::stdout().flush();
         let stop = Arc::new(AtomicBool::new(false));
         let join = {
-            let (stop, quiet) = (Arc::clone(&stop), Arc::clone(&quiet));
-            tokio::spawn(async move { Self::pump(store, run_id, tty, verbose, stop, quiet).await })
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move { Self::pump(store, run_id, ui, verbose, stop).await })
         };
-        Self {
-            stop,
-            join: Some(join),
-        }
+        Self { stop, join: Some(join) }
     }
 
     async fn pump(
         store: Arc<Store>,
         run_id: RunId,
-        tty: bool,
+        ui: UiHandle,
         verbose: bool,
         stop: Arc<AtomicBool>,
-        quiet: Arc<AtomicBool>,
-    ) {
-        let mut transcript = Transcript::new(Color::detect(tty), verbose);
-        let mut spinner = Spinner::new(Arc::clone(&quiet));
+    ) -> TurnStats {
+        let mut transcript = Transcript::new(ui.colors(), verbose);
         let mut cursor = 0u64;
         let mut activity = "starting";
         let mut tokens = 0u64;
+        let mut tasks: Option<(u32, u32)> = None;
         let mut ticks = 0u32;
         loop {
-            let events = store
-                .events_since(&run_id, cursor, 200)
-                .await
-                .unwrap_or_default();
-            let mut printed = false;
+            let events = store.events_since(&run_id, cursor, 200).await.unwrap_or_default();
+            transcript.set_width(crate::style::term_width());
+            let mut changed = !events.is_empty();
+            let mut rows = Vec::new();
             for event in &events {
                 cursor = event.seq;
-                let number = |key: &str| {
-                    event
-                        .payload
-                        .get(key)
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0)
-                };
+                let number = |key: &str| event.payload.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
                 tokens += number("input_tokens") + number("output_tokens");
-                let lines = transcript.lines(event);
-                if lines.is_empty() {
-                    continue;
-                }
-                spinner.clear();
-                for line in lines {
-                    println!("{line}");
-                }
-                let _ = std::io::stdout().flush();
-                printed = true;
+                rows.extend(transcript.lines(event));
                 activity = match event.kind {
                     EventKind::InferenceStarted | EventKind::InferenceCompleted => "thinking",
                     EventKind::ToolRequested => "running tool",
@@ -166,35 +80,44 @@ impl LiveTail {
                     _ => "working",
                 };
             }
+            ui.print(rows);
             ticks += 1;
+            if ticks % TASK_EVERY == 1 {
+                if let Ok(list) = store.list_tasks(&run_id).await {
+                    let done = list.iter().filter(|task| task.state == TaskState::Completed).count() as u32;
+                    let next = Some((done, list.len() as u32));
+                    changed |= next != tasks;
+                    tasks = next;
+                }
+            }
+            if changed || ticks == 1 {
+                ui.status(Status { activity: activity.to_string(), tokens, tasks });
+            }
             let finished = ticks.is_multiple_of(5)
                 && matches!(
                     store.load_run_required(&run_id).await.map(|run| run.status),
-                    Ok(RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled)
+                    Ok(status) if status.is_terminal()
                 );
             if (finished && events.is_empty()) || stop.load(Ordering::Relaxed) {
                 break;
             }
-            if tty && !printed && events.is_empty() {
-                spinner.tick(activity, tokens);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(POLL).await;
         }
-        spinner.clear();
-        for line in transcript.drain() {
-            println!("{line}");
-        }
-        let _ = std::io::stdout().flush();
+        ui.print(transcript.drain());
+        transcript.stats().clone()
     }
 
-    /// Stop the tail and let it flush its last events.
-    pub async fn finish(mut self) {
+    /// Stop the tail, let it flush its last events, and hand back what the turn did.
+    pub async fn finish(mut self) -> TurnStats {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(join) = self.join.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), join).await;
+        match self.join.take() {
+            Some(join) => tokio::time::timeout(Duration::from_secs(5), join)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default(),
+            None => TurnStats::default(),
         }
-        clear_line();
-        let _ = std::io::stdout().flush();
     }
 }
 
@@ -214,52 +137,35 @@ mod tests {
     use swarm_core::event::RunEvent;
     use swarm_core::run::Run;
 
-    /// Through the real store: events appended while a tail is live must reach
-    /// the transcript, and the tail must stop once the run reaches a terminal
-    /// state.
-    #[tokio::test]
-    async fn tail_streams_appended_events_and_stops_on_completion() {
+    async fn store_with_run() -> (tempfile::TempDir, Arc<Store>, RunId) {
         let temp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(Store::open(&temp.path().join("store")).await.unwrap());
         let run_id = RunId::new();
-        let mut run = Run::new(
-            "goal",
-            "mock",
-            Some("mock".to_string()),
-            1,
-            true,
-            ResourceBudget::default(),
-            0,
-        );
+        let mut run = Run::new("goal", "mock", Some("mock".to_string()), 1, true, ResourceBudget::default(), 0);
         run.id = run_id.clone();
         run.status = RunStatus::Running;
         store.create_run(&run).await.unwrap();
-        let header = Header {
-            run_id: run_id.to_string(),
-            goal: "goal".into(),
-            provider: "mock".into(),
-            model: "mock".into(),
-            workspace: ".".into(),
-            approvals: "ask_all".into(),
-            agents: 1,
-        };
-        // The session shares this flag with the approval card; a plain run hands
-        // it a flag nobody raises.
-        let quiet = Arc::new(AtomicBool::new(false));
-        let tail = LiveTail::start_shared(
+        (temp, store, run_id)
+    }
+
+    /// Through the real store: events appended while a tail is live reach the
+    /// stats, and the tail stops once the run is terminal.
+    #[tokio::test]
+    async fn tail_streams_appended_events_and_stops_on_completion() {
+        let (_temp, store, run_id) = store_with_run().await;
+        let tail = LiveTail::start(
             Arc::clone(&store),
             run_id.clone(),
-            &header,
+            None,
+            UiHandle::plain(crate::style::Color::Plain),
             false,
-            false,
-            Arc::clone(&quiet),
         );
-        assert!(!quiet.load(Ordering::SeqCst));
         store
             .append_event(&RunEvent::new(
-                EventKind::ToolRequested,
+                EventKind::ToolResult,
                 run_id.clone(),
-                serde_json::json!({"name":"write_file","arguments":{"path":"a.txt"}}),
+                serde_json::json!({"name":"read_file","success":true,"truncated":false,
+                    "arguments":{"path":"a.txt"},"output":"one\ntwo"}),
             ))
             .await
             .unwrap();
@@ -267,6 +173,17 @@ mod tests {
         let mut running = store.load_run_required(&run_id).await.unwrap();
         running.status = RunStatus::Completed;
         store.update_run(&running).await.unwrap();
-        tail.finish().await;
+        let stats = tail.finish().await;
+        assert_eq!(stats.reads, 1, "the tail rendered the event it saw");
+    }
+
+    #[tokio::test]
+    async fn an_idle_tail_can_be_stopped_at_once() {
+        let (_temp, store, run_id) = store_with_run().await;
+        let tail = LiveTail::start(store, run_id, None, UiHandle::plain(crate::style::Color::Plain), false);
+        let started = std::time::Instant::now();
+        let stats = tail.finish().await;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(stats, TurnStats::default());
     }
 }

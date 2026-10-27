@@ -449,7 +449,7 @@ async function loginWall(page) {
 
 async function sendMessage(session, prompt) {
   const { page } = session;
-  const editor = await composer(page);
+  let editor = await composer(page);
   // Which markup shape the site uses is decided per read, not cached per
   // session: a fresh chat has no turns to inspect yet.
   const previousTurns = await assistantCount(page);
@@ -458,13 +458,47 @@ async function sendMessage(session, prompt) {
 
   // An overlay over the composer (banners, tooltips) makes Playwright's click
   // time out on a visible element; focusing is enough for insertText to land.
-  await editor.click({ timeout: 5000 }).catch(async () => {
-    await editor.evaluate((node) => node.focus());
-  });
-  await editor.fill('').catch(() => {});
-  // insertText keeps newlines inside a contenteditable composer; typing them
-  // would submit a half-written prompt.
-  await page.keyboard.insertText(prompt);
+  // The composer can be visible before the page has finished initializing.
+  // Confirm the text actually landed before submitting, and retry if the page
+  // replaced or reset the editor while it was loading.
+  let entered = false;
+  for (let attempt = 0; attempt < 3 && !entered; attempt++) {
+    editor = await composer(page);
+    try {
+      await editor.waitFor({ state: 'visible', timeout: 10000 });
+      await editor.click({ timeout: 5000 });
+      if (prompt.split('\n').length > 40 && await editor.evaluate((node) => node.isContentEditable)) {
+        // The editor's per-paragraph cost makes fill() grow worse than
+        // linearly in line count (600 lines ~ 19s). Building the paragraphs in
+        // one DOM write lets the editor parse them once.
+        await editor.evaluate((node, text) => {
+          node.focus();
+          const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          node.innerHTML = text.split('\n').map((line) =>
+            `<p>${line ? esc(line) : '<br class="ProseMirror-trailingBreak">'}</p>`).join('');
+          node.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
+        }, prompt);
+      } else {
+        await editor.fill(prompt, { timeout: 10000 });
+      }
+      await page.waitForTimeout(500);
+      // A contenteditable composer reports its paragraph breaks as extra blank
+      // lines in innerText, so compare with whitespace collapsed.
+      entered = await editor.evaluate((node, expected) => {
+        const squash = (text) => text.replace(/\s+/g, ' ').trim();
+        return squash('value' in node ? node.value : node.innerText) === squash(expected);
+      }, prompt);
+      if (!entered) {
+        const got = await editor.evaluate((node) => ('value' in node ? node.value : node.innerText).length);
+        console.error(`[composer] attempt ${attempt}: prompt ${prompt.length} chars, composer ${got} chars`);
+      }
+    } catch (error) {
+      // A navigation or a late hydration can replace the composer.
+      console.error(`[composer] attempt ${attempt} (${prompt.length} chars): ${String(error.message).split('\n')[0]}`);
+    }
+    if (!entered) await page.waitForTimeout(1000);
+  }
+  if (!entered) throw new BridgeError(503, 'ChatGPT composer did not retain the prompt; wait for the page to load and retry');
   const send = await firstVisible(page, SEND, 5000);
   if (send) {
     await send.click();

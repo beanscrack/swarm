@@ -488,11 +488,12 @@ impl AgentRunner {
             true
         };
 
-        let (success, model_output, record) = if approved {
+        let (success, model_output, record, change) = if approved {
             let call = ToolCall::new(tc.id.clone(), tc.name.clone(), tc.arguments.clone());
             let result = self.executor.execute(&call).await;
             let out = result.as_model_output();
-            (result.success, out, result.to_record(&tc.arguments))
+            let change = result.change.clone();
+            (result.success, out, result.to_record(&tc.arguments), change)
         } else {
             let reason = match &validation {
                 ToolRequestValidation::Deny { reason } => {
@@ -508,7 +509,7 @@ impl AgentRunner {
             let mut denied = ToolResult::failure(reason.clone());
             denied.call_id = tc.id.clone();
             denied.name = name.clone();
-            (false, reason, denied.to_record(&tc.arguments))
+            (false, reason, denied.to_record(&tc.arguments), None)
         };
 
         let (model_text, truncated) = cap_for_model(&model_output);
@@ -530,6 +531,9 @@ impl AgentRunner {
                 "truncated": truncated,
                 "arguments": tc.arguments.clone(),
                 "output": model_output.chars().take(1200).collect::<String>(),
+                // What a file tool changed, captured when it ran, so a UI can
+                // show an exact diff without racing the file system.
+                "change": change,
             }),
         )
         .await?;

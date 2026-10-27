@@ -73,102 +73,169 @@ cargo run -p swarm-cli -- chat --resume run_1f2e…
 Every goal you type is a normal durable run, so `status`, `tasks`, `logs`,
 `--transcript`, budgets, checkpoints and approvals all keep working; the session
 is the layer on top. It is stored under the `chat` namespace of the same store,
-so a session survives restarts (`--new` starts a fresh one).
+so a session (and an active `/goal`) survives restarts; `--new` starts fresh.
 
 ```
-⏺ swarm
-  provider chatgpt-web · model auto · 1 agent · approvals on-write
-  session chat-1f2e… · turn 3 · 41.2k tokens · 12 inferences · 9 tool calls
+╭──────────────────────────────────────────────────────────╮
+│ ✻ Welcome to swarm!                                      │
+│                                                          │
+│   /help for help, /status for your current setup         │
+│                                                          │
+│   cwd: /home/me/project/work                             │
+│   chatgpt-web · auto · 3 agents · approvals ask_dangerous│
+╰──────────────────────────────────────────────────────────╯
 
-❯ add a login page
-⏺ [a1 t1] write_file("app/login.py")
-  ⎿ wrote 42 lines to app/login.py
-  ⎿ step 1 · 4.2s · 1.2k → 96 tokens · auto
-✻ writing · 26s · ↓ 2.7k tokens
-✻ completed in 26.4s · 1 task · 2 inferences · 1 tool calls · 2.7k tokens
-❯
+❯ make the login test pass
+● Read(app/login.py)
+  ⎿  Read 42 lines
+● Update(app/login.py)
+  ⎿  Updated app/login.py with 1 addition and 1 removal
+      12 -     if user.password == given:
+      12 +     if verify(user.password, given):
+● Bash(pytest -q)
+  ⎿  3 passed in 0.41s
+● Fixed the check in `login.py`; the test passes.
+✻ Cogitated for 26.4s · edited 1 file +1 -1 · read 1 file · ran 1 command · 2.7k tokens
+
+────────────────────────────────────────────────────────────────
+❯ Try "write tests for the parser"
+────────────────────────────────────────────────────────────────
+  ? for shortcuts                     chatgpt-web · auto · 2.7k tokens
 ```
 
-The renderer (`transcript.rs`) and its palette (`style.rs`) follow Claude Code:
-the `⏺` action bullet in terracotta on a light cell, tool results as `⎿` preview
-lines at a four-space gutter, `+N` for what was cut, `↓ 1.2k` token counts, the
-`✻` working spinner, and a bordered permission panel:
+Finished output flows into your terminal's own scrollback; only the spinner,
+the prompt box and the footer are redrawn in place. Replies are rendered as
+markdown, file edits show a numbered diff, and a permission prompt shows the
+exact command or diff before anything runs:
 
 ```
-╭─ ⚠  Allow bash? ─────────────────────────────╮
-│ bash({"command": "rm -rf build"})            │
-│                                              │
-│ ❯ 1. Yes, allow once                         │
-│   2. Yes, allow for this session             │
-│   3. No, deny this call                      │
-│                                              │
-│ runs a shell command in the workspace        │
-╰──────────────────────────────────────────────╯
-  1/2/3 to choose · y/a/n shorthand · Esc denies
+╭──────────────────────────────────────────────────────────────╮
+│ Bash command                                                 │
+│                                                              │
+│   rm -rf build                                               │
+│                                                              │
+│   tool `bash` may act outside the sandbox                    │
+│                                                              │
+│ Do you want to proceed?                                      │
+│ ❯ 1. Yes                                                     │
+│   2. Yes, and don't ask again for bash this session          │
+│   3. No, deny this call (esc)                                │
+╰──────────────────────────────────────────────────────────────╯
 ```
 
-Colours are truecolor when the terminal offers them and are dropped for pipes,
-`NO_COLOR`, `TERM=dumb` and `SWARM_UI=never`; `SWARM_UI=always` forces them for
-captures. `ctrl+o` widens previews.
+### Keys
 
-Keys: `enter` sends, `\` then `enter` inserts a newline, `up`/`down` and
-`ctrl+r` walk the prompt history, `tab` completes slash commands,
-`ctrl+a/e/b/f/k/u/w` do line editing, `ctrl+o` toggles transcript detail,
-`ctrl+l` redraws, `ctrl+c` interrupts the running turn (the run stays in the
-store and the message tells you how to resume it), `ctrl+d` leaves.
+| Key | Does |
+| --- | --- |
+| `enter` | send (a partial `/command` is completed first) |
+| `shift+enter`, `ctrl+j`, `\` then `enter` | newline (`shift+enter` needs a terminal with the kitty keyboard protocol; the others work everywhere) |
+| `esc` | stop the running turn; closes a menu first; pressed twice it clears the prompt (the draft stays in history) |
+| `ctrl+c` | clear the prompt, else stop the turn, else press twice to exit |
+| `ctrl+d` | delete forward, or exit on an empty prompt (press twice) |
+| `shift+tab` | cycle permission mode: default → ask every tool → auto → plan |
+| `up` / `down` | move through a multi-line prompt, then through history (saved across sessions) |
+| `ctrl+r` | search prompt history |
+| `tab` | complete a `/command` or `@file`; queue what you typed while a turn runs |
+| `ctrl+o` | toggle full transcript detail |
+| `ctrl+g` | edit the prompt in `$VISUAL` / `$EDITOR` |
+| `ctrl+l` | clear the screen |
+| `ctrl+z` | suspend (`fg` resumes and repaints) |
+| `?` on an empty prompt | shortcut sheet |
+| `ctrl+a/e/b/f/k/u/w/y`, `alt+b/f/d`, `ctrl+_` | emacs line editing, kill ring, undo |
 
-Slash commands: `/help`, `/status [run]`, `/tasks [run]`, `/logs [run]`,
-`/runs`, `/history`, `/cost`, `/tools`, `/copy`, `/model <name>`,
-`/agents <n>`, `/approve ask|danger|all`, `/allow [tool]`, `/allow-all`,
-`/compact`, `/clear`, `/new`, `/exit`.
+Pasting a large block collapses it to `[Pasted text #1 +41 lines]` in the prompt;
+the whole text is sent. Typing `/` opens a command menu, `@` a file menu.
 
-Goals typed while a turn is running are queued and run next, so you can steer
-the session without waiting. Approvals print the exact call with its risk and
-accept `y` (once), `n` (deny) or `a` (allow that tool for the rest of the
-session, the same list `/allow` shows). `/approve all` and `/allow-all` are
-per-session; nothing is written to disk.
+### Prompt prefixes
+
+* `@path` attaches a workspace file (or lists a folder) to the request. Paths
+  stay inside the workspace, and secrets such as `.env` or `*.pem` are refused.
+* `!command` runs a shell command in the workspace yourself, not through the
+  agent, and keeps its output as context for the next goal.
+* `#note` saves a line to `AGENTS.md`, which every agent reads.
+
+### Commands
+
+| Session | Work | Setup | Inspect |
+| --- | --- | --- | --- |
+| `/help [filter]` | `/goal [text\|status\|pause\|resume\|clear]` | `/model [name]` | `/status [run]` |
+| `/clear` `/new` | `/plan <task>` | `/permissions [ask\|all\|auto\|plan]` | `/cost` |
+| `/compact` | `/init` | `/allow [tool]` `/allow-all` | `/context` |
+| `/resume [run]` | `/queue [list\|rm n\|clear]` | `/verbose` | `/tasks [run]` `/logs [run]` |
+| `/undo [n]` `/retry` | `/busy [queue\|interrupt]` | `/memory [edit]` | `/runs` `/history` |
+| `/copy` `/export [file]` | `/agents [n]` | `/config` | `/tools` `/diff` `/doctor` |
+| `/exit` | | | |
+
+An unambiguous prefix works (`/comp`), and a typo gets a suggestion
+(`/hepl` → did you mean `/help`).
+
+* **`/goal <condition>`** keeps working across turns until the condition is met.
+  After each turn the configured model is asked, in one JSON line, whether the
+  goal is done, should continue, or is blocked. It pauses on `blocked`, after
+  20 turns, on a failed or interrupted turn, or if the judge gives no usable
+  answer three times; `/goal resume` restarts the budget. Anything you queue
+  takes priority over the next continuation.
+* **`/plan <task>`** (or `shift+tab` to plan mode) lets the agent read, list and
+  search but refuses every write and command, then asks whether to proceed.
+* **While a turn runs**, what you type is queued and shown above the prompt;
+  `up` takes the newest queued message back to edit, `/busy interrupt` makes
+  `enter` stop the turn and send the message instead.
+* **`/undo`** takes the last request out of the conversation and puts it back in
+  the prompt; **`/retry`** sends it again. The files the agent changed are not
+  reverted, only what the session remembers.
+* **`/copy`** puts the last result on the clipboard with an OSC 52 escape, so it
+  works over SSH and inside tmux.
 
 For scripts and CI, `swarm chat --oneshot` reads one goal from stdin and exits,
-and piped stdin feeds one input per line in order — a line starting with `/` is
-a command there too, everything else is a goal.
+and piped stdin feeds one input per line in order (a line starting with `/` is a
+command there too). The final result is printed to stdout. Colours are dropped
+for pipes, `NO_COLOR` and `TERM=dumb`; `SWARM_UI=always` forces them and
+`SWARM_UI=never` disables them. `SWARM_KEYBOARD=legacy` skips the keyboard
+protocol query for terminals that mishandle it.
+
+### How it stays unbroken
+
+The terminal has exactly one owner: a UI task (`crates/swarm-cli/src/ui`). The
+engine, the transcript tail and the permission prompt never print; they send
+messages to it, so a spinner, a dialog and streaming output can no longer fight
+over a row. It keeps the live region at the bottom with relative cursor
+arithmetic (no queries to the terminal), draws each frame inside a synchronized
+update with the cursor hidden, and restores the terminal on exit, on panic, and
+on SIGTERM/SIGINT/SIGHUP. Text from models and tools is sanitised, so an escape
+sequence in a file the agent `cat`s cannot repaint or retitle your terminal.
+Tool subprocesses get no stdin (they cannot steal your keystrokes) and are
+killed when a turn is interrupted.
 
 ## Live view
 
-`run` prints a Claude Code-style transcript of the run as it happens:
+`swarm run` uses the same terminal UI (spinner, permission dialog, Esc to stop)
+and prints the transcript as the run happens:
 
 ```
-⏺ swarm
-  provider chatgpt-web · model auto · 3 agents · approvals on-write
+● swarm
+  provider chatgpt-web · model auto · 3 agents · approvals ask_dangerous
   goal create hello.txt containing hello and verify it
   workspace ./work · run run_1f2e…
 
-⏺ [a1 t1] asks for write_file
-  ⎿ step 1 · 4.2s · 1204 → 96 tokens · gpt-5.1
-⏺ [a1 t1] write_file(content=hello, path=hello.txt)
-  ⎿ wrote 5 byte(s) to hello.txt
-⏺ [a1 t1]
-  Created hello.txt and verified it contains `hello`.
-  ⎿ step 2 · 3.1s · 1330 → 41 tokens
-⏺ [t1] result
-  Created hello.txt and verified it contains `hello`.
+● Write(hello.txt)
+  ⎿  Wrote 1 line to hello.txt
+      1 + hello
+● Bash(cat hello.txt)
+  ⎿  hello
+● Created hello.txt and verified it contains `hello`.
 ✻ completed in 26.4s · 1 task · 2 inferences · 1 tool calls · 2671 tokens
 ```
 
-`⏺` is an action, `⎿` its result, `✗` a failure, and a braille spinner with the
-elapsed time, token count and current phase runs on the status row. A long
-assistant reply streams line by line; tool output shows its first line.
-The transcript is rendered from the persisted event log, so a run that was
-interrupted can be replayed after the fact:
+`●` is an action, `⎿` its result, `✗` a failure. The transcript is rendered from
+the persisted event log, so a run that was interrupted can be replayed later:
 
 ```sh
 cargo run -p swarm-cli -- logs <run-id> --transcript
 ```
 
-Flags: `--plain` prints only the final one-line summary, `--verbose` adds
-low-signal rows (agent states, checkpoints, longer text), and `--json`
-suppresses the transcript entirely. Colours are off for pipes, when
-`NO_COLOR` is set, and under `TERM=dumb`. Force the live view in a pipe or CI
-with `SWARM_UI=always` (or disable it with `SWARM_UI=never`).
+Flags: `--plain` prints only the final one-line summary, and `--verbose` adds
+low-signal rows (swarm's own tool names and arguments, agent states,
+checkpoints, per-step usage).
 
 
 On this workstation, the Qwen server can be started with

@@ -1,23 +1,33 @@
-//! Serialized terminal prompts for agent tool approvals.
+//! Tool approvals: the permission dialog and the session's allow list.
+//!
+//! The dialog is an ordinary [`DialogSpec`] shown by the UI task, so approving
+//! never touches the keyboard or the screen from the engine's side; the
+//! engine just awaits the answer.
 
 use std::collections::HashSet;
-use std::io::{self, IsTerminal, Write};
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled};
+use serde_json::Value;
+use swarm_core::config::ApprovalPolicy;
 use swarm_runtime::{ApprovalHandler, ApprovalRequest};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::Mutex as AsyncMutex;
 
-use crate::live::clear_line;
-use crate::transcript::{Color, args_summary, paint};
+use crate::style::{Color, role};
+use crate::ui::diff;
+use crate::ui::text::{sanitize, truncate};
+use crate::ui::{Accent, DialogSpec, Mode, UiHandle};
 
-/// Tools the user approved for the rest of the session (`a` at the prompt),
-/// Claude Code's "yes, and don't ask again for this tool".
+/// How long a prompt waits before it counts as a refusal.
+const PROMPT_TIMEOUT: Duration = Duration::from_secs(600);
+/// Rows of command or diff shown before the dialog collapses the rest.
+const BODY_ROWS: usize = 16;
+
+/// Tools the user approved for the rest of the session ("yes, and don't ask
+/// again for this tool").
 #[derive(Default)]
 pub struct AllowList(Mutex<HashSet<String>>);
 
@@ -37,10 +47,13 @@ impl AllowList {
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.0
+        let mut names: Vec<String> = self
+            .0
             .lock()
-            .map(|set| set.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default()
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
     }
 
     pub fn clear(&self) {
@@ -50,20 +63,39 @@ impl AllowList {
     }
 }
 
-/// A request for one key press, answered by the thread that owns the keyboard.
-pub type KeyRequest = mpsc::UnboundedSender<Decision>;
+/// The current permission mode, shared between the session loop (Shift+Tab)
+/// and the approval handler, so switching to "auto" takes effect on a prompt
+/// that has not been shown yet.
+#[derive(Debug, Default)]
+pub struct SharedMode(AtomicU8);
 
-/// The prompt reader's key bus. A terminal session has exactly one reader
-/// thread, so a process-wide slot is enough, and it keeps the approval card
-/// from opening a second console reader that would race it for input.
-static KEY_BUS: std::sync::OnceLock<mpsc::UnboundedSender<KeyRequest>> = std::sync::OnceLock::new();
+impl SharedMode {
+    pub fn new(mode: Mode) -> Arc<Self> {
+        let shared = Arc::new(Self::default());
+        shared.set(mode);
+        shared
+    }
 
-pub fn install_key_bus(tx: mpsc::UnboundedSender<KeyRequest>) {
-    let _ = KEY_BUS.set(tx);
-}
+    pub fn set(&self, mode: Mode) {
+        self.0.store(
+            match mode {
+                Mode::Default => 0,
+                Mode::AskAll => 1,
+                Mode::Auto => 2,
+                Mode::Plan => 3,
+            },
+            Ordering::SeqCst,
+        );
+    }
 
-pub fn key_bus() -> Option<&'static mpsc::UnboundedSender<KeyRequest>> {
-    KEY_BUS.get()
+    pub fn get(&self) -> Mode {
+        match self.0.load(Ordering::SeqCst) {
+            1 => Mode::AskAll,
+            2 => Mode::Auto,
+            3 => Mode::Plan,
+            _ => Mode::Default,
+        }
+    }
 }
 
 /// The answer to one approval prompt.
@@ -79,442 +111,372 @@ impl Decision {
         self != Decision::Deny
     }
 
-    /// One key press to a decision (pure, so the mapping is testable). Number
-    /// keys pick the matching row of the panel; `y`/`a` keep the old one-keystroke
-    /// shorthand; anything else denies, matching the capital-D default below.
-    pub fn from_key(ch: char) -> Self {
-        match ch {
-            'y' | 'Y' | '1' => Self::AllowOnce,
-            'a' | 'A' | '2' => Self::AllowAlways,
-            '3' | 'n' | 'N' => Self::Deny,
+    /// The dialog's option index to a decision (`None` is a dismissal).
+    pub fn from_choice(choice: Option<usize>) -> Self {
+        match choice {
+            Some(0) => Self::AllowOnce,
+            Some(1) => Self::AllowAlways,
             _ => Self::Deny,
         }
     }
 }
 
-/// The rows of the Claude Code permission dialog: box, the exact call, the
-/// numbered choices with `❯` on the cursor row, then the reason.
-pub fn panel_lines(
-    title: &str,
-    command: &str,
-    choices: &[&str],
-    description: &str,
-    cursor: usize,
-    width: usize,
-) -> Vec<String> {
-    // Claude Code sizes the panel 46..76 cells and clamps to the terminal.
-    let inner = width.clamp(46, 76).saturating_sub(4).max(24);
-    let total = inner + 4;
-    let row = |body: &str| {
-        // Never let a long line push the right border out of alignment.
-        let body: std::borrow::Cow<'_, str> = if body.chars().count() > inner {
-            std::borrow::Cow::Owned(body.chars().take(inner).collect())
-        } else {
-            std::borrow::Cow::Borrowed(body)
-        };
-        format!("\u{2502} {body:<inner$} \u{2502}")
-    };
-    let mut out = Vec::new();
-
-    let head = format!("\u{256d}\u{2500} {title} ");
-    let mut top = head.chars().take(total.saturating_sub(1)).collect::<String>();
-    top.push_str(&"\u{2500}".repeat(total.saturating_sub(top.chars().count() + 1)));
-    top.push('\u{256e}');
-    out.push(top);
-
-    let mut wrapped = Vec::new();
-    for line in command.lines() {
-        for chunk in wrap(line, inner.saturating_sub(2)) {
-            wrapped.push(chunk);
-        }
+/// The footer mode a run's approval policy corresponds to.
+pub fn mode_of(policy: ApprovalPolicy) -> Mode {
+    match policy {
+        ApprovalPolicy::AskDangerous => Mode::Default,
+        ApprovalPolicy::AskAll => Mode::AskAll,
+        ApprovalPolicy::Never => Mode::Auto,
     }
-    let hidden = wrapped.len().saturating_sub(4);
-    wrapped.truncate(4);
-    for line in wrapped {
-        out.push(row(&line));
-    }
-    if hidden > 0 {
-        out.push(row(&format!(
-            "\u{2026} {hidden} more lines \u{00b7} ctrl+o shows detail"
-        )));
-    }
-    out.push(row(""));
-    for (index, choice) in choices.iter().enumerate() {
-        let mark = if index == cursor { "\u{276f}" } else { " " };
-        out.push(row(&format!(
-            "{mark} {}. {:<cw$}",
-            index + 1,
-            choice,
-            cw = inner.saturating_sub(5)
-        )));
-    }
-    if !description.is_empty() {
-        out.push(row(""));
-        for line in wrap(description, inner.saturating_sub(2)).into_iter().take(6) {
-            out.push(row(&line));
-        }
-    }
-    out.push(format!(
-        "\u{2570}{}\u{256f}",
-        "\u{2500}".repeat(total.saturating_sub(2))
-    ));
-    out
 }
 
-/// Naive word wrap that never splits a word shorter than the width.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(8);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let mut word = word;
-        // A word wider than the panel (a long path, a base64 blob) gets broken.
-        while word.chars().count() > width {
-            let head: String = word.chars().take(width).collect();
-            if !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-            }
-            lines.push(head.clone());
-            word = &word[head.len()..];
-        }
-        let room = current.chars().count();
-        if room == 0 {
-            current.push_str(word);
-        } else if room + 1 + word.chars().count() <= width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
-        }
+/// The runtime policy a mode needs. Plan mode asks about *every* tool so the
+/// handler can refuse everything but reading.
+pub fn policy_of(mode: Mode) -> ApprovalPolicy {
+    match mode {
+        Mode::Default => ApprovalPolicy::AskDangerous,
+        Mode::AskAll | Mode::Plan => ApprovalPolicy::AskAll,
+        Mode::Auto => ApprovalPolicy::Never,
     }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
 }
 
-/// The numbered rows, in Claude Code's wording.
-pub const CHOICES: [&str; 3] = [
-    "Yes, allow once",
-    "Yes, allow for this session",
-    "No, deny this call",
-];
-
-/// The full card, coloured, ready to print. Shared by the raw-mode path and
-/// the key-bus path so an interactive session and a bare `swarm run` show the
-/// same dialog.
-fn card(request: &ApprovalRequest) -> String {
-    let width = crossterm::terminal::size()
-        .map(|(cols, _)| cols as usize)
-        .unwrap_or(76);
-    let colors = Color::detect(true);
-    let title = format!("\u{26a0}  Allow {}?", request.name);
-    let command = format!("{}({})", request.name, args_summary(&request.arguments));
-    let body = panel_lines(&title, &command, &CHOICES, &request.risk, 0, width);
-    let mut out = String::from("\n");
-    for (index, line) in body.iter().enumerate() {
-        let painted = if index == 0 {
-            paint(colors, "warn", line)
-        } else if line.contains('\u{276f}') {
-            paint(colors, "brand", line)
-        } else {
-            paint(colors, "meta", line)
-        };
-        out.push_str(&painted);
-        out.push('\n');
-    }
-    out.push_str(&paint(
-        colors,
-        "meta",
-        "  1/2/3 to choose \u{00b7} y/a/n shorthand \u{00b7} Esc denies",
-    ));
-    // The card is printed with `eprint!`, so it owns its own line ending: without
-    // this the next transcript row lands on the hint row (`...Esc denies● ...`).
-    out.push('\n');
-    out
+/// Tools that only look; plan mode lets them through.
+pub fn is_read_only(tool: &str) -> bool {
+    matches!(tool, "read_file" | "list_files" | "search_files")
 }
 
-pub struct ConsoleApproval {
-    prompt_lock: AsyncMutex<()>,
-    quiet: Arc<AtomicBool>,
+pub struct UiApproval {
+    ui: UiHandle,
     allow: Arc<AllowList>,
+    mode: Arc<SharedMode>,
+    workspace: PathBuf,
+    /// Parallel agents can ask at once; the user answers one prompt at a time.
+    gate: AsyncMutex<()>,
 }
 
-impl Default for ConsoleApproval {
-    fn default() -> Self {
-        Self::new(Arc::new(AtomicBool::new(false)))
-    }
-}
-
-impl ConsoleApproval {
-    /// `quiet` is shared with the live tail so the status line yields the row.
-    pub fn new(quiet: Arc<AtomicBool>) -> Self {
-        Self {
-            prompt_lock: AsyncMutex::new(()),
-            quiet,
-            allow: AllowList::new(),
-        }
-    }
-
-    /// Share the session-wide allow list so `/approve` and `/new` can reset it.
-    pub fn with_list(quiet: Arc<AtomicBool>, allow: Arc<AllowList>) -> Self {
-        Self {
-            prompt_lock: AsyncMutex::new(()),
-            quiet,
-            allow,
-        }
-    }
-}
-
-struct RawModeGuard {
-    was_enabled: bool,
-}
-
-impl RawModeGuard {
-    fn enter() -> io::Result<Self> {
-        let was_enabled = is_raw_mode_enabled().unwrap_or(false);
-        if !was_enabled {
-            enable_raw_mode()?;
-        }
-        Ok(Self { was_enabled })
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        // Restore, never unconditionally disable: an interactive session keeps
-        // raw mode enabled for its own prompt reader.
-        if !self.was_enabled && is_raw_mode_enabled().unwrap_or(false) {
-            let _ = disable_raw_mode();
-        }
-    }
-}
-
-/// Restores the spinner after the prompt finishes, on every exit path.
-struct QuietGuard(Arc<AtomicBool>);
-
-impl Drop for QuietGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+impl UiApproval {
+    pub fn new(ui: UiHandle, allow: Arc<AllowList>, mode: Arc<SharedMode>, workspace: PathBuf) -> Self {
+        Self { ui, allow, mode, workspace, gate: AsyncMutex::new(()) }
     }
 }
 
 #[async_trait]
-impl ApprovalHandler for ConsoleApproval {
+impl ApprovalHandler for UiApproval {
     async fn approve(&self, request: &ApprovalRequest) -> bool {
-        let _lock = self.prompt_lock.lock().await;
-        if self.allow.contains(&request.name) {
+        let _turn = self.gate.lock().await;
+        // Plan mode is read-only no matter what was allowed earlier.
+        if self.mode.get() == Mode::Plan {
+            return is_read_only(&request.name);
+        }
+        if self.mode.get() == Mode::Auto || self.allow.contains(&request.name) {
             return true;
         }
-        self.quiet.store(true, Ordering::SeqCst);
-        let _quiet = QuietGuard(Arc::clone(&self.quiet));
-        clear_line();
-        // In an interactive session the prompt reader owns raw mode and stdin;
-        // asking it is the only way not to race it for keystrokes.
-        if let Some(bus) = key_bus() {
-            let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
-            if bus.send(reply_tx).is_ok() {
-                clear_line();
-                eprint!("{}", card(request).replace('\n', "\r\n"));
-                let _ = io::stderr().flush();
-                let decided = tokio::time::timeout(Duration::from_secs(600), reply_rx.recv()).await;
-                return self
-                    .resolve(
-                        request,
-                        decided.ok().flatten().unwrap_or(Decision::Deny),
-                    )
-                    .await;
-            }
-        }
-        if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        if !self.ui.is_live() {
             eprintln!(
                 "tool {} requires approval, but no interactive terminal is available; denied",
                 request.name
             );
             return false;
         }
-        let raw = match RawModeGuard::enter() {
-            Ok(raw) => raw,
-            Err(error) => {
-                eprintln!("could not read approval: {error}; denied");
-                return false;
-            }
-        };
-        // Discard input entered before the user sees this particular request.
-        while matches!(event::poll(Duration::ZERO), Ok(true)) {
-            if event::read().is_err() {
-                return false;
-            }
+        let spec = dialog_for(request, &self.workspace, crate::style::term_width(), self.ui.colors());
+        let choice = tokio::time::timeout(PROMPT_TIMEOUT, self.ui.choose(spec)).await.ok().flatten();
+        let decision = Decision::from_choice(choice);
+        if decision == Decision::AllowAlways {
+            self.allow.allow(&request.name);
         }
-        // Claude Code-style panel: the exact call, its risk, numbered choices.
-        eprint!("{}", card(request).replace('\n', "\r\n"));
-        let _ = io::stderr().flush();
-        let decision = loop {
-            match event::poll(Duration::from_millis(50)) {
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            break Decision::Deny;
-                        }
-                        match key.code {
-                            KeyCode::Char(ch) => break Decision::from_key(ch),
-                            KeyCode::Esc => break Decision::Deny,
-                            _ => {}
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break Decision::Deny,
-                },
-                Ok(false) => {}
-                Err(_) => break Decision::Deny,
-            }
-        };
-        drop(raw);
-        self.resolve(request, decision).await
+        decision.approved()
     }
 }
 
-impl ConsoleApproval {
-    async fn resolve(&self, request: &ApprovalRequest, decision: Decision) -> bool {
-        if matches!(decision, Decision::AllowAlways) {
-            self.allow.allow(&request.name);
+/// What the dialog is called, by tool.
+fn title_for(name: &str, creates: bool) -> String {
+    match name {
+        "bash" => "Bash command".into(),
+        "run_tests" => "Run tests".into(),
+        "python" => "Python script".into(),
+        "git" => "Git command".into(),
+        "write_file" if creates => "Create file".into(),
+        "write_file" => "Overwrite file".into(),
+        "edit_file" => "Edit file".into(),
+        other => format!("Use tool: {other}"),
+    }
+}
+
+fn str_arg<'a>(arguments: &'a Value, key: &str) -> &'a str {
+    arguments.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// Rows describing the call: the command it will run, or the diff it will make.
+fn body_for(request: &ApprovalRequest, workspace: &Path, inner: usize, colors: Color) -> (Vec<String>, bool) {
+    let args = &request.arguments;
+    let dim = |text: &str| role(colors, "subtle", text);
+    let mut rows: Vec<String> = Vec::new();
+    let mut creates = false;
+    let code = |text: &str| -> Vec<String> {
+        sanitize(text).lines().map(|line| format!("  {line}")).collect()
+    };
+    match request.name.as_str() {
+        "bash" => rows.extend(code(str_arg(args, "command"))),
+        "run_tests" => {
+            let command = str_arg(args, "command");
+            rows.extend(code(if command.is_empty() { "cargo test" } else { command }));
         }
-        // The transcript renders the `ApprovalResolved` event as `⎿ approved`, so
-        // echoing it here too printed the row twice. The card already ended its own
-        // line, so nothing more is printed.
-        decision.approved()
+        "python" => rows.extend(code(str_arg(args, "code"))),
+        "git" => {
+            let parts: Vec<&str> = args
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            rows.push(format!("  git {}", sanitize(&parts.join(" "))));
+        }
+        "edit_file" | "write_file" => {
+            let path = str_arg(args, "path");
+            let on_disk = swarm_tools::resolve_within(workspace, path)
+                .ok()
+                .and_then(|abs| std::fs::read_to_string(abs).ok());
+            let view = if request.name == "edit_file" {
+                let find = str_arg(args, "find");
+                let line = on_disk.as_deref().and_then(|text| diff::line_of(text, find)).unwrap_or(0);
+                diff::snippet_diff(find, str_arg(args, "replace"), line, inner, colors, BODY_ROWS)
+            } else {
+                creates = on_disk.is_none();
+                diff::file_diff(on_disk.as_deref(), str_arg(args, "content"), inner, colors, BODY_ROWS)
+            };
+            rows.push(format!("  {}", truncate(&sanitize(path), inner.saturating_sub(2))));
+            rows.push(format!("  {}", dim(&diff::summary_text(&view.summary))));
+            rows.extend(view.lines);
+        }
+        _ => rows.push(format!("  {}", crate::transcript::args_summary(args))),
+    }
+    if !request.risk.is_empty() {
+        rows.push(String::new());
+        rows.push(format!("  {}", dim(&sanitize(&request.risk))));
+    }
+    (rows, creates)
+}
+
+/// The permission dialog for one request.
+pub fn dialog_for(request: &ApprovalRequest, workspace: &Path, cols: usize, colors: Color) -> DialogSpec {
+    let inner = cols.clamp(24, 110).saturating_sub(4);
+    let (body, creates) = body_for(request, workspace, inner, colors);
+    DialogSpec {
+        title: title_for(&request.name, creates),
+        body,
+        question: "Do you want to proceed?".to_string(),
+        options: vec![
+            "Yes".to_string(),
+            format!("Yes, and don't ask again for {} this session", request.name),
+            "No, deny this call (esc)".to_string(),
+        ],
+        shortcuts: vec![('y', 0), ('a', 1), ('n', 2)],
+        default: 0,
+        hint: "enter confirms \u{00b7} 1/2/3 or y/a/n \u{00b7} esc denies".to_string(),
+        accent: Accent::Permission,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AllowList, CHOICES, ConsoleApproval, Decision, Decision::*, KeyRequest, install_key_bus,
-        key_bus, panel_lines, wrap,
-    };
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::*;
+    use crate::ui::text::strip_ansi;
+    use serde_json::json;
     use swarm_core::{AgentId, RunId, TaskId};
-    use swarm_runtime::{ApprovalHandler, ApprovalRequest};
 
-    /// The card no longer opens its own console reader: it asks the prompt
-    /// reader for the key, so the two cannot race for stdin.
-    #[tokio::test]
-    async fn the_prompt_reader_answers_the_card() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<KeyRequest>();
-        if key_bus().is_some() {
-            return; // another test in this process already owns the keyboard
-        }
-        install_key_bus(tx);
-        let quiet = Arc::new(AtomicBool::new(false));
-        let allow = AllowList::new();
-        let approval = ConsoleApproval::with_list(Arc::clone(&quiet), Arc::clone(&allow));
-        let answering = tokio::spawn(async move {
-            while let Some(reply) = rx.recv().await {
-                let _ = reply.send(AllowAlways);
-            }
-        });
-        let request = ApprovalRequest {
+    fn request(name: &str, arguments: Value, risk: &str) -> ApprovalRequest {
+        ApprovalRequest {
             run_id: RunId::new(),
             task_id: TaskId::new(),
             agent_id: AgentId::new(),
             call_id: "call_1".to_string(),
-            name: "write_file".to_string(),
-            arguments: serde_json::json!({"path": "a.txt", "content": "hi"}),
-            risk: "writes a.txt".to_string(),
-        };
-        assert!(approval.approve(&request).await, "the reader answers 'a'");
-        assert!(allow.contains("write_file"), "'a' pins the tool");
-        assert!(
-            approval.approve(&request).await,
-            "the next call is answered by the allow list"
+            name: name.to_string(),
+            arguments,
+            risk: risk.to_string(),
+        }
+    }
+
+    fn text(spec: &DialogSpec) -> String {
+        spec.body.iter().map(|row| strip_ansi(row)).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn choices_map_to_decisions() {
+        assert_eq!(Decision::from_choice(Some(0)), Decision::AllowOnce);
+        assert_eq!(Decision::from_choice(Some(1)), Decision::AllowAlways);
+        assert_eq!(Decision::from_choice(Some(2)), Decision::Deny);
+        assert_eq!(Decision::from_choice(None), Decision::Deny, "dismissing denies");
+        assert_eq!(Decision::from_choice(Some(9)), Decision::Deny);
+        assert!(Decision::AllowAlways.approved() && !Decision::Deny.approved());
+    }
+
+    #[test]
+    fn a_bash_call_shows_the_exact_command_and_why() {
+        let spec = dialog_for(
+            &request("bash", json!({"command": "rm -rf build\necho done"}), "runs a shell command"),
+            Path::new("."),
+            80,
+            Color::Plain,
         );
-        assert!(!quiet.load(Ordering::SeqCst), "the card gives the terminal back");
-        answering.abort();
+        assert_eq!(spec.title, "Bash command");
+        let body = text(&spec);
+        assert!(body.contains("  rm -rf build\n  echo done"), "{body}");
+        assert!(body.contains("runs a shell command"), "{body}");
+        assert_eq!(spec.options.len(), 3);
+        assert!(spec.options[1].contains("bash"));
+        assert_eq!(spec.shortcuts, vec![('y', 0), ('a', 1), ('n', 2)]);
+        assert_eq!(spec.accent, Accent::Permission);
     }
 
     #[test]
-    fn approval_keys_map_to_decisions() {
-        assert_eq!(Decision::from_key('y'), Decision::AllowOnce);
-        assert_eq!(Decision::from_key('Y'), Decision::AllowOnce);
-        assert_eq!(Decision::from_key('a'), Decision::AllowAlways);
-        assert_eq!(Decision::from_key('n'), Decision::Deny);
-        assert_eq!(Decision::from_key(' '), Decision::Deny);
-        assert_eq!(Decision::from_key('\r'), Decision::Deny);
-        assert!(Decision::AllowAlways.approved());
-        assert!(!Decision::Deny.approved());
-    }
-
-    #[test]
-    fn number_keys_pick_the_numbered_row() {
-        assert_eq!(Decision::from_key('1'), Decision::AllowOnce);
-        assert_eq!(Decision::from_key('2'), Decision::AllowAlways);
-        assert_eq!(Decision::from_key('3'), Decision::Deny);
-        assert_eq!(CHOICES.len(), 3, "three rows, three number keys");
-    }
-
-    #[test]
-    fn the_panel_is_a_box_with_numbered_choices() {
-        let lines = panel_lines(
-            "\u{26a0}  Allow write_file?",
-            "write_file({\"path\": \"a.txt\"})",
-            &CHOICES,
-            "writes a.txt",
-            0,
-            60,
+    fn untrusted_command_text_cannot_inject_escapes() {
+        let spec = dialog_for(
+            &request("bash", json!({"command": "echo \u{1b}[2J\u{1b}]0;pwned\u{7}hi"}), "r\u{1b}[31m"),
+            Path::new("."),
+            80,
+            Color::Plain,
         );
-        assert!(lines[0].starts_with("\u{256d}\u{2500} \u{26a0}"), "{lines:?}");
-        assert!(lines[0].ends_with('\u{256e}'));
-        assert!(lines.last().unwrap().starts_with('\u{2570}'));
-        assert!(lines.last().unwrap().ends_with('\u{256f}'));
-        // Every row is the same printed width: a real box, not a suggestion.
-        let widths: Vec<usize> = lines.iter().map(|line| line.chars().count()).collect();
-        assert!(
-            widths.windows(2).all(|pair| pair[0] == pair[1]),
-            "ragged panel: {widths:?}"
+        for row in &spec.body {
+            assert!(!row.contains('\u{1b}') && !row.contains('\u{7}'), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn git_and_python_calls_are_readable() {
+        let git = dialog_for(&request("git", json!({"args": ["push", "--force"]}), ""), Path::new("."), 80, Color::Plain);
+        assert!(text(&git).contains("git push --force"));
+        let py = dialog_for(&request("python", json!({"code": "print(1)\nprint(2)"}), ""), Path::new("."), 80, Color::Plain);
+        assert!(text(&py).contains("  print(1)\n  print(2)"));
+        assert_eq!(py.title, "Python script");
+    }
+
+    #[test]
+    fn an_edit_shows_the_diff_with_real_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.py"), "import os\n\ndef main():\n    return 1\n").unwrap();
+        let spec = dialog_for(
+            &request(
+                "edit_file",
+                json!({"path": "app.py", "find": "    return 1", "replace": "    return 2"}),
+                "",
+            ),
+            dir.path(),
+            80,
+            Color::Plain,
         );
-        let body = lines.join("\n");
-        assert!(body.contains("\u{276f} 1. Yes, allow once"), "{body}");
-        assert!(body.contains("  2. Yes, allow for this session"));
-        assert!(body.contains("  3. No, deny this call"));
-        assert!(body.contains("writes a.txt"));
+        assert_eq!(spec.title, "Edit file");
+        let body = text(&spec);
+        assert!(body.contains("app.py"), "{body}");
+        assert!(body.contains("Added 1 line, removed 1 line"), "{body}");
+        assert!(body.contains(" 4 -     return 1"), "line 4 is where the text really is: {body}");
+        assert!(body.contains(" 4 +     return 2"), "{body}");
     }
 
     #[test]
-    fn the_cursor_moves() {
-        let third = panel_lines("t", "c", &CHOICES, "", 2, 60).join("\n");
-        assert!(third.contains("\u{276f} 3. No, deny this call"), "{third}");
-        assert!(!third.contains("\u{276f} 1."), "cursor should be on row 3");
+    fn writing_a_new_file_says_create_and_an_existing_one_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = dialog_for(
+            &request("write_file", json!({"path": "new.txt", "content": "hello\n"}), ""),
+            dir.path(),
+            80,
+            Color::Plain,
+        );
+        assert_eq!(new.title, "Create file");
+        assert!(text(&new).contains("Added 1 line"), "{}", text(&new));
+        std::fs::write(dir.path().join("old.txt"), "before\n").unwrap();
+        let over = dialog_for(
+            &request("write_file", json!({"path": "old.txt", "content": "after\n"}), ""),
+            dir.path(),
+            80,
+            Color::Plain,
+        );
+        assert_eq!(over.title, "Overwrite file");
+        assert!(text(&over).contains("- before") && text(&over).contains("+ after"), "{}", text(&over));
     }
 
     #[test]
-    fn a_long_command_is_capped_with_a_hint() {
-        let long = "x".repeat(400);
-        let body = panel_lines("t", &long, &CHOICES, "", 0, 60).join("\n");
-        assert!(body.contains("more lines"), "{body}");
-        assert!(body.contains("ctrl+o shows detail"), "{body}");
+    fn a_path_outside_the_workspace_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dialog_for(
+            &request("write_file", json!({"path": "../../etc/hostname", "content": "x\n"}), ""),
+            dir.path(),
+            80,
+            Color::Plain,
+        );
+        assert_eq!(spec.title, "Create file", "an escaping path is treated as unreadable");
     }
 
     #[test]
-    fn wrapping_keeps_words_intact() {
-        let lines = wrap("allow this tool to write files under the workspace", 12);
-        assert!(lines.iter().all(|line| line.chars().count() <= 12), "{lines:?}");
-        assert!(lines.iter().any(|line| line == "write files"), "{lines:?}");
+    fn a_huge_diff_is_collapsed_in_the_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let content: String = (0..500).map(|n| format!("line {n}\n")).collect();
+        let spec = dialog_for(
+            &request("write_file", json!({"path": "big.txt", "content": content}), ""),
+            dir.path(),
+            80,
+            Color::Plain,
+        );
+        assert!(spec.body.len() < 30, "{} rows", spec.body.len());
+        assert!(text(&spec).contains("more lines"), "{}", text(&spec));
     }
 
     #[test]
-    fn allow_list_tracks_tools() {
+    fn unknown_tools_fall_back_to_their_arguments() {
+        let spec = dialog_for(&request("mystery", json!({"x": 1}), "unknown"), Path::new("."), 80, Color::Plain);
+        assert_eq!(spec.title, "Use tool: mystery");
+        assert!(text(&spec).contains("x=1"));
+    }
+
+    #[test]
+    fn the_allow_list_tracks_tools() {
         let allow = AllowList::new();
         assert!(!allow.contains("write_file"));
         allow.allow("write_file");
+        allow.allow("bash");
         assert!(allow.contains("write_file"));
-        assert!(!allow.contains("run_command"));
-        assert_eq!(allow.names(), vec!["write_file".to_string()]);
+        assert_eq!(allow.names(), vec!["bash".to_string(), "write_file".to_string()]);
         allow.clear();
         assert!(!allow.contains("write_file"));
+    }
+
+    #[test]
+    fn modes_and_policies_map_both_ways() {
+        for policy in [ApprovalPolicy::AskDangerous, ApprovalPolicy::AskAll, ApprovalPolicy::Never] {
+            assert_eq!(policy_of(mode_of(policy)), policy);
+        }
+        assert_eq!(policy_of(Mode::Plan), ApprovalPolicy::AskAll, "plan mode must see every call");
+    }
+
+    #[test]
+    fn the_shared_mode_round_trips() {
+        let mode = SharedMode::new(Mode::Default);
+        for next in [Mode::AskAll, Mode::Auto, Mode::Plan, Mode::Default] {
+            mode.set(next);
+            assert_eq!(mode.get(), next);
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_mode_and_the_allow_list_skip_the_dialog() {
+        let allow = AllowList::new();
+        let mode = SharedMode::new(Mode::Auto);
+        let approval =
+            UiApproval::new(UiHandle::plain(Color::Plain), Arc::clone(&allow), Arc::clone(&mode), PathBuf::from("."));
+        let call = request("bash", json!({"command": "ls"}), "runs");
+        assert!(approval.approve(&call).await, "auto mode approves without a terminal");
+        mode.set(Mode::Default);
+        assert!(!approval.approve(&call).await, "no terminal and not allowed: denied");
+        allow.allow("bash");
+        assert!(approval.approve(&call).await, "an allowed tool needs no dialog");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_allows_only_reading() {
+        let mode = SharedMode::new(Mode::Plan);
+        let allow = AllowList::new();
+        allow.allow("bash");
+        let approval = UiApproval::new(UiHandle::plain(Color::Plain), allow, mode, PathBuf::from("."));
+        assert!(approval.approve(&request("read_file", json!({"path": "a"}), "")).await);
+        assert!(!approval.approve(&request("bash", json!({"command": "ls"}), "")).await, "even an allowed tool");
+        assert!(!approval.approve(&request("write_file", json!({}), "")).await);
     }
 }

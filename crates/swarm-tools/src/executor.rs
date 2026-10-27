@@ -10,7 +10,7 @@ use serde_json::Value;
 use swarm_core::tool::{ToolCatalog, ToolRequestValidation, ToolSpec};
 
 use crate::catalog::builtin_catalog;
-use crate::error::ToolResult;
+use crate::error::{FileChange, ToolResult};
 use crate::sandbox::{SandboxConfig, cap_output};
 
 /// A single model-requested tool call, decoupled from the provider types.
@@ -173,7 +173,9 @@ impl ToolExecutor {
         let mut cmd = tokio::process::Command::new(prog);
         cmd.args(args);
         cmd.current_dir(&self.config.workspace_root);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // A tool must never read the user's keyboard, and an abandoned call (Ctrl+C,
+        // a timeout) must not leave its process running.
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return ToolResult::failure(format!("failed to spawn command: {e}")),
@@ -248,8 +250,14 @@ impl ToolExecutor {
                 return ToolResult::failure(format!("write_file: cannot create directory: {e}"));
             }
         }
+        let before = std::fs::read_to_string(&abs).ok();
+        let created = !abs.exists();
         match std::fs::write(&abs, &content) {
-            Ok(()) => ToolResult::ok(format!("wrote {} byte(s) to {path}", content.len())),
+            Ok(()) => {
+                let mut result = ToolResult::ok(format!("wrote {} byte(s) to {path}", content.len()));
+                result.change = Some(FileChange::capture(before, created));
+                result
+            }
             Err(e) => ToolResult::failure(format!("write_file: {e}")),
         }
     }
@@ -291,10 +299,14 @@ impl ToolExecutor {
             original.replacen(&find, &replace, 1)
         };
         match std::fs::write(&abs, &updated) {
-            Ok(()) => ToolResult::ok(format!(
-                "edited {path} ({} replacement(s))",
-                if replace_all { count } else { 1 }
-            )),
+            Ok(()) => {
+                let mut result = ToolResult::ok(format!(
+                    "edited {path} ({} replacement(s))",
+                    if replace_all { count } else { 1 }
+                ));
+                result.change = Some(FileChange::capture(Some(original), false));
+                result
+            }
             Err(e) => ToolResult::failure(format!("edit_file: {e}")),
         }
     }
@@ -418,7 +430,9 @@ impl ToolExecutor {
         let mut cmd = tokio::process::Command::new(interpreter);
         cmd.arg(tmp.as_os_str());
         cmd.current_dir(&self.config.workspace_root);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // A tool must never read the user's keyboard, and an abandoned call (Ctrl+C,
+        // a timeout) must not leave its process running.
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -462,7 +476,9 @@ impl ToolExecutor {
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(&args);
         cmd.current_dir(&self.config.workspace_root);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // A tool must never read the user's keyboard, and an abandoned call (Ctrl+C,
+        // a timeout) must not leave its process running.
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return ToolResult::failure(format!("failed to spawn git: {e}")),
@@ -565,6 +581,109 @@ mod tests {
             .execute(&call("3", "read_file", json!({"path": "f.txt"})))
             .await;
         assert_eq!(r.content, "baz foo");
+    }
+
+    /// The diff the UI shows is built from what the tool captured as it ran,
+    /// not from re-reading the file later.
+    #[tokio::test]
+    async fn file_tools_record_what_they_changed() {
+        let dir = tempdir().unwrap();
+        let ex = executor_in(&dir);
+        let created = ex
+            .execute(&call("1", "write_file", json!({"path": "n.txt", "content": "one\n"})))
+            .await;
+        let change = created.change.expect("write_file records a change");
+        assert!(change.created, "a new file is flagged as created");
+        assert_eq!(change.before, None);
+
+        let overwritten = ex
+            .execute(&call("2", "write_file", json!({"path": "n.txt", "content": "two\n"})))
+            .await;
+        let change = overwritten.change.expect("change");
+        assert!(!change.created);
+        assert_eq!(change.before.as_deref(), Some("one\n"));
+
+        let edited = ex
+            .execute(&call(
+                "3",
+                "edit_file",
+                json!({"path": "n.txt", "find": "two", "replace": "three"}),
+            ))
+            .await;
+        assert_eq!(edited.change.expect("change").before.as_deref(), Some("two\n"));
+
+        let failed = ex
+            .execute(&call("4", "edit_file", json!({"path": "n.txt", "find": "absent", "replace": "x"})))
+            .await;
+        assert!(!failed.success && failed.change.is_none(), "a failed edit changed nothing");
+        let read = ex.execute(&call("5", "read_file", json!({"path": "n.txt"}))).await;
+        assert!(read.change.is_none(), "reads change nothing");
+    }
+
+    #[tokio::test]
+    async fn a_huge_previous_version_is_not_kept() {
+        let dir = tempdir().unwrap();
+        let ex = executor_in(&dir);
+        std::fs::write(dir.path().join("big.txt"), "x".repeat(300 * 1024)).unwrap();
+        let result = ex
+            .execute(&call("1", "write_file", json!({"path": "big.txt", "content": "small"})))
+            .await;
+        let change = result.change.expect("change");
+        assert!(!change.created);
+        assert_eq!(change.before, None, "over the cap: no copy is stored");
+    }
+
+    /// A tool that reads stdin must not be able to take the user's keystrokes
+    /// away from the prompt: it sees end-of-file at once. The test points fd 0
+    /// at a pipe that never closes, which is what a live terminal looks like to
+    /// a child that inherits it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_processes_do_not_inherit_the_keyboard() {
+        let dir = tempdir().unwrap();
+        let ex = executor_in(&dir);
+        let mut fds = [0i32; 2];
+        // SAFETY: plain fd plumbing on descriptors this test creates; fd 0 is
+        // restored before any assertion runs.
+        let saved = unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            let saved = libc::dup(0);
+            libc::dup2(fds[0], 0);
+            saved
+        };
+        let started = Instant::now();
+        let result = ex
+            .execute(&call("1", "bash", json!({"command": "cat; echo finished", "timeout_ms": 4000})))
+            .await;
+        let elapsed = started.elapsed();
+        unsafe {
+            libc::dup2(saved, 0);
+            libc::close(saved);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.content.contains("finished"), "{:?}", result.content);
+        assert!(elapsed < Duration::from_secs(3), "cat waited on the terminal for {elapsed:?}");
+    }
+
+    /// Interrupting a turn drops the tool future; the process it started must
+    /// not outlive it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_a_running_tool_kills_its_process() {
+        let dir = tempdir().unwrap();
+        let ex = executor_in(&dir);
+        let pidfile = dir.path().join("pid");
+        let command = format!("echo $$ > {}; exec sleep 60", pidfile.display());
+        let tool_call = call("1", "bash", json!({"command": command, "timeout_ms": 120000}));
+        let running = ex.execute(&tool_call);
+        let _ = tokio::time::timeout(Duration::from_millis(600), running).await;
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // SAFETY: signal 0 only probes whether the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "process {pid} survived its cancelled tool call");
     }
 
     #[tokio::test]

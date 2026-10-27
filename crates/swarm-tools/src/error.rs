@@ -41,6 +41,29 @@ impl std::fmt::Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
+/// Largest file whose previous contents are kept for a diff.
+const CHANGE_CAP_BYTES: usize = 128 * 1024;
+
+/// What a file tool changed, recorded at the moment it ran so a diff can be
+/// shown later without racing the file system.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FileChange {
+    /// The file's contents before the call; `None` for a new file, or one too
+    /// large to keep.
+    pub before: Option<String>,
+    /// The call created the file.
+    pub created: bool,
+}
+
+impl FileChange {
+    pub fn capture(before: Option<String>, created: bool) -> Self {
+        Self {
+            before: before.filter(|text| text.len() <= CHANGE_CAP_BYTES),
+            created,
+        }
+    }
+}
+
 /// The outcome of executing one tool call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -63,6 +86,9 @@ pub struct ToolResult {
     pub duration_ms: u64,
     /// A reference to a persisted artifact, when the runtime stored the output.
     pub output_ref: Option<ArtifactRef>,
+    /// What a file tool changed (`write_file`, `edit_file`).
+    #[serde(default)]
+    pub change: Option<FileChange>,
 }
 
 impl ToolResult {
@@ -79,6 +105,7 @@ impl ToolResult {
             error: None,
             duration_ms: 0,
             output_ref: None,
+            change: None,
         }
     }
 
@@ -101,6 +128,7 @@ impl ToolResult {
             error: None,
             duration_ms: 0,
             output_ref: None,
+            change: None,
         }
     }
 
@@ -117,6 +145,7 @@ impl ToolResult {
             error: Some(error.into()),
             duration_ms: 0,
             output_ref: None,
+            change: None,
         }
     }
 
@@ -138,6 +167,7 @@ impl ToolResult {
             error: Some(error.into()),
             duration_ms: 0,
             output_ref: None,
+            change: None,
         }
     }
 

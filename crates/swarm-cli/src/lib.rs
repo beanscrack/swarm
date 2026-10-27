@@ -6,6 +6,7 @@ mod style;
 mod commands;
 mod live;
 mod transcript;
+mod ui;
 mod tui;
 
 pub use commands::{Cli, CommandOutcome, execute};
