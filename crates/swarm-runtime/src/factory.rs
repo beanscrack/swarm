@@ -12,7 +12,7 @@ use swarm_core::budget::BillingMode;
 use swarm_core::config::{ProviderConfig, RunConfig};
 use swarm_core::provider::ProviderKind;
 use swarm_core::ProviderId;
-use swarm_providers::{GeminiWebConfig, GeminiWebProvider, ManagedAgentConfig, ManagedAgentProvider, MockProvider, OpenAiConfig, OpenAiProvider, Provider, ProviderRegistry};
+use swarm_providers::{BrowserChatConfig, BrowserChatProvider, ChatSite, ManagedAgentConfig, ManagedAgentProvider, MockProvider, OpenAiConfig, OpenAiProvider, Provider, ProviderRegistry};
 use swarm_scheduler::SchedulerConfig;
 
 use crate::error::RuntimeError;
@@ -78,13 +78,37 @@ pub fn local_provider_config() -> ProviderConfig {
     }
 }
 
+/// Browser-backed ChatGPT chat preset. Requires the local bridge to be running.
+///
+/// `model` is matched against the account's model picker; "auto" leaves the
+/// site's own default in place.
+pub fn chatgpt_web_provider_config() -> ProviderConfig {
+    ProviderConfig {
+        name: ProviderId::new("chatgpt-web").expect("valid provider name"),
+        kind: ProviderKind::ChatGptWeb,
+        model: "auto".to_string(),
+        base_url: Some("http://127.0.0.1:8766".to_string()),
+        api_key: None,
+        api_key_env: None,
+        max_output_tokens: 8192,
+        temperature: None,
+        workspace_dir: None,
+        command: Vec::new(),
+        timeout_secs: None,
+        extra_args: Vec::new(),
+        zero_cost: false,
+        billing: BillingMode::Subscription,
+        max_concurrency: Some(4),
+    }
+}
+
 /// Browser-backed Gemini chat preset. Requires the local bridge to be running.
 pub fn gemini_web_provider_config() -> ProviderConfig {
     ProviderConfig {
         name: ProviderId::new("gemini-web").expect("valid provider name"),
         kind: ProviderKind::GeminiWeb,
         model: "4 Argon".to_string(),
-        base_url: Some("http://127.0.0.1:8765".to_string()),
+        base_url: Some(ChatSite::Gemini.default_bridge_url().to_string()),
         api_key: None,
         api_key_env: None,
         max_output_tokens: 8192,
@@ -137,12 +161,20 @@ fn provider_for(pc: &ProviderConfig) -> Result<Arc<dyn Provider>, RuntimeError> 
             let provider: Arc<dyn Provider> = Arc::new(ManagedAgentProvider::new(pc.name.clone(), config)?);
             Ok(provider)
         }
-        ProviderKind::GeminiWeb => {
-            let base_url = pc.base_url.as_deref().unwrap_or("http://127.0.0.1:8765");
-            let config = GeminiWebConfig::new(base_url, &pc.model)
+        kind @ (ProviderKind::GeminiWeb | ProviderKind::ChatGptWeb) => {
+            let site = match kind {
+                ProviderKind::ChatGptWeb => ChatSite::ChatGpt,
+                _ => ChatSite::Gemini,
+            };
+            let base_url = pc
+                .base_url
+                .as_deref()
+                .unwrap_or_else(|| site.default_bridge_url());
+            let config = BrowserChatConfig::new(site, base_url, &pc.model)
                 .billing(pc.billing)
                 .max_concurrency(pc.max_concurrency.unwrap_or(4));
-            let provider: Arc<dyn Provider> = Arc::new(GeminiWebProvider::new(pc.name.clone(), config)?);
+            let provider: Arc<dyn Provider> =
+                Arc::new(BrowserChatProvider::new(pc.name.clone(), config)?);
             Ok(provider)
         }
     }
@@ -204,6 +236,25 @@ mod tests {
         assert_eq!(managed.kind(), ProviderKind::ManagedAgent);
         let scheduler = scheduler_config(&cfg, &registry);
         assert_eq!(scheduler.provider_limits.get("managed"), Some(&1));
+    }
+
+    #[test]
+    fn chatgpt_web_preset_builds_as_subscription_provider() {
+        let pc = chatgpt_web_provider_config();
+        assert_eq!(pc.kind, ProviderKind::ChatGptWeb);
+        assert_eq!(pc.name.as_str(), "chatgpt-web");
+        assert_eq!(pc.model, "auto");
+        assert_eq!(pc.base_url.as_deref(), Some("http://127.0.0.1:8766"));
+        assert!(!pc.zero_cost);
+        let mut cfg = RunConfig::mock("goal", 2);
+        cfg.provider = pc.name.clone();
+        cfg.providers = vec![pc];
+        cfg.zero_cost = false;
+        cfg.scheduler.zero_cost = false;
+        let registry = build_registry(&cfg).unwrap();
+        assert_eq!(registry.find(&cfg.provider).unwrap().kind(), ProviderKind::ChatGptWeb);
+        // ChatGPT's own pick is used, so the model name is not an API slug.
+        assert_eq!(registry.find(&cfg.provider).unwrap().model(), "auto");
     }
 
     #[test]

@@ -1,0 +1,735 @@
+//! Consumer chat UIs used as Swarm's reasoning model, through a local bridge.
+//!
+//! Swarm does not talk to ChatGPT or Gemini directly: a loopback Node bridge
+//! owns one browser tab per Swarm session and drives the site's own chat page.
+//! Swarm keeps the durable conversation, the tool loop, budgets, and approvals;
+//! the bridge only receives the new turns and returns the rendered reply.
+//!
+//! Bridge protocol (loopback HTTP, JSON):
+//!
+//! * `GET  /health`                      -> `{ready, sessions, access_points, chat_url}`
+//! * `POST /sessions` `{model}`          -> `{id, access_point}`
+//! * `POST /sessions/{id}/messages`      -> `{text, chat_url, model?, usage?}`
+//!   `{request_id, prompt}`, idempotent per `request_id`
+//! * `DELETE /sessions/{id}`             -> `{closed}`
+//!
+//! The sites have no tool calling, so Swarm asks for a fenced ```swarm JSON
+//! block and parses the reply: [`parse_tool_calls`].
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::stream;
+use reqwest::{Client, StatusCode, Url};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+
+use swarm_core::budget::{BillingMode, TokenUsage};
+use swarm_core::message::ChatRole;
+use swarm_core::provider::{ProviderCapabilities, ProviderErrorClass, ProviderKind};
+use swarm_core::{ProviderId, SessionId};
+
+use crate::error::ProviderError;
+use crate::pricing::ModelPricing;
+use crate::provider::{
+    FinishReason, NativeToolCall, Provider, ProviderStream, SendRequest, Session, SessionConfig,
+    ToolProtocol, build_chunks,
+};
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Which consumer chat site the bridge is driving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatSite {
+    ChatGpt,
+    Gemini,
+}
+
+impl ChatSite {
+    /// Name used in prompts and error messages.
+    pub fn display(self) -> &'static str {
+        match self {
+            ChatSite::ChatGpt => "ChatGPT",
+            ChatSite::Gemini => "Gemini",
+        }
+    }
+
+    pub fn kind(self) -> ProviderKind {
+        match self {
+            ChatSite::ChatGpt => ProviderKind::ChatGptWeb,
+            ChatSite::Gemini => ProviderKind::GeminiWeb,
+        }
+    }
+
+    /// The bridge port this site's preset expects.
+    pub fn default_bridge_url(self) -> &'static str {
+        match self {
+            ChatSite::ChatGpt => "http://127.0.0.1:8766",
+            ChatSite::Gemini => "http://127.0.0.1:8765",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserChatConfig {
+    pub site: ChatSite,
+    pub base_url: String,
+    pub model: String,
+    pub billing: BillingMode,
+    pub max_concurrency: u32,
+}
+
+impl BrowserChatConfig {
+    pub fn new(site: ChatSite, base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            site,
+            base_url: base_url.into(),
+            model: model.into(),
+            billing: BillingMode::Subscription,
+            max_concurrency: 4,
+        }
+    }
+
+    /// ChatGPT web chat through the bridge on `base_url`.
+    pub fn chatgpt(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::new(ChatSite::ChatGpt, base_url, model)
+    }
+
+    /// Gemini web chat through the bridge on `base_url`.
+    pub fn gemini(base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        Self::new(ChatSite::Gemini, base_url, model)
+    }
+
+    pub fn billing(mut self, billing: BillingMode) -> Self {
+        self.billing = billing;
+        self
+    }
+
+    pub fn max_concurrency(mut self, max: u32) -> Self {
+        self.max_concurrency = max.max(1);
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserChatProvider {
+    id: ProviderId,
+    config: BrowserChatConfig,
+    client: Client,
+}
+
+impl BrowserChatProvider {
+    pub fn new(id: ProviderId, config: BrowserChatConfig) -> Result<Self, ProviderError> {
+        let site = config.site.display();
+        let url = Url::parse(&config.base_url)
+            .map_err(|e| ProviderError::Session(format!("invalid {site} bridge URL: {e}")))?;
+        if url.scheme() != "http"
+            || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        {
+            return Err(ProviderError::Session(format!(
+                "{site} browser bridge must use loopback HTTP"
+            )));
+        }
+        let client = Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        Ok(Self { id, config, client })
+    }
+
+    fn endpoint(&self, path: &str) -> String {
+        format!(
+            "{}{}",
+            self.config.base_url.trim_end_matches('/'),
+            path
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionCreated {
+    id: String,
+}
+
+#[async_trait]
+impl Provider for BrowserChatProvider {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+    fn kind(&self) -> ProviderKind {
+        self.config.site.kind()
+    }
+    fn model(&self) -> &str {
+        &self.config.model
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        let site = self.config.site.display();
+        ProviderCapabilities {
+            streaming: false,
+            tools: false,
+            json_mode: false,
+            reasoning: true,
+            managed_agent: false,
+            max_output_tokens: None,
+            max_concurrency: Some(self.config.max_concurrency),
+            notes: Some(format!("{site} web chat; tool calls use Swarm fenced JSON")),
+        }
+    }
+    fn billing(&self) -> BillingMode {
+        self.config.billing
+    }
+    fn pricing(&self) -> ModelPricing {
+        ModelPricing::default()
+    }
+
+    async fn start_session(&self, _config: SessionConfig) -> Result<Box<dyn Session>, ProviderError> {
+        let site = self.config.site.display();
+        let response = self
+            .client
+            .post(self.endpoint("/sessions"))
+            .json(&json!({"model": self.config.model}))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(format!("{site} bridge unreachable: {e}")))?;
+        let response = checked(response).await?;
+        let created: SessionCreated = response.json().await
+            .map_err(|e| ProviderError::Malformed(format!("{site} session: {e}")))?;
+        if created.id.is_empty() {
+            return Err(ProviderError::Malformed(format!(
+                "{site} session has no ID"
+            )));
+        }
+        Ok(Box::new(BrowserChatSession {
+            id: SessionId::new(),
+            remote_id: created.id,
+            provider_id: self.id.clone(),
+            site: self.config.site,
+            model: self.config.model.clone(),
+            base_url: self.config.base_url.clone(),
+            billing: self.config.billing,
+            client: self.client.clone(),
+            sent_count: Arc::new(Mutex::new(0)),
+        }))
+    }
+}
+
+/// Token counts the bridge read back from the site (ChatGPT reports them on its
+/// conversation API; the web UI itself shows none).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BridgeUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+}
+
+impl From<BridgeUsage> for TokenUsage {
+    fn from(usage: BridgeUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserReply {
+    text: String,
+    #[allow(dead_code)]
+    chat_url: Option<String>,
+    /// Model the site actually answered with, when the site reports it.
+    #[allow(dead_code)]
+    model: Option<String>,
+    usage: Option<BridgeUsage>,
+}
+
+struct BrowserChatSession {
+    id: SessionId,
+    remote_id: String,
+    provider_id: ProviderId,
+    site: ChatSite,
+    model: String,
+    base_url: String,
+    billing: BillingMode,
+    client: Client,
+    sent_count: Arc<Mutex<usize>>,
+}
+
+impl BrowserChatSession {
+    fn endpoint(&self, path: &str) -> String {
+        format!(
+            "{}/sessions/{}{path}",
+            self.base_url.trim_end_matches('/'),
+            self.remote_id
+        )
+    }
+}
+
+#[async_trait]
+impl Session for BrowserChatSession {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
+    fn session_id(&self) -> &SessionId {
+        &self.id
+    }
+
+    async fn stream(&self, request: &SendRequest) -> Result<ProviderStream, ProviderError> {
+        let site = self.site.display();
+        if request.zero_cost && !self.billing.is_zero_cost() {
+            return Err(ProviderError::Session(format!(
+                "{site} subscription access is unavailable in a zero-cost run"
+            )));
+        }
+        let mut sent_count = self.sent_count.lock().await;
+        if request.messages.len() < *sent_count {
+            return Err(ProviderError::Session(format!(
+                "{site} conversation history moved backwards"
+            )));
+        }
+        let prompt = format_prompt(request, *sent_count, self.site);
+        if prompt.trim().is_empty() {
+            return Err(ProviderError::Session(format!(
+                "no new {site} prompt to send"
+            )));
+        }
+        let request_id = format!("{}-{}", self.id, request.messages.len());
+        let response = self
+            .client
+            .post(self.endpoint("/messages"))
+            .timeout(request.deadline.unwrap_or(DEFAULT_TIMEOUT))
+            .json(&json!({"request_id": request_id, "prompt": prompt}))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        let response = checked(response).await?;
+        let reply: BrowserReply = response.json().await
+            .map_err(|e| ProviderError::Malformed(format!("{site} reply: {e}")))?;
+        if reply.text.trim().is_empty() {
+            return Err(ProviderError::Malformed(format!(
+                "{site} returned an empty reply"
+            )));
+        }
+        *sent_count = request.messages.len();
+        let (calls, finish) = match parse_tool_calls(&reply.text, &request_id) {
+            Ok(calls) if calls.is_empty() => (calls, FinishReason::Stop),
+            Ok(calls) => (calls, FinishReason::ToolCalls),
+            Err(_) => (Vec::new(), FinishReason::MalformedTool),
+        };
+        let chunks = build_chunks(&reply.text, &calls, finish, reply.usage.map(TokenUsage::from));
+        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
+    }
+
+    async fn close(&self) -> Result<(), ProviderError> {
+        let response = self
+            .client
+            .delete(self.endpoint(""))
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(e.to_string()))?;
+        checked(response).await?;
+        Ok(())
+    }
+}
+
+/// Builds the text sent to the chat page. Swarm owns the transcript, so only
+/// turns the site has not already seen are sent; assistant turns are already
+/// visible in the chat and are skipped once the session is warm.
+fn format_prompt(request: &SendRequest, sent_count: usize, site: ChatSite) -> String {
+    let name = site.display();
+    let mut out = String::new();
+    if sent_count == 0 {
+        out.push_str("You are the reasoning model for Swarm, an agent runtime. Follow the SYSTEM instructions below. Swarm executes tools and returns their results. To request one tool, reply with only a fenced ```swarm JSON block containing {\"tool\":{\"name\":\"tool_name\",\"arguments\":{...}}}. Never claim a tool ran until Swarm returns its result.\n");
+        if request.tool_protocol == ToolProtocol::Text {
+            if let Some(tools) = request.tools_as_text() {
+                out.push_str(&tools);
+            }
+        }
+    }
+    for message in &request.messages[sent_count..] {
+        if sent_count > 0 && message.role == ChatRole::Assistant {
+            continue; // already visible in the chat page
+        }
+        out.push_str("\n[");
+        out.push_str(match message.role {
+            ChatRole::System => "SYSTEM",
+            ChatRole::User => "USER",
+            ChatRole::Assistant => "ASSISTANT",
+            ChatRole::Tool => "TOOL RESULT",
+        });
+        if let Some(id) = &message.tool_call_id {
+            out.push(' ');
+            out.push_str(id);
+        }
+        out.push_str("]\n");
+        out.push_str(&message.content);
+        if !message.tool_calls.is_empty() {
+            out.push_str("\nRequested tools: ");
+            out.push_str(&serde_json::to_string(&message.tool_calls).unwrap_or_default());
+        }
+        out.push('\n');
+    }
+    // The contract is repeated on every turn, as the last thing the model reads.
+    // Chat sites have no function-calling channel and drift out of a preamble
+    // sent once, and an "otherwise answer normally" allowance lets the site
+    // complete the task in its own sandbox while Swarm records zero tool calls.
+    out.push_str(
+        "\nSWARM PROTOCOL (applies to this reply): you have no files, shell, browser, canvas, \
+         or download ability, and anything you make there does not exist for Swarm. Reply with \
+         exactly one fenced ```swarm block and nothing else: \
+         {\"tool\":{\"name\":\"<tool name from the list above>\",\"arguments\":{...}}}. Only when \
+         Swarm has already returned tool results that complete the task may you reply with a \
+         plain-text summary instead.",
+    );
+    let _ = name;
+    out
+}
+
+/// Find a Swarm tool request in text with no usable fence, by scanning for a
+/// balanced top-level JSON object that mentions `tool`/`tool_calls`. String
+/// contents are tracked so braces inside a file body cannot end the object.
+fn scan_tool_json(text: &str) -> Option<Value> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'"' && !escaped {
+            in_string = !in_string;
+        } else if *byte == b'\\' && in_string {
+            escaped = !escaped;
+            continue;
+        }
+        if in_string {
+            escaped = false;
+            continue;
+        }
+        if *byte == b'{' {
+            if depth == 0 {
+                start = index;
+            }
+            depth += 1;
+        } else if *byte == b'}' && depth > 0 {
+            depth -= 1;
+            if depth > 0 {
+                continue;
+            }
+            let candidate = &text[start..=index];
+            if !candidate.contains("\"tool\"") && !candidate.contains("\"tool_calls\"") {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<Value>(candidate) {
+                if parsed.get("tool").is_some() || parsed.get("tool_calls").is_some() {
+                    return Some(parsed);
+                }
+            }
+        }
+        escaped = false;
+    }
+    None
+}
+
+/// Reads a Swarm tool request out of rendered chat text.
+fn parse_tool_calls(text: &str, request_id: &str) -> Result<Vec<NativeToolCall>, ProviderError> {
+    let mut remaining = text;
+    let mut value = None;
+    while let Some(start) = remaining.find("```") {
+        let after_open = &remaining[start + 3..];
+        let Some(end) = after_open.find("```") else { break };
+        let block = after_open[..end].trim();
+        // Rendered code blocks may lose their language tag, and the model
+        // sometimes adds punctuation just outside the JSON object.
+        if let (Some(first), Some(last)) = (block.find('{'), block.rfind('}')) {
+            if first <= last {
+                let inner = &block[first..=last];
+                match serde_json::from_str::<Value>(inner) {
+                    Ok(parsed)
+                        if parsed.get("tool").is_some() || parsed.get("tool_calls").is_some() =>
+                    {
+                        value = Some(parsed);
+                        break;
+                    }
+                    Err(_) if inner.contains("\"tool\"") || inner.contains("\"tool_calls\"") => {
+                        return Err(ProviderError::Malformed(
+                            "chat tool block is not valid JSON".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        remaining = &after_open[end + 3..];
+    }
+    let value = match value {
+        Some(value) => value,
+        // Rendered 2026 chat often keeps only the fence's language label, so the
+        // reply arrives as `swarm{"tool":…}` with no backticks to find.
+        None => match scan_tool_json(text) {
+            Some(parsed) => parsed,
+            None => return Ok(Vec::new()),
+        },
+    };
+    let values: Vec<&Value> = if let Some(tool) = value.get("tool") {
+        vec![tool]
+    } else if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
+        calls.iter().collect()
+    } else {
+        return Ok(Vec::new()); // planner and finding blocks are not tool calls
+    };
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let name = call
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| ProviderError::Malformed("chat tool call has no name".into()))?;
+            let args = call
+                .get("arguments")
+                .or_else(|| call.get("input"))
+                .filter(|v| v.is_object())
+                .ok_or_else(|| {
+                    ProviderError::Malformed("chat tool call needs object arguments".into())
+                })?;
+            Ok(NativeToolCall::new(
+                format!("{request_id}-{index}"),
+                name,
+                args.clone(),
+            ))
+        })
+        .collect()
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BridgeError {
+    error: String,
+}
+
+async fn checked(response: reqwest::Response) -> Result<reqwest::Response, ProviderError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let message = response
+        .json::<BridgeError>()
+        .await
+        .map(|body| body.error)
+        .unwrap_or_else(|_| "browser bridge request failed".into());
+    let class = match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorClass::Auth,
+        StatusCode::TOO_MANY_REQUESTS => ProviderErrorClass::QuotaExhausted,
+        s if s.is_server_error() => ProviderErrorClass::Transient,
+        _ => ProviderErrorClass::Permanent,
+    };
+    Err(ProviderError::Api {
+        status: status.as_u16(),
+        message,
+        class,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swarm_core::message::ChatMessage;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn request() -> SendRequest {
+        let mut request = SendRequest::new(vec![
+            ChatMessage::system("follow the task"),
+            ChatMessage::user("make a file"),
+            ChatMessage::assistant("calling a tool"),
+            ChatMessage::tool("c1", "file written"),
+        ]);
+        request.tool_protocol = ToolProtocol::Text;
+        request
+    }
+
+    #[test]
+    fn prompt_sends_only_new_non_assistant_turns() {
+        let request = request();
+        let first = format_prompt(&request, 0, ChatSite::ChatGpt);
+        assert!(first.contains("follow the task"));
+        assert!(first.contains("make a file"));
+        let second = format_prompt(&request, 2, ChatSite::ChatGpt);
+        assert!(!second.contains("make a file"));
+        assert!(!second.contains("calling a tool"));
+        assert!(second.contains("file written"));
+    }
+
+    #[test]
+    fn tool_block_becomes_validated_native_call() {
+        let text = "```swarm\n{\"tool\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.txt\",\"content\":\"hi\"}}}\n```";
+        let calls = parse_tool_calls(text, "request-1").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["path"], "a.txt");
+        assert!(
+            parse_tool_calls("```swarm\n{\"plan\":{\"steps\":[]}}\n```", "r")
+                .unwrap()
+                .is_empty()
+        );
+        let copied = "```\n{\"tool\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"x.txt\"}}}\n```";
+        assert_eq!(parse_tool_calls(copied, "r").unwrap()[0].name, "read_file");
+        let malformed = "```\n{\"tool\":{\"name\":\"read_file\",\"arguments\":\"x.txt\"}}\n```";
+        assert!(matches!(
+            parse_tool_calls(malformed, "r"),
+            Err(ProviderError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn bridge_must_stay_on_loopback() {
+        let config = BrowserChatConfig::chatgpt("https://chatgpt.com", "auto");
+        assert!(matches!(
+            BrowserChatProvider::new(ProviderId::new("chatgpt-web").unwrap(), config),
+            Err(ProviderError::Session(_))
+        ));
+    }
+
+    #[test]
+    fn each_site_reports_its_own_kind_and_default_port() {
+        assert_eq!(ChatSite::ChatGpt.kind(), ProviderKind::ChatGptWeb);
+        assert_eq!(ChatSite::Gemini.kind(), ProviderKind::GeminiWeb);
+        assert_eq!(ChatSite::ChatGpt.default_bridge_url(), "http://127.0.0.1:8766");
+        assert_eq!(ChatSite::Gemini.default_bridge_url(), "http://127.0.0.1:8765");
+    }
+
+    async fn provider_for(server: &MockServer, site: ChatSite) -> BrowserChatProvider {
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "remote-1"})))
+            .expect(1)
+            .mount(server)
+            .await;
+        BrowserChatProvider::new(
+            ProviderId::new("chat").unwrap(),
+            BrowserChatConfig::new(site, server.uri(), "auto"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tool_request_survives_a_lost_fence() {
+        // Rendered 2026 chat keeps the fence's language label and drops the
+        // backticks, so the reply arrives as `swarm{"tool":…}`.
+        let text = "swarm{\"tool\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.txt\",\"content\":\"x\"}}}";
+        let calls = parse_tool_calls(text, "req").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+    }
+
+    #[test]
+    fn braces_inside_a_string_do_not_end_the_object() {
+        let text = "Sure! swarm{\"tool\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.txt\",\"content\":\"}{ not the end\"}}}";
+        let calls = parse_tool_calls(text, "req").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+    }
+
+    #[test]
+    fn prose_and_plans_are_not_tool_calls() {
+        assert!(parse_tool_calls("I created the file for you.", "req")
+            .unwrap()
+            .is_empty());
+        assert!(parse_tool_calls("{\"plan\":{\"steps\":[]}}", "req")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn fenced_request_still_wins_and_parses() {
+        let text = "```swarm\n{\"tool\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}}\n```";
+        let calls = parse_tool_calls(text, "req").unwrap();
+        assert_eq!(calls[0].name, "read_file");
+    }
+
+    #[tokio::test]
+    async fn chatgpt_session_reports_usage_from_the_bridge() {
+        let server = MockServer::start().await;
+        let provider = provider_for(&server, ChatSite::ChatGpt).await;
+        let tool = "```swarm\n{\"tool\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"x.txt\",\"content\":\"hi\"}}}\n```";
+        Mock::given(method("POST"))
+            .and(path("/sessions/remote-1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "text": tool,
+                "chat_url": "https://chatgpt.com/c/abc",
+                "model": "gpt-5.1",
+                "usage": {"input_tokens": 120, "output_tokens": 30, "cached_input_tokens": 0}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/sessions/remote-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"closed": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session = provider.start_session(SessionConfig::default()).await.unwrap();
+        let response = session.send(request()).await.unwrap();
+        assert_eq!(provider.kind(), ProviderKind::ChatGptWeb);
+        assert_eq!(response.finish_reason, FinishReason::ToolCalls);
+        assert_eq!(response.tool_calls[0].name, "write_file");
+        assert_eq!(response.usage.input_tokens, 120);
+        assert_eq!(response.usage.output_tokens, 30);
+        session.close().await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let prompt = body["prompt"].as_str().unwrap();
+        assert!(prompt.contains("follow policy") || prompt.contains("follow the task"));
+        assert!(prompt.contains("make a file"));
+    }
+
+    #[tokio::test]
+    async fn gemini_session_without_usage_still_works() {
+        let server = MockServer::start().await;
+        let provider = provider_for(&server, ChatSite::Gemini).await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/remote-1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "text": "hello from the page"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session = provider.start_session(SessionConfig::default()).await.unwrap();
+        let response = session.send(request()).await.unwrap();
+        assert_eq!(provider.kind(), ProviderKind::GeminiWeb);
+        assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(response.usage.total(), 0);
+        assert!(response.text.contains("hello from the page"));
+    }
+
+    #[tokio::test]
+    async fn bridge_rate_limit_maps_to_quota_exhausted() {
+        let server = MockServer::start().await;
+        let provider = provider_for(&server, ChatSite::ChatGpt).await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/remote-1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_json(json!({"error": "You have no more messages"})),
+            )
+            .mount(&server)
+            .await;
+        let session = provider.start_session(SessionConfig::default()).await.unwrap();
+        let error = session.send(request()).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderError::Api { status: 429, class: ProviderErrorClass::QuotaExhausted, .. }
+        ));
+    }
+}

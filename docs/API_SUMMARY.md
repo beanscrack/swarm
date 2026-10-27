@@ -2,7 +2,8 @@
 
 This records the public surface at commit `e22fbd1` ("turn 2/20"). It is not
 the current API: later work implemented the runtime, CLI, provider factory,
-tool reply handling, managed-agent provider, and Gemini web provider. Consult
+tool reply handling, managed-agent provider, and browser-chat provider (ChatGPT
+and Gemini web bridges). Consult
 the current source for implementation details. The snapshot below is retained
 only as an implementation record.
 

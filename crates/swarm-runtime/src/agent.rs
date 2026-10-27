@@ -222,11 +222,17 @@ impl AgentRunner {
                 EventKind::InferenceCompleted,
                 json!({
                     "step": cp.steps,
+                    "model": provider_entry.model(),
                     "input_tokens": resp.usage.input_tokens,
                     "output_tokens": resp.usage.output_tokens,
                     "spend_micros": spend,
                     "finish_reason": format!("{:?}", resp.finish_reason),
                     "latency_ms": latency_ms,
+                    // The live transcript renders the reply itself; the durable
+                    // copy of the full turn stays in the agent checkpoint.
+                    "text": resp.text.chars().take(4000).collect::<String>(),
+                    "tool_calls": resp.tool_calls.iter()
+                        .map(|call| call.name.clone()).collect::<Vec<_>>(),
                 }),
             )
             .await?;
@@ -441,7 +447,7 @@ impl AgentRunner {
             agent,
             task,
             EventKind::ToolRequested,
-            json!({ "call_id": tc.id.clone(), "name": name.clone() }),
+            json!({ "call_id": tc.id.clone(), "name": name.clone(), "arguments": tc.arguments.clone() }),
         )
         .await?;
 
@@ -520,6 +526,8 @@ impl AgentRunner {
                 "name": name,
                 "success": success,
                 "truncated": truncated,
+                "arguments": tc.arguments.clone(),
+                "output": model_output.chars().take(1200).collect::<String>(),
             }),
         )
         .await?;
@@ -641,7 +649,7 @@ mod tests {
     use swarm_core::budget::ResourceBudget;
     use swarm_core::provider::ProviderErrorClass;
     use swarm_core::{AgentRole, TaskId, TaskState};
-    use swarm_providers::{coding_script, GeminiWebConfig, GeminiWebProvider, MockProvider, MockStep, Provider};
+    use swarm_providers::{coding_script, BrowserChatConfig, BrowserChatProvider, MockProvider, MockStep, Provider};
     use swarm_tools::SandboxConfig;
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use wiremock::matchers::{method, path};
@@ -743,7 +751,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_text_tool_call_runs_through_sandbox_and_closes_session() {
+    async fn chatgpt_text_tool_call_runs_through_sandbox_and_closes_session() {
         let bridge = MockServer::start().await;
         Mock::given(method("POST")).and(path("/sessions"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":"remote-1"})))
@@ -757,22 +765,27 @@ mod tests {
                 } else {
                     "```swarm\n{\"tool\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"hello.txt\",\"content\":\"hello\"}}}\n```".to_string()
                 };
-                ResponseTemplate::new(200).set_body_json(json!({"text":answer,"chat_url":"https://gemini.google.com/app/fixture"}))
+                ResponseTemplate::new(200).set_body_json(json!({"text":answer,"chat_url":"https://chatgpt.com/c/fixture","usage":{"input_tokens":120,"output_tokens":18,"cached_input_tokens":0}}))
             })
             .expect(2).mount(&bridge).await;
         Mock::given(method("DELETE")).and(path("/sessions/remote-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"closed":true})))
             .expect(1).mount(&bridge).await;
         let (mut runner, run, task, mut agent, _mock, dir) = fixture(vec![]).await;
-        let provider_id = ProviderId::new("gemini-web").unwrap();
-        let gemini = GeminiWebProvider::new(provider_id.clone(),
-            GeminiWebConfig::new(bridge.uri(), "Auto").billing(swarm_core::budget::BillingMode::ZeroCost)).unwrap();
+        let provider_id = ProviderId::new("chatgpt-web").unwrap();
+        let chatgpt = BrowserChatProvider::new(provider_id.clone(),
+            BrowserChatConfig::chatgpt(bridge.uri(), "auto").billing(swarm_core::budget::BillingMode::ZeroCost)).unwrap();
         let mut registry = ProviderRegistry::new();
-        registry.register(Arc::new(gemini));
+        registry.register(Arc::new(chatgpt));
         runner.registry = Arc::new(registry);
         let outcome = runner.run(&run, &task, &mut agent, &provider_id).await.unwrap();
         assert!(matches!(outcome, AgentOutcome::Completed { .. }));
         assert_eq!(std::fs::read_to_string(dir.path().join("ws/hello.txt")).unwrap(), "hello");
+        // ChatGPT reports token counts on its conversation API, so Swarm's
+        // budget ledger is fed real numbers through the bridge.
+        let usage = runner.store.load_stats(&run.id).await.unwrap().usage;
+        assert_eq!(usage.input_tokens, 240, "two inferences x 120 input tokens");
+        assert_eq!(usage.output_tokens, 36, "two inferences x 18 output tokens");
         bridge.verify().await;
     }
 

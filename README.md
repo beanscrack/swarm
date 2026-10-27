@@ -11,7 +11,7 @@ A Rust workspace for orchestrating swarms of LLM agents: scheduling tasks, track
 | --- | --- |
 | `swarm-core` | Shared types: ids, agents, tasks, runs, events, messages, budgets, config, provider/tool traits |
 | `swarm-store` | SQLite persistence (sqlx) with migrations for runs, tasks, agents, events, artifacts, findings, hypotheses, usage |
-| `swarm-providers` | LLM provider abstraction, OpenAI client, Gemini web bridge client, mock provider, pricing, quota, registry |
+| `swarm-providers` | LLM provider abstraction, OpenAI client, browser-chat provider (ChatGPT and Gemini web bridges), mock provider, pricing, quota, registry |
 | `swarm-scheduler` | Task scheduling |
 | `swarm-tools` | Tool implementations available to agents |
 | `swarm-runtime` | Agent runtime tying scheduler, providers, tools, and store together |
@@ -58,29 +58,128 @@ To use a running OpenAI-compatible llama-server on `127.0.0.1:8080`:
 cargo run -p swarm-cli -- run "create hello.txt containing hello and verify it" --provider local --approve-all
 ```
 
+## Interactive session
+
+Plain `swarm` (no subcommand) on a terminal opens a Claude Code-style session.
+`swarm chat` (alias `c`) is the same thing with arguments:
+
+```sh
+cargo run -p swarm-cli --                       # session on ./.swarm + ./work
+cargo run -p swarm-cli -- chat "add a login page" --provider chatgpt-web
+cargo run -p swarm-cli -- chat --continue       # keep the last run's result as context
+cargo run -p swarm-cli -- chat --resume run_1f2e…
+```
+
+Every goal you type is a normal durable run, so `status`, `tasks`, `logs`,
+`--transcript`, budgets, checkpoints and approvals all keep working; the session
+is the layer on top. It is stored under the `chat` namespace of the same store,
+so a session survives restarts (`--new` starts a fresh one).
+
+```
+● swarm
+  provider chatgpt-web · model auto · 1 agent · approvals on-write
+  session chat-1f2e… · turn 3 · 41.2k tokens · 12 inferences · 9 tool calls
+
+● add a login page
+⏺ [a1 t1] asks for write_file
+  ⎿ step 1 · 4.2s · 1204 → 96 tokens
+✻ completed in 26.4s · 1 task · 2 inferences · 1 tool calls · 2671 tokens
+●
+```
+
+Keys: `enter` sends, `\` then `enter` inserts a newline, `up`/`down` and
+`ctrl+r` walk the prompt history, `tab` completes slash commands,
+`ctrl+a/e/b/f/k/u/w` do line editing, `ctrl+o` toggles transcript detail,
+`ctrl+l` redraws, `ctrl+c` interrupts the running turn (the run stays in the
+store and the message tells you how to resume it), `ctrl+d` leaves.
+
+Slash commands: `/help`, `/status [run]`, `/tasks [run]`, `/logs [run]`,
+`/runs`, `/history`, `/cost`, `/tools`, `/copy`, `/model <name>`,
+`/agents <n>`, `/approve ask|danger|all`, `/allow [tool]`, `/allow-all`,
+`/compact`, `/clear`, `/new`, `/exit`.
+
+Goals typed while a turn is running are queued and run next, so you can steer
+the session without waiting. Approvals print the exact call with its risk and
+accept `y` (once), `n` (deny) or `a` (allow that tool for the rest of the
+session, the same list `/allow` shows). `/approve all` and `/allow-all` are
+per-session; nothing is written to disk.
+
+For scripts and CI, `swarm chat --oneshot` reads one goal from stdin and exits,
+and piped stdin feeds one input per line in order — a line starting with `/` is
+a command there too, everything else is a goal.
+
+## Live view
+
+`run` prints a Claude Code-style transcript of the run as it happens:
+
+```
+⏺ swarm
+  provider chatgpt-web · model auto · 3 agents · approvals on-write
+  goal create hello.txt containing hello and verify it
+  workspace ./work · run run_1f2e…
+
+⏺ [a1 t1] asks for write_file
+  ⎿ step 1 · 4.2s · 1204 → 96 tokens · gpt-5.1
+⏺ [a1 t1] write_file(content=hello, path=hello.txt)
+  ⎿ wrote 5 byte(s) to hello.txt
+⏺ [a1 t1]
+  Created hello.txt and verified it contains `hello`.
+  ⎿ step 2 · 3.1s · 1330 → 41 tokens
+⏺ [t1] result
+  Created hello.txt and verified it contains `hello`.
+✻ completed in 26.4s · 1 task · 2 inferences · 1 tool calls · 2671 tokens
+```
+
+`⏺` is an action, `⎿` its result, `✗` a failure, and a braille spinner with the
+elapsed time, token count and current phase runs on the status row. A long
+assistant reply streams line by line; tool output shows its first line.
+The transcript is rendered from the persisted event log, so a run that was
+interrupted can be replayed after the fact:
+
+```sh
+cargo run -p swarm-cli -- logs <run-id> --transcript
+```
+
+Flags: `--plain` prints only the final one-line summary, `--verbose` adds
+low-signal rows (agent states, checkpoints, longer text), and `--json`
+suppresses the transcript entirely. Colours are off for pipes, when
+`NO_COLOR` is set, and under `TERM=dumb`. Force the live view in a pipe or CI
+with `SWARM_UI=always` (or disable it with `SWARM_UI=never`).
+
+
 On this workstation, the Qwen server can be started with
 `C:\Users\fortn\llama.cpp\start-qwen38-27b.ps1`. Its declared alias is
 `qwen3.8-27b-hauhau`, matching the `local` preset.
 
 The `local` preset uses one concurrent request and a 600-second HTTP timeout.
 Use `--model` and `--base-url` to override its defaults. A named provider
-other than `mock`, `local`, or `gemini-web` must be defined in a TOML file passed with
+other than `mock`, `local`, `chatgpt-web`, or `gemini-web` must be defined in a TOML file passed with
 `--config`. Runs using paid providers must explicitly disable the zero-cost
 policy in that configuration.
 
-To use Gemini web chat as Swarm's reasoning model, start the local Chrome
-bridge with an account that can select 4 Argon. Then run:
+To use ChatGPT web chat as Swarm's reasoning model, start the local Chrome
+bridge and sign in, then run:
 
 ```sh
-cargo run -p swarm-cli -- run "create hello.txt and verify it" --provider gemini-web --agents 3
+cargo run -p swarm-cli -- run "create hello.txt and verify it" --provider chatgpt-web --agents 3
 ```
 
-The `gemini-web` preset selects `4 Argon`. It requires an account that can use
-that model. The bridge gives every Swarm agent a separate chat tab and allows
-concurrent sessions. Setup, account requirements, limitations, and multi-profile
-configuration are in [Gemini web bridge](docs/GEMINI_WEB.md). A live Argon run
-has not been verified on this machine because the available account requested
-an upgrade.
+The `chatgpt-web` preset uses the bridge at `127.0.0.1:8766` and leaves the
+model at the account's own pick; pass `--model` to select one from ChatGPT's
+model picker. Each session gets its own conversation and the bridge deletes it
+when the session closes, so runs do not pile up in your chat history
+(`--keep-chats` keeps them while debugging). The conversation API is not
+available to every account, so run the bridge with `--no-api` for live use: it
+reads replies from the rendered turns and reports token usage as zero. Setup,
+model naming, sign-in through your own Chrome, concurrency across signed-in
+profiles, rate limits, and troubleshooting are in
+[ChatGPT web bridge](docs/CHATGPT_WEB.md). The bridge is verified offline against
+a fixture site (`bridges/chatgpt-web/fixture.mjs`) and end to end with
+`node e2e.mjs`.
+
+Gemini web chat is the same bridge pattern on port `8765`
+(`--provider gemini-web`, [docs/GEMINI_WEB.md](docs/GEMINI_WEB.md)).
+
 For a managed-agent provider, set `kind = "managed_agent"`, a `command` array,
 and optionally `workspace_dir` and `timeout_secs` in its provider entry.
 The CLI uses `--workspace` when `workspace_dir` is omitted. Swarm sends the

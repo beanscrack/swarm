@@ -7,3 +7,6 @@ work/
 *.db-shm
 bridges/gemini-web/node_modules/
 bridges/gemini-web/.gemini-browser-profile/
+bridges/chatgpt-web/node_modules/
+bridges/chatgpt-web/.chatgpt-browser-profile/
+bridges/chatgpt-web/.chrome-cdp/

@@ -17,6 +17,7 @@ string_enum! {
         OpenAiCompatible => "open_ai_compatible",
         ManagedAgent => "managed_agent",
         GeminiWeb => "gemini_web",
+        ChatGptWeb => "chatgpt_web",
     }
 }
 

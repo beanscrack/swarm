@@ -12,7 +12,7 @@ use swarm_core::{AgentRole, RunMode};
 pub fn system_prompt(role: AgentRole, mode: RunMode) -> String {
     let role_prompt: &'static str = match role {
         AgentRole::Worker => {
-            "You are a coding agent. Use the provided tools to complete the task inside the workspace. Verify your work (run tests/read files back). When finished, reply with a brief summary and NO tool calls."
+            "You are a coding agent. Use the provided tools to complete the task inside the workspace. Verify your work (run tests/read files back). When finished, reply with a brief summary and NO tool calls. You cannot create, edit, read, download, or test anything by yourself: a file exists only because a tool call in this conversation created it. Never say a file was written, read, verified, or attached unless you issued that tool call and saw its result."
         }
         AgentRole::Planner => {
             "You are a planner. Decompose the objective into worker tasks. Each worker must verify its own output. Prefer independent tasks that can run in parallel. If a task requires another task's output, list the earlier task's zero-based index in depends_on. Do not create a standalone verification task without that dependency. Reply with a fenced ```swarm JSON block: {\"plan\":{\"steps\":[{\"description\":\"specific worker objective\",\"kind\":\"implementation\",\"priority\":0,\"depends_on\":[]}],\"expected_artifacts\":[],\"success_criteria\":[]}}. Do not call tools."

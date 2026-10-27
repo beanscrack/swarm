@@ -2,8 +2,10 @@
 //!
 //! This crate defines the provider contract (normalized request/response
 //! types plus the async [`Provider`] / [`Session`] traits), a deterministic
-//! offline [`MockProvider`], an OpenAI-compatible HTTP backend, a
-//! managed-agent (external CLI) backend, a spend/quota [`QuotaGate`], and a
+//! offline [`MockProvider`], an OpenAI-compatible HTTP backend, a managed-agent
+//! (external CLI) backend, a browser-bridge consumer chat backend
+//! ([`BrowserChatProvider`], for ChatGPT and Gemini web), a spend/quota
+//! [`QuotaGate`], and a
 //! policy-aware [`ProviderRegistry`] dispatch table.
 //!
 //! Two execution models are supported:
@@ -13,8 +15,8 @@
 //! * **managed agents** (`ManagedAgent`) — the backend owns its tool loop;
 //!   Swarm manages the process, workspace, and captured output only.
 
+pub mod browser_chat;
 pub mod error;
-pub mod gemini_web;
 pub mod managed;
 pub mod mock;
 pub mod openai;
@@ -25,7 +27,7 @@ pub mod registry;
 
 // Convenience re-exports.
 pub use error::ProviderError;
-pub use gemini_web::{GeminiWebConfig, GeminiWebProvider};
+pub use browser_chat::{BrowserChatConfig, BrowserChatProvider, ChatSite};
 pub use managed::{ManagedAgentConfig, ManagedAgentProvider};
 pub use mock::{coding_script, MockProvider, MockStep};
 pub use openai::{OpenAiConfig, OpenAiProvider};
