@@ -76,6 +76,10 @@ pub struct RunArgs {
     model: Option<String>,
     #[arg(long)]
     base_url: Option<String>,
+    /// Steps (model turns) each agent may take; the default is 40, which long
+    /// edit-test-commit tasks can exhaust before they finish.
+    #[arg(long)]
+    max_steps: Option<u32>,
     /// Print only the final one-line summary (no live transcript).
     #[arg(long)]
     plain: bool,
@@ -254,6 +258,12 @@ fn run_config(args: &RunArgs) -> Result<RunConfig> {
             bail!("--agents must be at least 1");
         }
         cfg.agents = agents;
+    }
+    if let Some(steps) = args.max_steps {
+        if steps == 0 {
+            bail!("--max-steps must be at least 1");
+        }
+        cfg.budget.max_steps_per_agent = steps;
     }
     apply_provider_overrides(
         &mut cfg,
