@@ -225,6 +225,7 @@ impl Provider for BrowserChatProvider {
             billing: self.config.billing,
             client: self.client.clone(),
             sent_count: Arc::new(Mutex::new(0)),
+            summary: Arc::new(Mutex::new(None)),
         }))
     }
 }
@@ -272,6 +273,9 @@ struct BrowserChatSession {
     billing: BillingMode,
     client: Client,
     sent_count: Arc<Mutex<usize>>,
+    /// Model-written summary of the steps before `covered` (a message count into
+    /// the steps after the task), refreshed as more steps fall out of the window.
+    summary: Arc<Mutex<Option<(usize, String)>>>,
 }
 
 impl BrowserChatSession {
@@ -281,6 +285,43 @@ impl BrowserChatSession {
             self.base_url.trim_end_matches('/'),
             self.remote_id
         )
+    }
+
+    /// Ask the model, in its own fresh chat, to fold the steps that no longer fit
+    /// into the running summary. Returns the text and its estimated token cost,
+    /// or `None` when it fails: the prompt then keeps its one-line digest.
+    async fn summarize(
+        &self,
+        request: &SendRequest,
+        from: usize,
+        to: usize,
+        previous: Option<&str>,
+    ) -> Option<(String, u64)> {
+        let steps = steps_of(request);
+        let lines: Vec<String> = steps.get(from..to.min(steps.len()))?.iter().map(summary_line).collect();
+        let prompt = format!(
+            "You are compacting an agent's working notes. Write a plain-text summary of at most {SUMMARY_CHARS} \
+             characters covering the previous summary and the new steps below: what was done, concrete findings \
+             (file paths, commands, results, errors), decisions made, and what is still unfinished. Reply with \
+             the summary only: no preamble, no JSON, no code fences.\n\n[PREVIOUS SUMMARY]\n{}\n\n[NEW STEPS]\n{}\n",
+            previous.unwrap_or("(none)"),
+            clip_middle(&lines.join("\n"), 7_000),
+        );
+        let response = self
+            .client
+            .post(self.endpoint("/messages"))
+            .timeout(Duration::from_secs(90))
+            .json(&json!({"request_id": format!("{}-sum-{to}", self.id), "prompt": prompt, "fresh": true}))
+            .send()
+            .await
+            .ok()?;
+        let reply: BrowserReply = checked(response).await.ok()?.json().await.ok()?;
+        let text: String = reply.text.trim().chars().take(SUMMARY_CHARS + 300).collect();
+        if text.is_empty() || text.contains("```swarm") {
+            return None;
+        }
+        let tokens = estimate_tokens(&prompt).saturating_add(estimate_tokens(&text));
+        Some((text, tokens))
     }
 }
 
@@ -310,8 +351,31 @@ impl Session for BrowserChatSession {
                 "{site} conversation history moved backwards"
             )));
         }
+        let mut summary_tokens = 0u64;
         let prompt = if stateless {
-            compile_prompt(request, self.site, prompt_budget())
+            let mut summary = self.summary.lock().await;
+            // History that shrank (a rewind or a restarted agent) invalidates a
+            // summary that covered steps no longer in it.
+            if summary.as_ref().is_some_and(|(covered, _)| *covered > steps_of(request).len()) {
+                *summary = None;
+            }
+            let budget = prompt_budget();
+            let current = summary.as_ref().map(|(covered, text)| (*covered, text.as_str()));
+            let (mut prompt, first_kept) = compile_with_summary(request, self.site, budget, current);
+            let covered = summary.as_ref().map_or(0, |(covered, _)| *covered);
+            if request.tool_protocol == ToolProtocol::Text
+                && first_kept.saturating_sub(covered) >= SUMMARY_REFRESH_MESSAGES
+            {
+                let previous = summary.as_ref().map(|(_, text)| text.clone());
+                if let Some((text, tokens)) =
+                    self.summarize(request, covered, first_kept, previous.as_deref()).await
+                {
+                    prompt = compile_with_summary(request, self.site, budget, Some((first_kept, &text))).0;
+                    *summary = Some((first_kept, text));
+                    summary_tokens = tokens;
+                }
+            }
+            prompt
         } else {
             format_prompt(request, *sent_count, self.site)
         };
@@ -343,7 +407,15 @@ impl Session for BrowserChatSession {
             Ok(calls) => (calls, FinishReason::ToolCalls),
             Err(_) => (Vec::new(), FinishReason::MalformedTool),
         };
-        let chunks = build_chunks(&reply.text, &calls, finish, reply.usage.map(TokenUsage::from));
+        // The site reports no usage on the web UI, so a missing figure is estimated
+        // (about four characters a token) instead of recorded as zero. The summary
+        // call, when there was one, is part of this step's cost.
+        let usage = reply.usage.map(TokenUsage::from).unwrap_or_else(|| TokenUsage {
+            input_tokens: estimate_tokens(&prompt).saturating_add(summary_tokens),
+            output_tokens: estimate_tokens(&reply.text),
+            cached_input_tokens: 0,
+        });
+        let chunks = build_chunks(&reply.text, &calls, finish, Some(usage));
         Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok))))
     }
 
@@ -454,6 +526,40 @@ const RESULT_CHARS: usize = 3_000;
 const NEWEST_RESULT_CHARS: usize = 6_000;
 const DIGEST_CHARS: usize = 2_500;
 const CHECKLIST_CHARS: usize = 1_500;
+/// Ask for a fresh summary once this many messages (about six steps) have fallen
+/// out of the window since the last one: one extra call per ~6 steps.
+const SUMMARY_REFRESH_MESSAGES: usize = 12;
+const SUMMARY_CHARS: usize = 900;
+
+/// About four characters to a token: a floor-level estimate for sites that report
+/// no usage, good enough to make cost and budget figures mean something.
+fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64).div_ceil(4)
+}
+
+/// The messages after the task itself: everything from the model's first reply.
+fn steps_of(request: &SendRequest) -> &[swarm_core::message::ChatMessage] {
+    let first_reply = request
+        .messages
+        .iter()
+        .position(|message| message.role == ChatRole::Assistant)
+        .unwrap_or(request.messages.len());
+    &request.messages[first_reply..]
+}
+
+/// A step as the summarizer reads it: more detail than the one-line digest.
+fn summary_line(message: &swarm_core::message::ChatMessage) -> String {
+    match message.role {
+        ChatRole::Tool => format!("RESULT: {}", one_line(&message.content, 300)),
+        _ if !message.tool_calls.is_empty() => message
+            .tool_calls
+            .iter()
+            .map(|call| format!("CALL {}({})", call.name, one_line(&call.arguments.to_string(), 160)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => format!("SAID: {}", one_line(&message.content, 200)),
+    }
+}
 
 fn prompt_budget() -> usize {
     std::env::var("SWARM_PROMPT_CHARS")
@@ -532,22 +638,32 @@ fn digest_line(message: &swarm_core::message::ChatMessage) -> String {
 
 /// The whole prompt for one call, built from the full transcript.
 fn compile_prompt(request: &SendRequest, site: ChatSite, budget: usize) -> String {
+    compile_with_summary(request, site, budget, None).0
+}
+
+/// [`compile_prompt`] with an optional model-written summary of the first
+/// `covered` step messages, and the index of the first step kept in full.
+fn compile_with_summary(
+    request: &SendRequest,
+    site: ChatSite,
+    budget: usize,
+    summary: Option<(usize, &str)>,
+) -> (String, usize) {
     if request.tool_protocol != ToolProtocol::Text {
-        return format_prompt(request, 0, site);
+        return (format_prompt(request, 0, site), 0);
     }
     let mut head = String::from(TOOL_PREAMBLE);
     if let Some(tools) = request.tools_as_text() {
         head.push_str(&tools);
     }
     // Everything before the model's first reply is the task itself: keep it whole.
-    let first_reply = request
-        .messages
-        .iter()
-        .position(|message| message.role == ChatRole::Assistant)
-        .unwrap_or(request.messages.len());
-    let (task, steps) = request.messages.split_at(first_reply);
+    // The system message carries the project's AGENTS.md / CLAUDE.md (up to 8,000
+    // characters on top of the base prompt), so it gets the larger allowance.
+    let steps = steps_of(request);
+    let task = &request.messages[..request.messages.len() - steps.len()];
     for message in task {
-        head.push_str(&render_message(message, 6_000));
+        let cap = if message.role == ChatRole::System { 14_000 } else { 8_000 };
+        head.push_str(&render_message(message, cap));
     }
     let room = budget.saturating_sub(head.chars().count() + TOOL_CONTRACT.chars().count());
 
@@ -571,7 +687,14 @@ fn compile_prompt(request: &SendRequest, site: ChatSite, budget: usize) -> Strin
     let mut out = head;
     let earlier = &steps[..first_kept];
     if !earlier.is_empty() {
-        let mut lines: Vec<String> = earlier.iter().map(digest_line).collect();
+        // Steps a summary already covers are not repeated as digest lines.
+        let covered = summary.map_or(0, |(covered, _)| covered.min(first_kept));
+        if let Some((_, text)) = summary {
+            out.push_str("\n[SUMMARY OF EARLIER WORK]\n");
+            out.push_str(text);
+            out.push('\n');
+        }
+        let mut lines: Vec<String> = earlier[covered..].iter().map(digest_line).collect();
         let mut total = 0usize;
         let mut from = lines.len();
         while from > 0 && total + lines[from - 1].chars().count() < DIGEST_CHARS {
@@ -580,13 +703,15 @@ fn compile_prompt(request: &SendRequest, site: ChatSite, budget: usize) -> Strin
         }
         let omitted = from;
         lines.drain(..from);
-        out.push_str("\n[EARLIER STEPS, condensed");
-        if omitted > 0 {
-            out.push_str(&format!("; {omitted} older lines dropped"));
+        if !lines.is_empty() {
+            out.push_str("\n[EARLIER STEPS, condensed");
+            if omitted > 0 {
+                out.push_str(&format!("; {omitted} older lines dropped"));
+            }
+            out.push_str("]\n");
+            out.push_str(&lines.join("\n"));
+            out.push('\n');
         }
-        out.push_str("]\n");
-        out.push_str(&lines.join("\n"));
-        out.push('\n');
         // The checklist is the agent's own record of progress: never condense it.
         let checklist = earlier
             .iter()
@@ -604,7 +729,7 @@ fn compile_prompt(request: &SendRequest, site: ChatSite, budget: usize) -> Strin
         out.push_str(&block);
     }
     out.push_str(TOOL_CONTRACT);
-    out
+    (out, first_kept)
 }
 
 /// Find a Swarm tool request in text with no usable fence, by scanning for a
@@ -1115,8 +1240,104 @@ mod tests {
         let response = session.send(request()).await.unwrap();
         assert_eq!(provider.kind(), ProviderKind::GeminiWeb);
         assert_eq!(response.finish_reason, FinishReason::Stop);
-        assert_eq!(response.usage.total(), 0);
+        // The site reported no usage, so the figure is an estimate, not zero.
+        assert!(response.usage.input_tokens > 0 && response.usage.output_tokens > 0, "{:?}", response.usage);
         assert!(response.text.contains("hello from the page"));
+    }
+
+    #[test]
+    fn a_summary_replaces_the_digest_of_the_steps_it_covers() {
+        let (prompt, first_kept) = compile_with_summary(
+            &convo(30, 2_500),
+            ChatSite::ChatGpt,
+            12_000,
+            Some((10, "SUMMARY-TEXT: edited a.go and ran its tests")),
+        );
+        assert!(prompt.contains("SUMMARY OF EARLIER WORK") && prompt.contains("SUMMARY-TEXT"), "{prompt}");
+        // Steps 1-5 are messages 0..10 and are covered; step 8 is not.
+        assert!(!prompt.contains("run step 3\"}"), "a covered step is not repeated");
+        assert!(prompt.contains("run step 8\"}"), "a step after the summary is still listed");
+        assert!(first_kept > 10, "the window moved past the summary: {first_kept}");
+        assert!(prompt.contains("END30END") && prompt.contains("GOAL-TEXT"));
+    }
+
+    #[test]
+    fn a_full_instruction_file_in_the_system_message_is_not_clipped() {
+        let instructions = format!("INSTRUCTIONS-START {} INSTRUCTIONS-END", "rule. ".repeat(1_300));
+        assert!(instructions.len() > 7_000 && instructions.len() <= 8_100);
+        let mut request = convo(1, 100);
+        request.messages[0] = ChatMessage::system(format!("base prompt\n\n{instructions}"));
+        let prompt = compile_prompt(&request, ChatSite::ChatGpt, 16_000);
+        assert!(prompt.contains("INSTRUCTIONS-START") && prompt.contains("INSTRUCTIONS-END"));
+        assert!(!prompt.contains("characters omitted"), "nothing clipped");
+    }
+
+    #[tokio::test]
+    async fn old_steps_are_summarized_by_the_model_and_the_summary_is_reused() {
+        let server = MockServer::start().await;
+        let provider = provider_for(&server, ChatSite::ChatGpt).await;
+        // The summary request is the one that says it is compacting notes.
+        Mock::given(method("POST"))
+            .and(path("/sessions/remote-1/messages"))
+            .and(wiremock::matchers::body_string_contains("compacting an agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "SUMMARY-FROM-MODEL: wrote 3 files"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tool = "```swarm\n{\"tool\":{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}}\n```";
+        Mock::given(method("POST"))
+            .and(path("/sessions/remote-1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": tool})))
+            .mount(&server)
+            .await;
+        let session = provider.start_session(SessionConfig::default()).await.unwrap();
+
+        let first = session.send(convo(40, 2_500)).await.unwrap();
+        assert_eq!(first.finish_reason, FinishReason::ToolCalls);
+        assert!(first.usage.input_tokens > 2_000, "summary cost is counted: {:?}", first.usage);
+        // One more step: not enough has fallen out of the window to ask again.
+        session.send(convo(41, 2_500)).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let bodies: Vec<Value> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/messages"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 3, "summary + two steps");
+        assert!(bodies[0]["prompt"].as_str().unwrap().contains("compacting an agent"));
+        for step in &bodies[1..] {
+            assert_eq!(step["fresh"], true, "every call is its own chat");
+            let prompt = step["prompt"].as_str().unwrap();
+            assert!(prompt.contains("SUMMARY-FROM-MODEL"), "the summary rides along: {prompt}");
+            assert!(prompt.contains("SWARM PROTOCOL"));
+        }
+        assert!(bodies[1]["prompt"].as_str().unwrap().chars().count() < 30_000);
+    }
+
+    #[tokio::test]
+    async fn a_failed_summary_falls_back_to_the_digest() {
+        let server = MockServer::start().await;
+        let provider = provider_for(&server, ChatSite::ChatGpt).await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/remote-1/messages"))
+            .and(wiremock::matchers::body_string_contains("compacting an agent"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({"error": "empty reply"})))
+            .mount(&server)
+            .await;
+        let tool = "```swarm\n{\"tool\":{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}}\n```";
+        Mock::given(method("POST"))
+            .and(path("/sessions/remote-1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": tool})))
+            .mount(&server)
+            .await;
+        let session = provider.start_session(SessionConfig::default()).await.unwrap();
+        let response = session.send(convo(40, 2_500)).await.unwrap();
+        assert_eq!(response.finish_reason, FinishReason::ToolCalls, "the step still ran");
+        let requests = server.received_requests().await.unwrap();
+        let last: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+        let prompt = last["prompt"].as_str().unwrap();
+        assert!(prompt.contains("EARLIER STEPS, condensed") && !prompt.contains("SUMMARY OF EARLIER WORK"));
     }
 
     #[tokio::test]
