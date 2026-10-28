@@ -67,6 +67,14 @@ const TURN = [
   '[data-message-id] .markdown',
   'article .markdown',
 ];
+// The user's own turn, newest markup first. This is the proof that the site
+// POSTED the message: a send the app swallows creates no user unit, and the
+// reply has not started yet, so nothing else on the page can tell you.
+const USER_TURN = [
+  '[data-content-search-unit-key$=":user"]',
+  '[data-message-author-role="user"]',
+  'article[data-message-author-role="user"]',
+];
 // Per-turn state attribute the 2026 site uses while streaming.
 const TURN_STATE = '[data-talvt-turn-state]';
 // Visually hidden "ChatGPT said:" heading that ships inside the unit, so it
@@ -208,9 +216,13 @@ async function createSession(model) {
   try {
     await page.goto(chatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await composer(page);
+    // Root URL resumes the last chat; a session must own a fresh conversation,
+    // and the model has to be picked after the reset, not before it.
+    await startNewChat(page);
+    await composer(page);
     await selectModel(page, model);
     const id = randomUUID();
-    sessions.set(id, { page, model, accessPoint, replies: new Map(), activeAt: Date.now(), pending: false });
+    sessions.set(id, { page, model, accessPoint, replies: new Map(), activeAt: Date.now(), pending: false, log: [] });
     return { id, access_point: accessPoint };
   } catch (error) {
     await page.close();
@@ -279,7 +291,38 @@ async function isGenerating(page) {
   for (const selector of STOPPING) {
     if (await page.locator(selector).first().isVisible().catch(() => false)) return true;
   }
-  return false;
+  // 2026 ChatGPT has no stop button, so the selector list above never fires and
+  // an idle gate built on it is a no-op. The turn element carries the state: the
+  // last one is `generating` until the site finishes, and submitting into that
+  // window is what drops a mid-conversation send.
+  const state = await page.evaluate(() => {
+    const nodes = document.querySelectorAll('[data-talvt-turn-state]');
+    const last = nodes[nodes.length - 1];
+    return last ? last.getAttribute('data-talvt-turn-state') : null;
+  }).catch(() => null);
+  return state === 'generating';
+}
+
+async function userTurnCount(page) {
+  for (const selector of USER_TURN) {
+    const count = await page.locator(selector).count().catch(() => 0);
+    if (count > 0) return count;
+  }
+  return 0;
+}
+
+/// The site drops a message submitted while it is still streaming the previous
+/// turn: the text leaves the composer, no user unit is created, and the reply
+/// poll then waits out the whole response window for a turn that never existed.
+/// Swarm posts a tool result the moment a reply is read, so this gap is normal
+/// and has to be closed before typing.
+async function waitIdle(page, windowMs) {
+  const until = Date.now() + windowMs;
+  while (await isGenerating(page).catch(() => false)) {
+    if (Date.now() > until) return false;
+    await page.waitForTimeout(400);
+  }
+  return true;
 }
 
 async function fencedCode(element) {
@@ -432,6 +475,22 @@ async function deleteChatFromMenu(page, id) {
   return gone;
 }
 
+/// Did the site take the message? Proved only by new turn units: a user unit
+/// means the app POSTED the prompt, an assistant unit means the reply is there.
+/// "is generating" is deliberately NOT a start signal — it is inherited from the
+/// previous turn when a submission is swallowed, which is what turned a dropped
+/// send into a 10-minute 504.
+async function turnStarted(page, previousTurns, previousUserTurns, windowMs) {
+  const until = Date.now() + windowMs;
+  while (Date.now() < until) {
+    if (await assistantCount(page) > previousTurns) return true;
+    if (await userTurnCount(page) > previousUserTurns) return true;
+    if (await loginWall(page)) return true;
+    await page.waitForTimeout(300);
+  }
+  return false;
+}
+
 async function pageComplaint(page) {
   const alerts = await page.locator('[role="alert"], [data-testid*="limit"], .banner').allTextContents()
     .catch(() => []);
@@ -447,65 +506,272 @@ async function loginWall(page) {
     /sign (in|up)|log ?in to|continue to chatgpt|create a free account|authenticat/i.test(text));
 }
 
-async function sendMessage(session, prompt) {
-  const { page } = session;
-  let editor = await composer(page);
-  // Which markup shape the site uses is decided per read, not cached per
-  // session: a fresh chat has no turns to inspect yet.
-  const previousTurns = await assistantCount(page);
-  const probe = useApi ? await readViaApi(page, -1) : null;
-  const apiBaseline = probe && probe.count >= 0 ? probe.count : 0;
-
-  // An overlay over the composer (banners, tooltips) makes Playwright's click
-  // time out on a visible element; focusing is enough for insertText to land.
-  // The composer can be visible before the page has finished initializing.
-  // Confirm the text actually landed before submitting, and retry if the page
-  // replaced or reset the editor while it was loading.
-  let entered = false;
-  for (let attempt = 0; attempt < 3 && !entered; attempt++) {
-    editor = await composer(page);
+/// Type the prompt into the composer and prove the DOM took it, retrying when a
+/// late hydration resets the editor.
+///
+/// Long prompts go in as chunked CDP insertText. Writing innerHTML in one shot
+/// renders the text and the composer *looks* full while the editor's own
+/// document stays empty: Enter then submits nothing and the reply poll waits out
+/// the whole response window for a turn that was never requested (the 600s 504).
+/// A single insertText of ~6k chars was measured dropping one character, hence
+/// the chunks.
+///
+/// The proof is a LENGTH check, never a string comparison. ChatGPT's editor
+/// parses markdown as you type: "- " becomes a bullet, and paired underscores in
+/// identifiers like generation_config.go become emphasis, which re-nests nodes
+/// and reorders innerText, so a tail comparison rejects faithful prompts (that
+/// was the 503 storm). Truncation is still caught, by length.
+async function typePrompt(page, prompt) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const editor = await composer(page);
     try {
       await editor.waitFor({ state: 'visible', timeout: 10000 });
       await editor.click({ timeout: 5000 });
       if (prompt.split('\n').length > 40 && await editor.evaluate((node) => node.isContentEditable)) {
-        // The editor's per-paragraph cost makes fill() grow worse than
-        // linearly in line count (600 lines ~ 19s). Building the paragraphs in
-        // one DOM write lets the editor parse them once.
-        await editor.evaluate((node, text) => {
-          node.focus();
-          const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-          node.innerHTML = text.split('\n').map((line) =>
-            `<p>${line ? esc(line) : '<br class="ProseMirror-trailingBreak">'}</p>`).join('');
-          node.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText' }));
-        }, prompt);
+        await editor.evaluate((node) => node.focus());
+        for (let at = 0; at < prompt.length; at += 1800) {
+          await page.keyboard.insertText(prompt.slice(at, at + 1800));
+          await page.waitForTimeout(25);
+        }
       } else {
         await editor.fill(prompt, { timeout: 10000 });
       }
       await page.waitForTimeout(500);
-      // A contenteditable composer reports its paragraph breaks as extra blank
-      // lines in innerText, so compare with whitespace collapsed.
-      entered = await editor.evaluate((node, expected) => {
+      const verdict = await editor.evaluate((node, expected) => {
         const squash = (text) => text.replace(/\s+/g, ' ').trim();
-        return squash('value' in node ? node.value : node.innerText) === squash(expected);
+        const norm = (text) => squash(text).replace(/•/g, ' ');
+        const core = (text) => text.replace(/[^a-z0-9]/gi, '');
+        const read = ('value' in node ? node.value : node.innerText) || '';
+        return {
+          want: core(norm(expected)).length,
+          got: core(norm(read)).length,
+          wantTail: core(norm(expected)).slice(-40),
+          gotTail: core(norm(read)).slice(-40),
+        };
       }, prompt);
-      if (!entered) {
-        const got = await editor.evaluate((node) => ('value' in node ? node.value : node.innerText).length);
-        console.error(`[composer] attempt ${attempt}: prompt ${prompt.length} chars, composer ${got} chars`);
-      }
+      if (verdict.got >= Math.floor(verdict.want * 0.98)) return true;
+      console.error(`[composer] attempt ${attempt}: want=${verdict.want} got=${verdict.got}`);
+      console.error(`[composer]   want tail ${JSON.stringify(verdict.wantTail)}`);
+      console.error(`[composer]   got  tail ${JSON.stringify(verdict.gotTail)}`);
     } catch (error) {
       // A navigation or a late hydration can replace the composer.
       console.error(`[composer] attempt ${attempt} (${prompt.length} chars): ${String(error.message).split('\n')[0]}`);
     }
-    if (!entered) await page.waitForTimeout(1000);
+    await page.waitForTimeout(1000);
   }
-  if (!entered) throw new BridgeError(503, 'ChatGPT composer did not retain the prompt; wait for the page to load and retry');
-  const send = await firstVisible(page, SEND, 5000);
-  if (send) {
-    await send.click();
+  return false;
+}
+
+/// Keep the bridge's own copy of the conversation. The site stops accepting new
+/// messages once a chat is long, and the chat that replaces it needs the history.
+// Measured: the site drops the 6th message of a chat, so rotate after the 5th.
+const MAX_TURNS_PER_CHAT = 5;
+
+async function sendLogged(session, prompt) {
+  session.log.push({ role: 'user', text: prompt });
+  const reply = await sendMessage(session, prompt);
+  session.log.push({ role: 'assistant', text: reply.text });
+  // The site stops accepting new messages in a chat after about six exchanges,
+  // and it fails by dropping the send with no wall at all. Flag the session so
+  // the next prompt opens a fresh chat carrying the transcript.
+  if (await userTurnCount(session.page) >= MAX_TURNS_PER_CHAT) session.rotate = true;
+  return reply;
+}
+
+/// Newest turns first, newest-first accumulation, capped so the carry-over stays
+/// inside the size the site accepts on a fresh chat.
+function carriedTranscript(log, budget = Number(process.env.SWARM_CARRY_CHARS) || 16000) {
+  const parts = [];
+  let size = 0;
+  // The first prompt holds the goal and the reply protocol. Newest-first
+  // accumulation drops it, and the agent then starts the task over after every
+  // rotation. Pin its head and tail, and spend the rest of the budget on recent turns.
+  let floor = 0;
+  let pinned = '';
+  if (log.length > 1 && log[0].role === 'user') {
+    const first = log[0].text;
+    const text = first.length > 5000 ? `${first.slice(0, 2500)}\n[...]\n${first.slice(-2500)}` : first;
+    pinned = `Swarm (original request): ${text}`;
+    size += pinned.length;
+    floor = 1;
+  }
+  // The newest log entry is the prompt being sent now; the caller appends it
+  // itself, so carrying it too would send the same text twice.
+  for (let index = log.length - 2; index >= floor; index -= 1) {
+    const turn = log[index];
+    const part = `${turn.role === 'user' ? 'Swarm' : 'ChatGPT'}: ${turn.text}`;
+    if (size + part.length > budget) break;
+    size += part.length;
+    parts.unshift(part);
+  }
+  if (pinned) parts.unshift(pinned);
+  if (parts.length === 0) return '';
+  return '[CONVERSATION SO FAR — the browser chat was restarted because the site'
+    + ' stopped accepting messages. Continue from here, do not greet again.]\n\n'
+    + `${parts.join('\n\n')}\n\n[CONTINUE]\n`;
+}
+
+/// The site silently stops accepting messages in a long chat: Enter clears the
+/// composer, posts nothing, and no wall is shown. Nothing recovers that chat, so
+/// delete it, open a fresh one in the same tab, and carry the transcript.
+const trace = (...parts) => {
+  if (process.env.SWARM_BRIDGE_TRACE) console.log(new Date().toISOString().slice(11, 19), ...parts);
+};
+
+async function restartChat(session, prompt) {
+  const { page } = session;
+  trace('restartChat: start, prompt chars', prompt.length, 'log turns', session.log.length);
+  await deleteChat(page).catch(() => 'failed');
+  await startNewChat(page);
+  trace('restartChat: new chat opened', page.url());
+  await page.waitForTimeout(1500);
+  // The old chat's turns can stay in the DOM for a moment after the URL leaves
+  // /c/<id>. A baseline taken then is the old count, the new chat never exceeds
+  // it, and a prompt that was posted reads as "not posted". Wait for an empty
+  // view; a fresh chat has no turns, so the baseline is then 0.
+  for (let tick = 0; tick < 40; tick += 1) {
+    if (await assistantCount(page) === 0 && await userTurnCount(page) === 0) break;
+    await page.waitForTimeout(250);
+  }
+  const previousTurns = await assistantCount(page);
+  const previousUserTurns = await userTurnCount(page);
+  trace('restartChat: baselines', previousTurns, previousUserTurns);
+  if (!(await waitIdle(page, 20000))) { trace('restartChat: never idle'); return false; }
+  const carried = carriedTranscript(session.log) + prompt;
+  if (!(await typePrompt(page, carried))) { trace('restartChat: typePrompt failed, chars', carried.length); return false; }
+  await page.keyboard.press('Enter');
+  const started = await turnStarted(page, previousTurns, previousUserTurns, 30000);
+  trace('restartChat: turnStarted', started, 'chars', carried.length);
+  return started;
+}
+
+/// Force a genuinely new conversation.
+///
+/// Opening the site's root URL RESUMES the most recent chat, so every "new"
+/// bridge session piles the run into the same conversation. That chat grows past
+/// the point where the site accepts messages at all (Enter clears the composer,
+/// posts nothing, no wall), which is what killed long runs at turn 6-10. The
+/// sidebar's New chat control is the only reliable reset.
+async function startNewChat(page) {
+  const before = page.url();
+  const control = page.locator('button[aria-label="New chat"], a[aria-label="New chat"]').first();
+  if (await control.count().catch(() => 0)) {
+    await control.click({ timeout: 5000 }).catch(() => {});
   } else {
-    await page.keyboard.press('Enter');
+    await page.goto(chatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  }
+  // The chat view is /c/<id>; a fresh composer stays on the root URL.
+  for (let tick = 0; tick < 20; tick += 1) {
+    if (!/\/c\//.test(page.url())) return true;
+    await page.waitForTimeout(250);
+  }
+  return page.url() !== before && !/\/c\//.test(page.url());
+}
+
+async function sendMessage(session, prompt) {
+  const { page } = session;
+  // The site stops accepting messages in a chat after roughly six exchanges and
+  // fails SILENTLY (no wall, dropped send), so rotate proactively: sendLogged
+  // flags the session when the chat gets long, and the next prompt opens a fresh
+  // chat with the transcript carried over. Rotating after a drop, as this used to
+  // do, spends a full watchdog cycle on every turn.
+  let sent = false;
+  if (session.rotate) {
+    session.rotate = false;
+    sent = await restartChat(session, prompt);
+    trace('sendMessage: rotated, sent =', sent);
+  }
+  // Which markup shape the site uses is decided per read, not cached per
+  // session: a fresh chat has no turns to inspect yet.
+  // After a rotation the prompt is already posted in a fresh chat, so counting
+  // turns now would include the reply that is being generated and the reader
+  // would wait for one more. A fresh chat has no earlier turns: baseline 0.
+  let previousTurns = sent ? 0 : await assistantCount(page);
+  const probe = useApi && !sent ? await readViaApi(page, -1) : null;
+  let apiBaseline = probe && probe.count >= 0 ? probe.count : 0;
+
+  // Never type into a site that is still answering: the send is swallowed.
+  if (!sent && !(await waitIdle(page, 90000))) {
+    throw new BridgeError(503,
+      'ChatGPT is still generating the previous turn after 90s; the browser is busy'
+      + ' (a second swarm/agent session on this Chrome does this) — let it finish and retry');
+  }
+  const previousUserTurns = await userTurnCount(page);
+
+  // An overlay over the composer (banners, tooltips) makes Playwright's click
+  // time out on a visible element; focusing is enough for insertText to land.
+  if (!sent && !(await typePrompt(page, prompt))) {
+    throw new BridgeError(503, 'ChatGPT composer did not retain the prompt; wait for the page to load and retry');
+  }
+  if (!sent) {
+    const send = await firstVisible(page, SEND, 5000);
+    if (send) {
+      await send.click();
+    } else {
+      await page.keyboard.press('Enter');
+    }
   }
 
+  // Did the site start a turn at all? A submission the app ignored (composer
+  // rendered the text, its document did not take it) used to burn the whole
+  // response window before anyone noticed. Walls are classified first, and Enter
+  // is pressed again ONLY while the composer still holds the prompt: re-pressing
+  // on a cleared composer submits a second, empty turn.
+  if (!sent && !(await turnStarted(page, previousTurns, previousUserTurns, 20000))) {
+    const complaint = await pageComplaint(page);
+    if (/limit|quota|too many|try again later|usage cap|out of free/i.test(complaint)) {
+      throw new BridgeError(429, complaint);
+    }
+    if (await loginWall(page)) {
+      throw new BridgeError(401,
+        'ChatGPT asked you to sign in; sign in in the bridge Chrome window and retry');
+    }
+    const box = await firstVisible(page, COMPOSER, 2000).catch(() => null);
+    const holds = box ? await box.evaluate((node, expected) => {
+      const squash = (text) => text.replace(/\s+/g, ' ').trim();
+      const read = squash('value' in node ? node.value : node.innerText);
+      return squash(expected).slice(0, 40).length > 0 && read.startsWith(squash(expected).slice(0, 40));
+    }, prompt).catch(() => false) : false;
+    if (holds) {
+      // A late hydration can swallow the first keypress while the text sits there.
+      await page.keyboard.press('Enter');
+      if (await turnStarted(page, previousTurns, previousUserTurns, 20000)) {
+        // Recovered; fall through to the reply poll.
+      } else {
+        throw new BridgeError(503,
+          'ChatGPT ignored the send: the prompt is in the composer and no generation'
+          + ' started; the editor accepted the text without registering it — re-run the turn');
+      }
+    } else {
+      // The site swallowed the submission — the normal outcome of submitting
+      // into the window where it is still finishing the previous turn. The
+      // composer is empty, so typing again cannot post a second copy.
+      let recovered = false;
+      if (await waitIdle(page, 30000) && await typePrompt(page, prompt)) {
+        await page.keyboard.press('Enter');
+        recovered = await turnStarted(page, previousTurns, previousUserTurns, 20000);
+      }
+      // Dropped twice means this chat is finished with: the site stops accepting
+      // new messages in a long chat and shows no wall at all. Carry the
+      // transcript into a fresh chat and try there.
+      if (!recovered) {
+        recovered = await restartChat(session, prompt);
+        // The prompt now sits in a fresh chat, so the old chat's turn count is no
+        // longer the thing to wait past: the reply there is turn number one.
+        if (recovered) {
+          previousTurns = 0;
+          apiBaseline = 0;
+        }
+      }
+      if (!recovered) {
+        throw new BridgeError(503,
+          'ChatGPT would not post the prompt: it accepted the text, posted nothing and'
+          + ' stayed idle, in a fresh chat too; re-run the turn');
+      }
+    }
+  }
+
+  trace('sendMessage: waiting for reply, sent', sent, 'previousTurns', previousTurns, 'useApi', useApi);
   const deadline = Date.now() + responseTimeoutMs;
   let apiFailures = 0;
   while (Date.now() < deadline) {
@@ -605,7 +871,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (!session.replies.has(body.request_id)) {
         const previous = session.queue ?? Promise.resolve();
-        const next = previous.catch(() => {}).then(() => sendMessage(session, body.prompt));
+        const next = previous.catch(() => {}).then(() => sendLogged(session, body.prompt));
         session.pending = true;
         session.queue = next;
         next.finally(() => { session.pending = false; }).catch(() => {});
