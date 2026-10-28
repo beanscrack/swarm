@@ -360,6 +360,30 @@ impl Session for BrowserChatSession {
 fn format_prompt(request: &SendRequest, sent_count: usize, site: ChatSite) -> String {
     let name = site.display();
     let mut out = String::new();
+    // A call with no tools (the /goal judge, /btw) asks for its own answer shape.
+    // The tool contract below would contradict it ("exactly one line of JSON" vs
+    // "exactly one fenced swarm block"), and the site answers such a prompt with
+    // nothing at all.
+    if request.tool_protocol != ToolProtocol::Text {
+        if sent_count == 0 {
+            out.push_str("You are a reasoning model working for Swarm, an agent runtime. Follow the SYSTEM instructions below and answer in exactly the form they ask for. You have no tools for this reply.\n");
+        }
+        for message in &request.messages[sent_count..] {
+            if sent_count > 0 && message.role == ChatRole::Assistant {
+                continue;
+            }
+            out.push_str(match message.role {
+                ChatRole::System => "\n[SYSTEM]\n",
+                ChatRole::User => "\n[USER]\n",
+                ChatRole::Assistant => "\n[ASSISTANT]\n",
+                ChatRole::Tool => "\n[TOOL RESULT]\n",
+            });
+            out.push_str(&message.content);
+            out.push('\n');
+        }
+        let _ = name;
+        return out;
+    }
     if sent_count == 0 {
         out.push_str("You are the reasoning model for Swarm, an agent runtime. Follow the SYSTEM instructions below. Swarm executes tools and returns their results. To request one tool, reply with only a fenced ```swarm JSON block containing {\"tool\":{\"name\":\"tool_name\",\"arguments\":{...}}}. Never claim a tool ran until Swarm returns its result.\n");
         if request.tool_protocol == ToolProtocol::Text {
@@ -659,6 +683,25 @@ mod tests {
         assert!(!second.contains("make a file"));
         assert!(!second.contains("calling a tool"));
         assert!(second.contains("file written"));
+    }
+
+    #[test]
+    fn a_call_without_tools_gets_no_tool_contract() {
+        // The /goal judge asks for one line of JSON; the tool contract asks for a
+        // fenced swarm block. Sending both gets an empty reply from the site.
+        let mut request = SendRequest::new(vec![
+            ChatMessage::system("Answer with exactly one line of JSON"),
+            ChatMessage::user("Goal: done?"),
+        ]);
+        request.tool_protocol = ToolProtocol::None;
+        let prompt = format_prompt(&request, 0, ChatSite::ChatGpt);
+        assert!(prompt.contains("Answer with exactly one line of JSON"));
+        assert!(prompt.contains("Goal: done?"));
+        assert!(!prompt.contains("SWARM PROTOCOL"), "{prompt}");
+        assert!(!prompt.contains("```swarm"), "{prompt}");
+        // An agent turn keeps the contract.
+        let tooled = format_prompt(&self::request(), 0, ChatSite::ChatGpt);
+        assert!(tooled.contains("SWARM PROTOCOL") && tooled.contains("```swarm"));
     }
 
     #[test]

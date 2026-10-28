@@ -249,9 +249,11 @@ pub fn parse_subcommand(args: &str) -> SubCommand {
 /// assistant's last reply, and a report of what the turn did (the reply alone
 /// can claim more than the work shows).
 pub fn judge_messages(goal: &Goal, reply: &str, work: &str) -> (String, String) {
+    // A plain `VERDICT:` line, not JSON: asked for a JSON object, the ChatGPT site
+    // returns an empty turn, while this form is answered reliably (measured).
     let system = "You are a strict reviewer deciding whether a goal has been fully achieved. \
-        Answer with exactly one line of JSON and nothing else: \
-        {\"verdict\": \"done\" | \"continue\" | \"blocked\", \"reason\": \"one short sentence\"}. \
+        Answer with exactly one line in this form and nothing else: \
+        VERDICT: done - one short reason  (the first word after VERDICT: is done, continue or blocked). \
         Say \"done\" only when the assistant's reply and the work report together show the goal \
         (and every extra condition listed with it) is complete and verified. Say \"blocked\" only when it cannot proceed without something from \
         the user. Otherwise say \"continue\"."
@@ -274,9 +276,40 @@ fn cut(text: &str, max: usize) -> String {
     format!("\u{2026}{}", tail.into_iter().rev().collect::<String>())
 }
 
-/// Read the judge's reply: the first JSON object in it, tolerating a code fence
-/// or chatter around it.
+fn verdict_word(word: &str, reason: String) -> Option<Verdict> {
+    match word.to_ascii_lowercase().as_str() {
+        "done" | "complete" | "achieved" => Some(Verdict::Done(reason)),
+        "continue" | "wait" | "not_done" => Some(Verdict::Continue(reason)),
+        "blocked" | "unachievable" => Some(Verdict::Blocked(reason)),
+        _ => None,
+    }
+}
+
+/// `VERDICT: done - reason` on a line of its own, tolerating markdown emphasis
+/// or a bullet in front of it.
+fn parse_verdict_line(reply: &str) -> Option<Verdict> {
+    for line in reply.lines() {
+        let line = line.trim().trim_start_matches(|c: char| matches!(c, '*' | '`' | '-' | '>' | '#' | ' '));
+        let Some(rest) = line.get(..8).filter(|head| head.eq_ignore_ascii_case("verdict:")).map(|_| &line[8..]) else {
+            continue;
+        };
+        let rest = rest.trim().trim_start_matches('*').trim();
+        let end = rest.find(|c: char| !(c.is_ascii_alphabetic() || c == '_')).unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(end);
+        let reason = tail.trim().trim_start_matches(|c: char| matches!(c, '-' | '\u{2014}' | '\u{2013}' | ':' | '*' | ' ')).trim_end_matches(['*', '`']).trim().to_string();
+        if let Some(verdict) = verdict_word(word, reason) {
+            return Some(verdict);
+        }
+    }
+    None
+}
+
+/// Read the judge's reply: a `VERDICT:` line, else the first JSON object in it,
+/// tolerating a code fence or chatter around it.
 pub fn parse_verdict(reply: &str) -> Option<Verdict> {
+    if let Some(verdict) = parse_verdict_line(reply) {
+        return Some(verdict);
+    }
     let start = reply.find('{')?;
     let end = reply.rfind('}')?;
     if end < start {
@@ -357,6 +390,19 @@ mod tests {
         assert_eq!(parse_verdict("{\"verdict\": \"done\"}"), Some(Verdict::Done(String::new())));
         assert_eq!(parse_verdict("{\"verdict\": \"wait\", \"reason\": \"x\"}"), Some(Verdict::Continue("x".into())));
         assert_eq!(parse_verdict("no json here"), None);
+        // The plain line the judge is asked for.
+        assert_eq!(
+            parse_verdict("VERDICT: done - PR #353 merged into main and issue #335 is closed."),
+            Some(Verdict::Done("PR #353 merged into main and issue #335 is closed.".into()))
+        );
+        assert_eq!(
+            parse_verdict("**VERDICT:** continue \u{2014} no deployment work was recorded"),
+            Some(Verdict::Continue("no deployment work was recorded".into()))
+        );
+        assert_eq!(parse_verdict("Verdict: BLOCKED - needs an API key"), Some(Verdict::Blocked("needs an API key".into())));
+        assert_eq!(parse_verdict("VERDICT: done"), Some(Verdict::Done(String::new())));
+        assert_eq!(parse_verdict("VERDICT: maybe - unsure"), None);
+        assert_eq!(parse_verdict("the verdict: is not clear"), None);
         assert_eq!(parse_verdict("{\"verdict\": \"maybe\"}"), None);
         assert_eq!(parse_verdict("{not json}"), None);
         assert_eq!(parse_verdict("} backwards {"), None);
@@ -453,7 +499,7 @@ mod tests {
         let goal = Goal::new("make tests pass");
         let reply = format!("{}THE CONCLUSION", "padding ".repeat(2000));
         let (system, user) = judge_messages(&goal, &reply, "edited 2 files, ran 3 commands");
-        assert!(system.contains("\"verdict\""));
+        assert!(system.contains("VERDICT:") && !system.contains("JSON"), "plain line, not JSON: {system}");
         assert!(user.contains("make tests pass"));
         assert!(user.contains("edited 2 files, ran 3 commands"));
         assert!(user.contains("THE CONCLUSION"), "the tail of a long reply is what matters");
