@@ -400,6 +400,7 @@ async function readViaDom(page, previous, deadline) {
     return null;
   }, { selectors: TURN, previous, stateSelector: TURN_STATE }).catch(() => null);
 
+  let emptySince = 0;
   while (Date.now() < deadline) {
     const found = await read();
     if (found && !(await isGenerating(page))) {
@@ -407,6 +408,13 @@ async function readViaDom(page, previous, deadline) {
         .evaluate(fencedCode).catch(() => found.text);
       const text = String(rendered ?? '').trim();
       if (text) return { text, model: null, usage: null };
+      // A turn the site marks complete that holds no text (measured: a prompt that
+      // asks for a JSON object gets exactly this). Polling on would hold the request
+      // for the whole response window; report it so the caller can retry or change.
+      emptySince ||= Date.now();
+      if (Date.now() - emptySince > 15000) return { text: '', empty: true };
+    } else {
+      emptySince = 0;
     }
     await page.waitForTimeout(400);
   }
@@ -567,10 +575,33 @@ async function typePrompt(page, prompt) {
 // Measured: the site drops the 6th message of a chat, so rotate after the 5th.
 const MAX_TURNS_PER_CHAT = 5;
 
-async function sendLogged(session, prompt) {
+/// One request, one chat: delete the previous chat, open an empty one, and let the
+/// normal send path run against it. The caller sends the whole context every time,
+/// as an API would, so nothing depends on the site remembering earlier turns and
+/// the site's long-chat limits never come into play.
+async function resetToFreshChat(page) {
+  await deleteChat(page).catch(() => 'failed');
+  await startNewChat(page);
+  for (let tick = 0; tick < 40; tick += 1) {
+    if (await assistantCount(page) === 0 && await userTurnCount(page) === 0) break;
+    await page.waitForTimeout(250);
+  }
+  trace('fresh chat ready', page.url());
+}
+
+async function sendLogged(session, prompt, fresh = false) {
+  if (fresh) {
+    await resetToFreshChat(session.page);
+    session.log = [];
+    session.rotate = false;
+  }
   session.log.push({ role: 'user', text: prompt });
   const reply = await sendMessage(session, prompt);
   session.log.push({ role: 'assistant', text: reply.text });
+  if (fresh) {
+    session.log = [];
+    return reply;
+  }
   // The site stops accepting new messages in a chat after about six exchanges,
   // and it fails by dropping the send with no wall at all. Flag the session so
   // the next prompt opens a fresh chat carrying the transcript.
@@ -789,6 +820,11 @@ async function sendMessage(session, prompt) {
       if (remaining < 1000) break;
       const reply = await readViaDom(page, previousTurns, deadline);
       if (reply?.text) return { ...reply, chat_url: page.url(), source: 'dom' };
+      if (reply?.empty) {
+        throw new BridgeError(502,
+          'ChatGPT finished its turn with an empty reply; the prompt got no text back'
+          + ' (JSON-object requests do this: ask for a plain line instead)');
+      }
       break;
     }
     // A stop button is the site's own "still streaming" signal.
@@ -871,11 +907,14 @@ const server = http.createServer(async (req, res) => {
       }
       if (!session.replies.has(body.request_id)) {
         const previous = session.queue ?? Promise.resolve();
-        const next = previous.catch(() => {}).then(() => sendLogged(session, body.prompt));
+        const next = previous.catch(() => {}).then(() => sendLogged(session, body.prompt, body.fresh === true));
         session.pending = true;
         session.queue = next;
         next.finally(() => { session.pending = false; }).catch(() => {});
         session.replies.set(body.request_id, next);
+        // A failed request must be retryable: keeping its rejected promise would
+        // answer every retry of the same request_id with the same stored error.
+        next.catch(() => { session.replies.delete(body.request_id); });
       }
       const reply = await session.replies.get(body.request_id);
       return json(res, 200, reply);

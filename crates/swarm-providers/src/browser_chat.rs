@@ -304,12 +304,17 @@ impl Session for BrowserChatSession {
             )));
         }
         let mut sent_count = self.sent_count.lock().await;
-        if request.messages.len() < *sent_count {
+        let stateless = stateless_mode();
+        if !stateless && request.messages.len() < *sent_count {
             return Err(ProviderError::Session(format!(
                 "{site} conversation history moved backwards"
             )));
         }
-        let prompt = format_prompt(request, *sent_count, self.site);
+        let prompt = if stateless {
+            compile_prompt(request, self.site, prompt_budget())
+        } else {
+            format_prompt(request, *sent_count, self.site)
+        };
         if prompt.trim().is_empty() {
             return Err(ProviderError::Session(format!(
                 "no new {site} prompt to send"
@@ -320,7 +325,7 @@ impl Session for BrowserChatSession {
             .client
             .post(self.endpoint("/messages"))
             .timeout(request.deadline.unwrap_or_else(request_timeout))
-            .json(&json!({"request_id": request_id, "prompt": prompt}))
+            .json(&json!({"request_id": request_id, "prompt": prompt, "fresh": stateless}))
             .send()
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -385,7 +390,7 @@ fn format_prompt(request: &SendRequest, sent_count: usize, site: ChatSite) -> St
         return out;
     }
     if sent_count == 0 {
-        out.push_str("You are the reasoning model for Swarm, an agent runtime. Follow the SYSTEM instructions below. Swarm executes tools and returns their results. To request one tool, reply with only a fenced ```swarm JSON block containing {\"tool\":{\"name\":\"tool_name\",\"arguments\":{...}}}. Never claim a tool ran until Swarm returns its result.\n");
+        out.push_str(TOOL_PREAMBLE);
         if request.tool_protocol == ToolProtocol::Text {
             if let Some(tools) = request.tools_as_text() {
                 out.push_str(&tools);
@@ -419,15 +424,186 @@ fn format_prompt(request: &SendRequest, sent_count: usize, site: ChatSite) -> St
     // Chat sites have no function-calling channel and drift out of a preamble
     // sent once, and an "otherwise answer normally" allowance lets the site
     // complete the task in its own sandbox while Swarm records zero tool calls.
-    out.push_str(
-        "\nSWARM PROTOCOL (applies to this reply): you have no files, shell, browser, canvas, \
-         or download ability, and anything you make there does not exist for Swarm. Reply with \
-         exactly one fenced ```swarm block and nothing else: \
-         {\"tool\":{\"name\":\"<tool name from the list above>\",\"arguments\":{...}}}. Only when \
-         Swarm has already returned tool results that complete the task may you reply with a \
-         plain-text summary instead.",
-    );
+    out.push_str(TOOL_CONTRACT);
     let _ = name;
+    out
+}
+
+const TOOL_PREAMBLE: &str = "You are the reasoning model for Swarm, an agent runtime. Follow the SYSTEM instructions below. Swarm executes tools and returns their results. To request one tool, reply with only a fenced ```swarm JSON block containing {\"tool\":{\"name\":\"tool_name\",\"arguments\":{...}}}. Never claim a tool ran until Swarm returns its result.\n";
+
+const TOOL_CONTRACT: &str = "\nSWARM PROTOCOL (applies to this reply): you have no files, shell, browser, canvas, \
+     or download ability, and anything you make there does not exist for Swarm. Reply with \
+     exactly one fenced ```swarm block and nothing else: \
+     {\"tool\":{\"name\":\"<tool name from the list above>\",\"arguments\":{...}}}. Only when \
+     Swarm has already returned tool results that complete the task may you reply with a \
+     plain-text summary instead.";
+
+// ---- Stateless prompt compiler -------------------------------------------------
+//
+// An API client re-sends the whole conversation on every call and the server
+// caches the prefix; Codex and Claude Code both work that way and compact when the
+// window fills. A chat site cannot be driven like that incrementally: it drops the
+// 6th message of a chat and a long chat degrades. So each call here is its own
+// chat (`fresh`), and the prompt is compiled from Swarm's own transcript under a
+// size budget: goal and tools always in full, the newest steps in full, older steps
+// condensed to one line each, and the latest checklist kept verbatim.
+
+/// Characters of prompt the site takes comfortably in one message (18k measured).
+const DEFAULT_PROMPT_CHARS: usize = 16_000;
+const RESULT_CHARS: usize = 3_000;
+const NEWEST_RESULT_CHARS: usize = 6_000;
+const DIGEST_CHARS: usize = 2_500;
+const CHECKLIST_CHARS: usize = 1_500;
+
+fn prompt_budget() -> usize {
+    std::env::var("SWARM_PROMPT_CHARS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|chars| *chars >= 4_000)
+        .unwrap_or(DEFAULT_PROMPT_CHARS)
+}
+
+/// One chat per call is the default; `SWARM_BROWSER_STATEFUL=1` restores the
+/// incremental behaviour (new turns only, one long chat).
+fn stateless_mode() -> bool {
+    !matches!(std::env::var("SWARM_BROWSER_STATEFUL").as_deref(), Ok(value) if !value.is_empty() && value != "0")
+}
+
+fn clip_middle(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let head = max * 2 / 3;
+    let tail = max - head;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(count - tail).collect();
+    format!("{start}\n[... {} characters omitted ...]\n{end}", count - max)
+}
+
+fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        format!("{}\u{2026}", flat.chars().take(max).collect::<String>())
+    }
+}
+
+fn role_label(role: ChatRole) -> &'static str {
+    match role {
+        ChatRole::System => "SYSTEM",
+        ChatRole::User => "USER",
+        ChatRole::Assistant => "ASSISTANT",
+        ChatRole::Tool => "TOOL RESULT",
+    }
+}
+
+fn render_message(message: &swarm_core::message::ChatMessage, cap: usize) -> String {
+    let mut out = format!("\n[{}", role_label(message.role));
+    if let Some(id) = &message.tool_call_id {
+        out.push(' ');
+        out.push_str(id);
+    }
+    out.push_str("]\n");
+    out.push_str(&clip_middle(&message.content, cap));
+    if !message.tool_calls.is_empty() {
+        let calls = serde_json::to_string(&message.tool_calls).unwrap_or_default();
+        out.push_str("\nRequested tools: ");
+        out.push_str(&clip_middle(&calls, 2_000));
+    }
+    out.push('\n');
+    out
+}
+
+/// One line for a step that no longer fits in full.
+fn digest_line(message: &swarm_core::message::ChatMessage) -> String {
+    match message.role {
+        ChatRole::Tool => format!("  -> {}", one_line(&message.content, 90)),
+        _ if !message.tool_calls.is_empty() => message
+            .tool_calls
+            .iter()
+            .map(|call| format!("- {}({})", call.name, one_line(&call.arguments.to_string(), 70)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => format!("- {}: {}", role_label(message.role).to_lowercase(), one_line(&message.content, 90)),
+    }
+}
+
+/// The whole prompt for one call, built from the full transcript.
+fn compile_prompt(request: &SendRequest, site: ChatSite, budget: usize) -> String {
+    if request.tool_protocol != ToolProtocol::Text {
+        return format_prompt(request, 0, site);
+    }
+    let mut head = String::from(TOOL_PREAMBLE);
+    if let Some(tools) = request.tools_as_text() {
+        head.push_str(&tools);
+    }
+    // Everything before the model's first reply is the task itself: keep it whole.
+    let first_reply = request
+        .messages
+        .iter()
+        .position(|message| message.role == ChatRole::Assistant)
+        .unwrap_or(request.messages.len());
+    let (task, steps) = request.messages.split_at(first_reply);
+    for message in task {
+        head.push_str(&render_message(message, 6_000));
+    }
+    let room = budget.saturating_sub(head.chars().count() + TOOL_CONTRACT.chars().count());
+
+    // Newest first, in full, always keeping the latest call and its result.
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut first_kept = steps.len();
+    for (index, message) in steps.iter().enumerate().rev() {
+        let cap = if index + 1 == steps.len() { NEWEST_RESULT_CHARS } else { RESULT_CHARS };
+        let block = render_message(message, cap);
+        let size = block.chars().count();
+        if kept.len() >= 2 && used + size > room {
+            break;
+        }
+        used += size;
+        kept.push(block);
+        first_kept = index;
+    }
+    kept.reverse();
+
+    let mut out = head;
+    let earlier = &steps[..first_kept];
+    if !earlier.is_empty() {
+        let mut lines: Vec<String> = earlier.iter().map(digest_line).collect();
+        let mut total = 0usize;
+        let mut from = lines.len();
+        while from > 0 && total + lines[from - 1].chars().count() < DIGEST_CHARS {
+            from -= 1;
+            total += lines[from].chars().count() + 1;
+        }
+        let omitted = from;
+        lines.drain(..from);
+        out.push_str("\n[EARLIER STEPS, condensed");
+        if omitted > 0 {
+            out.push_str(&format!("; {omitted} older lines dropped"));
+        }
+        out.push_str("]\n");
+        out.push_str(&lines.join("\n"));
+        out.push('\n');
+        // The checklist is the agent's own record of progress: never condense it.
+        let checklist = earlier
+            .iter()
+            .rev()
+            .flat_map(|message| message.tool_calls.iter().rev())
+            .find(|call| call.name == "todo_write");
+        if let Some(call) = checklist {
+            out.push_str("[LATEST CHECKLIST]\n");
+            out.push_str(&clip_middle(&call.arguments.to_string(), CHECKLIST_CHARS));
+            out.push('\n');
+        }
+        out.push_str("[RECENT STEPS, in full]\n");
+    }
+    for block in kept {
+        out.push_str(&block);
+    }
+    out.push_str(TOOL_CONTRACT);
     out
 }
 
@@ -683,6 +859,78 @@ mod tests {
         assert!(!second.contains("make a file"));
         assert!(!second.contains("calling a tool"));
         assert!(second.contains("file written"));
+    }
+
+    fn step(n: usize, body: usize) -> Vec<ChatMessage> {
+        vec![
+            ChatMessage::assistant_with_tool_calls(
+                "",
+                vec![swarm_core::message::MessageToolCall {
+                    id: format!("c{n}"),
+                    name: "bash".into(),
+                    arguments: json!({"command": format!("run step {n}")}),
+                }],
+            ),
+            ChatMessage::tool(format!("c{n}"), format!("BEGIN{n}BEGIN {} END{n}END", "x".repeat(body))),
+        ]
+    }
+
+    fn convo(steps: usize, body: usize) -> SendRequest {
+        let mut messages = vec![ChatMessage::system("be careful"), ChatMessage::user("GOAL-TEXT fix issue 7")];
+        for n in 1..=steps {
+            messages.extend(step(n, body));
+        }
+        let mut request = SendRequest::new(messages);
+        request.tool_protocol = ToolProtocol::Text;
+        request
+    }
+
+    #[test]
+    fn a_short_conversation_is_sent_whole_every_time() {
+        let prompt = compile_prompt(&convo(2, 200), ChatSite::ChatGpt, 16_000);
+        for needle in ["GOAL-TEXT", "END1END", "END2END", "SWARM PROTOCOL"] {
+            assert!(prompt.contains(needle), "{needle} missing");
+        }
+        assert!(!prompt.contains("EARLIER STEPS"), "nothing to condense yet");
+    }
+
+    #[test]
+    fn a_long_conversation_condenses_old_steps_and_keeps_what_matters() {
+        let mut request = convo(30, 2_500);
+        // The agent's own checklist, early on: it must survive condensing.
+        request.messages.insert(
+            2,
+            ChatMessage::assistant_with_tool_calls(
+                "",
+                vec![swarm_core::message::MessageToolCall {
+                    id: "todo".into(),
+                    name: "todo_write".into(),
+                    arguments: json!({"todos": [{"content": "PIN-ME", "status": "pending"}]}),
+                }],
+            ),
+        );
+        request.messages.insert(3, ChatMessage::tool("todo", "Todo list updated"));
+        let prompt = compile_prompt(&request, ChatSite::ChatGpt, 12_000);
+        let full: usize = request.messages.iter().map(|m| m.content.len()).sum();
+        assert!(prompt.chars().count() < full / 3, "{} chars vs {full} raw", prompt.chars().count());
+        assert!(prompt.contains("GOAL-TEXT") && prompt.contains("be careful"), "the task stays whole");
+        assert!(prompt.contains("END30END"), "the newest result stays in full");
+        assert!(prompt.contains("EARLIER STEPS, condensed"), "older steps are condensed");
+        assert!(prompt.contains("PIN-ME"), "the latest checklist is kept verbatim");
+        assert!(!prompt.contains("END2END"), "an old result body is not carried");
+        assert!(prompt.contains("run step 2"), "but the call that made it is still listed");
+        assert!(prompt.ends_with(TOOL_CONTRACT), "the contract is the last thing read");
+    }
+
+    #[test]
+    fn the_prompt_depends_only_on_the_transcript() {
+        // Stateless: the same history compiles to the same prompt, so a retry or a
+        // fresh chat sees exactly what the first attempt saw.
+        let request = convo(12, 1_800);
+        assert_eq!(
+            compile_prompt(&request, ChatSite::ChatGpt, 10_000),
+            compile_prompt(&request, ChatSite::ChatGpt, 10_000)
+        );
     }
 
     #[test]
