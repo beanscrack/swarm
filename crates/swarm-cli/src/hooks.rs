@@ -384,10 +384,8 @@ fn judge(ran: &Ran, timeout: Duration) -> Verdict {
 /// Run `command` through the shell with `input` on stdin.
 async fn run_command(command: &str, cwd: &Path, input: &Value, timeout: Duration) -> Ran {
     let failed = |problem: String| Ran { code: None, stdout: String::new(), stderr: String::new(), problem: Some(problem) };
-    let mut cmd = tokio::process::Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(cwd)
+    let mut cmd = crate::shell::shell().command(command);
+    cmd.current_dir(cwd)
         .env("SWARM_PROJECT_DIR", cwd)
         .env("CLAUDE_PROJECT_DIR", cwd)
         .stdin(Stdio::piped())
@@ -523,13 +521,15 @@ mod tests {
     async fn a_pre_hook_blocks_with_its_reason_and_sees_the_call_on_stdin() {
         let dir = tempfile::tempdir().unwrap();
         let seen = dir.path().join("seen.json");
+        let script = format!(
+            "cat > {seen}; grep -q rm -- {seen} && echo 'no rm here' >&2 && exit 2; exit 0",
+            seen = crate::shell::script_path(&seen)
+        );
+        // Serialise the settings: a raw `C:\Users\...` inside a JSON string
+        // literal is an invalid escape, and `parse` rightly rejects it.
         let hooks = hooks(
-            &format!(
-                r#"{{"hooks": {{"PreToolUse": [{{"matcher": "bash", "hooks": [
-                    {{"command": "cat > {}; grep -q rm -- {} && echo 'no rm here' >&2 && exit 2; exit 0"}}]}}]}}}}"#,
-                seen.display(),
-                seen.display()
-            ),
+            &json!({"hooks": {"PreToolUse": [{"matcher": "bash", "hooks": [{"command": script}]}]}})
+                .to_string(),
             dir.path(),
         );
         assert_eq!(hooks.before(&call("bash", json!({"command": "ls"}))).await, None);
@@ -583,7 +583,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("stopped.json");
         let hooks = hooks(
-            &format!(r#"{{"hooks": {{"Stop": [{{"hooks": [{{"command": "cat > {}"}}]}}]}}}}"#, out.display()),
+            &json!({"hooks": {"Stop": [{"hooks": [{"command": format!("cat > {}", crate::shell::script_path(&out))}]}]}})
+                .to_string(),
             dir.path(),
         );
         hooks.set_session("s2");

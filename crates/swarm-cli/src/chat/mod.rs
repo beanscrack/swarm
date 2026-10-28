@@ -195,6 +195,15 @@ impl Chat {
                 .map(|since| since.subsec_nanos() as usize)
                 .unwrap_or(0))
             % style::TIPS.len()];
+        // Hooks and `!` commands are shell scripts: without a POSIX shell,
+        // `;`, `&&` and `>` are parsed by cmd.exe and do something else.
+        let tip = match crate::shell::posix_available() {
+            true => tip.to_string(),
+            false => format!(
+                "{tip}  ·  {shell} only: set SWARM_SHELL to a POSIX shell for `;`, `&&` and `>` in hooks and ! commands",
+                shell = crate::shell::shell().label()
+            ),
+        };
         let mode_label = self.cfg.tools.approval.to_string();
         let workspace = self.workspace.display().to_string();
         self.ui.print(view::welcome(
@@ -209,7 +218,7 @@ impl Chat {
                 session_id: &self.session.id,
                 resumed_turns: self.session.turns.len(),
             },
-            tip,
+            &tip,
         ));
     }
 
@@ -607,10 +616,8 @@ pub(crate) fn remember_note(workspace: &std::path::Path, text: &str) -> Result<u
 /// `!cmd`: stdout then stderr, with a time limit; the child never reads the
 /// keyboard and does not outlive a cancelled call.
 async fn run_shell(workspace: PathBuf, command: String) -> (String, Option<i32>) {
-    let mut cmd = tokio::process::Command::new("/bin/sh");
-    cmd.arg("-c")
-        .arg(&command)
-        .current_dir(&workspace)
+    let mut cmd = crate::shell::shell().command(&command);
+    cmd.current_dir(&workspace)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -780,43 +787,48 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
         }
         quit = true;
     }
-    while !quit {
-        let due = chat.loop_job.as_ref().map(|job| job.next);
-        let action = tokio::select! {
-            // What you type always goes before the timer.
-            biased;
-            action = ui.recv() => match action {
-                Some(action) => action,
-                None => break,
-            },
-            () = async {
-                match due {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
+    // `quit` is decided by the goal block above and never changes inside the
+    // loop — the loop ends with `break` — so this is a guarded loop, not a
+    // while-loop.
+    if !quit {
+        'chat: loop {
+            let due = chat.loop_job.as_ref().map(|job| job.next);
+            let action = tokio::select! {
+                // What you type always goes before the timer.
+                biased;
+                action = ui.recv() => match action {
+                    Some(action) => action,
+                    None => break,
+                },
+                () = async {
+                    match due {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if chat.run_loop(&mut ui).await == Flow::Quit {
+                        break 'chat;
+                    }
+                    continue;
                 }
-            } => {
-                if chat.run_loop(&mut ui).await == Flow::Quit {
-                    break;
+            };
+            match action {
+                Action::Submit(text) => {
+                    if chat.submit(&mut ui, text).await == Flow::Quit {
+                        break 'chat;
+                    }
                 }
-                continue;
+                Action::Quit => break 'chat,
+                Action::CycleMode => chat.cycle_mode(),
+                Action::ToggleVerbose => chat.toggle_verbose(),
+                Action::Rewind => {
+                    if let Err(error) = chat.cmd_rewind("").await {
+                        chat.fail(&error);
+                    }
+                }
+                Action::Side(question) => chat.cmd_btw(&question).await,
+                Action::Interrupt => {}
             }
-        };
-        match action {
-            Action::Submit(text) => {
-                if chat.submit(&mut ui, text).await == Flow::Quit {
-                    break;
-                }
-            }
-            Action::Quit => break,
-            Action::CycleMode => chat.cycle_mode(),
-            Action::ToggleVerbose => chat.toggle_verbose(),
-            Action::Rewind => {
-                if let Err(error) = chat.cmd_rewind("").await {
-                    chat.fail(&error);
-                }
-            }
-            Action::Side(question) => chat.cmd_btw(&question).await,
-            Action::Interrupt => {}
         }
     }
     chat.save().await;
@@ -864,7 +876,7 @@ mod tests {
         if let Some(command) = agent_command {
             let mut provider = ProviderConfig::mock("agent", "scripted");
             provider.kind = ProviderKind::ManagedAgent;
-            provider.command = vec!["sh".into(), "-c".into(), command.into()];
+            provider.command = crate::shell::shell().argv(&command);
             provider.workspace_dir = Some(workspace.clone());
             cfg.provider = provider.name.clone();
             cfg.providers = vec![provider];
@@ -1148,7 +1160,8 @@ mod tests {
         let counter = rig.chat.workspace.join("stops");
         with_hooks(
             &mut rig,
-            &format!(r#"{{"hooks": {{"Stop": [{{"hooks": [{{"command": "echo x >> {}"}}]}}]}}}}"#, counter.display()),
+            &json!({"hooks": {"Stop": [{"hooks": [{"command": format!("echo x >> {}", crate::shell::script_path(&counter))}]}]}})
+                .to_string(),
         );
         rig.chat.goal = Some(Goal::new("keep going"));
         rig.chat.goal.as_mut().unwrap().max_turns = 3;
@@ -1381,16 +1394,29 @@ mod tests {
 
     #[tokio::test]
     async fn shell_commands_capture_both_streams_and_the_exit_code() {
+        if !crate::shell::posix_available() {
+            eprintln!("no POSIX shell: `;` chains and `>&2` need one");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (out, code) = run_shell(dir.path().to_path_buf(), "echo hello; echo oops >&2; exit 3".into()).await;
         assert!(out.contains("hello") && out.contains("oops"), "{out:?}");
         assert_eq!(code, Some(3));
         let (pwd, _) = run_shell(dir.path().to_path_buf(), "pwd".into()).await;
-        assert_eq!(pwd.trim(), dir.path().canonicalize().unwrap().to_string_lossy());
+        // Every shell spells the same directory differently: MSYS maps the temp
+        // root to `/tmp`, git-bash prints `/c/Users/...`, cmd prints `C:\...`.
+        // The last component is the one that proves `current_dir` took effect.
+        let want = dir.path().file_name().unwrap().to_string_lossy().into_owned();
+        let got = pwd.trim().replace('\\', "/");
+        assert!(got.ends_with(&want), "shell ran in {pwd:?}, wanted {dir:?}");
     }
 
     #[tokio::test]
     async fn a_shell_command_cannot_read_the_keyboard() {
+        if !crate::shell::posix_available() {
+            eprintln!("no POSIX shell: `cat` needs one");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
         let (out, code) = run_shell(dir.path().to_path_buf(), "cat; echo finished".into()).await;

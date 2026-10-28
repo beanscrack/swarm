@@ -38,7 +38,21 @@ use crate::provider::{
     ToolProtocol, build_chunks,
 };
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
+/// The consumer chat sites are a human-speed channel: a turn that streams a
+/// 4k-character tool payload can take a quarter of an hour, and the reply keeps
+/// arriving after a 10-minute window has closed, which turns a slow turn into a
+/// failed run. The window is generous by default; a fast self-hosted bridge can
+/// shorten it with SWARM_BROWSER_CHAT_TIMEOUT_MS.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1500);
+
+fn request_timeout() -> Duration {
+    std::env::var("SWARM_BROWSER_CHAT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis >= 30_000)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_TIMEOUT)
+}
 
 /// Which consumer chat site the bridge is driving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,7 +319,7 @@ impl Session for BrowserChatSession {
         let response = self
             .client
             .post(self.endpoint("/messages"))
-            .timeout(request.deadline.unwrap_or(DEFAULT_TIMEOUT))
+            .timeout(request.deadline.unwrap_or_else(request_timeout))
             .json(&json!({"request_id": request_id, "prompt": prompt}))
             .send()
             .await
@@ -398,44 +412,123 @@ fn format_prompt(request: &SendRequest, sent_count: usize, site: ChatSite) -> St
 /// contents are tracked so braces inside a file body cannot end the object.
 fn scan_tool_json(text: &str) -> Option<Value> {
     let bytes = text.as_bytes();
-    let mut depth = 0usize;
-    let mut start = 0usize;
+    let mut stack: Vec<u8> = Vec::new();
+    let mut start: Option<usize> = None;
     let mut in_string = false;
     let mut escaped = false;
     for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'"' && !escaped {
-            in_string = !in_string;
-        } else if *byte == b'\\' && in_string {
-            escaped = !escaped;
-            continue;
-        }
         if in_string {
-            escaped = false;
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
             continue;
         }
-        if *byte == b'{' {
-            if depth == 0 {
-                start = index;
+        match *byte {
+            b'"' => in_string = true,
+            open @ (b'{' | b'[') => {
+                if stack.is_empty() {
+                    start = Some(index);
+                }
+                stack.push(open);
             }
-            depth += 1;
-        } else if *byte == b'}' && depth > 0 {
-            depth -= 1;
-            if depth > 0 {
-                continue;
-            }
-            let candidate = &text[start..=index];
-            if !candidate.contains("\"tool\"") && !candidate.contains("\"tool_calls\"") {
-                continue;
-            }
-            if let Ok(parsed) = serde_json::from_str::<Value>(candidate) {
-                if parsed.get("tool").is_some() || parsed.get("tool_calls").is_some() {
-                    return Some(parsed);
+            b'}' | b']' => {
+                stack.pop();
+                if stack.is_empty() {
+                    if let Some(from) = start.take() {
+                        if let Some(parsed) = parse_tool_object(&text[from..=index]) {
+                            return Some(parsed);
+                        }
+                    }
                 }
             }
+            _ => {}
         }
-        escaped = false;
+    }
+    // The 2026 site can drop the last character of a rendered code block, so a
+    // real tool call can arrive one `}` short: `…"status":"pending"}}` where the
+    // source had three closers. That is a one-character channel loss, not a
+    // malformed plan, and losing it ends the run as "completed" mid-task. Close
+    // what is open, within a small budget, and only if nothing was cut mid-value.
+    if let (Some(from), false) = (start, stack.is_empty()) {
+        if stack.len() <= 4 {
+            if let Some(parsed) = parse_tool_object(&repair_truncated(&text[from..], &stack)) {
+                return Some(parsed);
+            }
+        }
     }
     None
+}
+
+fn parse_tool_object(candidate: &str) -> Option<Value> {
+    if !candidate.contains("\"tool\"") && !candidate.contains("\"tool_calls\"") {
+        return None;
+    }
+    let parsed = serde_json::from_str::<Value>(candidate).ok()?;
+    if parsed.get("tool").is_some() || parsed.get("tool_calls").is_some() {
+        Some(parsed)
+    } else {
+        None
+    }
+}
+
+/// Append the closers a truncated payload lost. Refuses (by returning the
+/// fragment unchanged, which then fails to parse) when the cut fell inside a
+/// string with content: that is a real truncation, and inventing a `"` there
+/// would hand a tool a silently shortened file body.
+fn repair_truncated(fragment: &str, stack: &[u8]) -> String {
+    let mut out = fragment.trim_end().trim_end_matches(',').to_string();
+    if out.ends_with('\\') {
+        out.pop();
+    }
+    match open_string_tail(&out) {
+        OpenString::None => {}
+        // `"args":{"path":"a.txt","content":""` — nothing lost but the closers.
+        OpenString::Empty => out.push('"'),
+        OpenString::Content => return fragment.to_string(),
+    }
+    for open in stack.iter().rev() {
+        out.push(if *open == b'{' { '}' } else { ']' });
+    }
+    out
+}
+
+enum OpenString {
+    None,
+    Empty,
+    Content,
+}
+
+fn open_string_tail(text: &str) -> OpenString {
+    let bytes = text.as_bytes();
+    let mut in_string = false;
+    let mut opened_at = 0usize;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+        } else if *byte == b'"' {
+            in_string = true;
+            opened_at = index;
+        }
+    }
+    if !in_string {
+        return OpenString::None;
+    }
+    if text[opened_at + 1..].is_empty() {
+        OpenString::Empty
+    } else {
+        OpenString::Content
+    }
 }
 
 /// Reads a Swarm tool request out of rendered chat text.
@@ -636,6 +729,27 @@ mod tests {
         let calls = parse_tool_calls(text, "req").unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "write_file");
+    }
+
+    #[test]
+    fn tool_request_survives_a_dropped_closing_brace() {
+        // Captured live: the site rendered the code block one character short,
+        // `…"status":"pending"}}` where the source had `]}}}`. Losing that call
+        // ended a 20-minute run as "completed" with the work half done.
+        let text = "swarm{\"tool\":{\"name\":\"todo_write\",\"arguments\":{\"todos\":[{\"content\":\"Identify the fixture-v1 composition\",\"activeForm\":\"Checking docs\",\"status\":\"in_progress\"},{\"content\":\"Run go build ./... and go test ./cmd/coalign-analyze/...\",\"status\":\"pending\"}]}}";
+        let calls = parse_tool_calls(text, "req").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "todo_write");
+        let todos = calls[0].arguments["todos"].as_array().unwrap();
+        assert_eq!(todos.len(), 2);
+    }
+
+    #[test]
+    fn a_payload_cut_mid_string_is_not_repaired() {
+        // The same one-character budget must not invent a closing quote inside a
+        // file body: that would write a silently truncated file.
+        let text = "swarm{\"tool\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.txt\",\"content\":\"package main\\nfunc main() { fmt.Println(";
+        assert!(parse_tool_calls(text, "req").unwrap().is_empty());
     }
 
     #[test]

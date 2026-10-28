@@ -166,13 +166,11 @@ impl ToolExecutor {
     }
 
     async fn run_shell(&self, command: &str, timeout: Duration) -> ToolResult {
-        let (prog, args): (&str, Vec<String>) = if cfg!(windows) {
-            ("cmd", vec!["/C".to_string(), command.to_string()])
-        } else {
-            ("/bin/sh", vec!["-c".to_string(), command.to_string()])
-        };
-        let mut cmd = tokio::process::Command::new(prog);
-        cmd.args(args);
+        // The tool is called `bash` and models write POSIX for it, so prefer a
+        // real sh (git-bash ships one on most Windows dev boxes). `cmd /C` is
+        // the last resort, not the Windows default: `pwd; ls -la` is exit 255
+        // there, and the agent burns a turn rediscovering cmd syntax.
+        let mut cmd = crate::shell::shell().command(command);
         cmd.current_dir(&self.config.workspace_root);
         // A tool must never read the user's keyboard, and an abandoned call (Ctrl+C,
         // a timeout) must not leave its process running.

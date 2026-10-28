@@ -15,6 +15,7 @@ mod catalog;
 mod error;
 mod executor;
 mod sandbox;
+pub mod shell;
 pub mod todo;
 
 pub use catalog::builtin_catalog;

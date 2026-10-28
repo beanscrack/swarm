@@ -3,6 +3,7 @@
 mod approval;
 mod chat;
 mod style;
+mod shell;
 mod commands;
 mod custom;
 mod hooks;

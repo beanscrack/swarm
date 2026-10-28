@@ -69,8 +69,13 @@ fn walk(root: &Path) -> Vec<String> {
                 .strip_prefix(root)
                 .unwrap_or(Path::new(""))
                 .join(&name)
-                .to_string_lossy()
-                .into_owned();
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                // Forward slashes everywhere: the picker shows and matches these,
+                // and a Windows `src\main.rs` never matches the `src/main.rs` a
+                // user types (or an `@` completion expands to).
+                .collect::<Vec<_>>()
+                .join("/");
             if is_dir {
                 out.push(format!("{relative}/"));
                 if depth + 1 < MAX_DEPTH {
