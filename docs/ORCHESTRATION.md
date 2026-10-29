@@ -47,7 +47,7 @@ completed.
 | `swarm job submit --goal TEXT [--repo PATH] [--base REF] [--label L] [--key K] [--provider P] [--max-steps N]` | Starts a job, returns `{job_id, state, workspace, branch}` immediately. `--key` makes a repeat submit return the same job. `--workspace DIR` works in an existing directory instead. `--goal-file F` reads the goal from a file. |
 | `swarm job status ID` | `state` (`starting`, `running`, `completed`, `failed`, `cancelled`, `interrupted`), elapsed seconds, model and tool calls, last action, and whether it has reported. |
 | `swarm job wait ID... [--timeout S] [--any]` | Blocks until all jobs finish (first one with `--any`) or the timeout. Returns `done`, `timed_out`, `still_running` and every job's status. |
-| `swarm job result ID` | `report` (the worker's own status, summary, metrics, artifacts, notes), `summary` (its final message), `files_changed`, and for repo jobs `patch` (`path`, `stat`, `apply`). |
+| `swarm job result ID` | `outcome`, `report` (the worker's own status, summary, metrics, artifacts, notes), `summary` (its final message), `files_changed`, and for repo jobs `patch` (`path`, `stat`, `apply`). |
 | `swarm job cancel ID` | Stops the job's process tree. A finished job is left alone. |
 | `swarm job list [--label L] [--state S]` | One status per job. |
 | `swarm job resume ID` | Continues an `interrupted` job (its process died mid-run) with the same workspace and provider. Any other state is refused. |
@@ -107,6 +107,18 @@ list the patch file you made as an artifact.
 
 ## Things that matter
 
+- **Read `outcome`, not `state`.** `state` only says the process ended. A worker that
+  gave up, or never touched a file, still ends as `completed`. `outcome` is the
+  worker's own `success` / `partial` / `failed` when it reported, otherwise
+  `changed_without_report` (it edited files; read the patch) or `no_work` (it did
+  nothing; resubmit). In a live trial one of four workers ended `completed` with
+  `no_work`, after telling the caller its tools were unavailable.
+- **A key stays with a failed job.** Submitting the same `--key` returns the existing
+  job even if it failed, so retry under a new key.
+- **Re-measure the winner.** In that trial the workers' own numbers matched a clean
+  re-run to within about 1% (0.28 ms, 12.5 ms, 15.4 ms against a 20.1 ms baseline),
+  but they ran one at a time on an idle machine; with several workers benchmarking at
+  once they would not have.
 - **Workers run commands without asking.** Jobs start with `--approve-all`, inside
   their own worktree. That is the point of isolation, and also why the goal should
   name what is in bounds. A worker is not sandboxed from the rest of the machine.

@@ -70,3 +70,6 @@ a summary of what you changed and why it was faster or not, metrics {speedup:
 - A job that reports `interrupted` lost its process; `swarm_resume` continues it.
 - A worker that never calls `report_result` still leaves `summary` and
   `files_changed`; read those instead, and tighten the goal next time.
+- Read `outcome`, not `state`. A job can end `completed` having done nothing:
+  `outcome` is `no_work` then (resubmit under a new `key`; a key stays with a failed
+  job), or `changed_without_report` when it edited files without reporting.

@@ -136,6 +136,11 @@ fn provider_for(pc: &ProviderConfig) -> Result<Arc<dyn Provider>, RuntimeError> 
             if std::env::var("SWARM_MOCK_SCRIPT").as_deref() == Ok("coding") {
                 p.script = Some(coding_script());
             }
+            // `SWARM_MOCK_LATENCY_MS` makes every mock call take that long, for
+            // tests that need a worker which is still running.
+            if let Some(ms) = std::env::var("SWARM_MOCK_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                p.latency = std::time::Duration::from_millis(ms);
+            }
             let provider: Arc<dyn Provider> = Arc::new(p);
             Ok(provider)
         }

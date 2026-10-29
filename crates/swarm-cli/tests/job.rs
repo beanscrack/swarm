@@ -168,6 +168,85 @@ fn a_repo_job_gets_its_own_worktree_and_returns_a_patch() {
     assert!(PathBuf::from(b["workspace"].as_str().unwrap()).exists(), "the other job is not touched");
 }
 
+// A caller that captures our output (a shell tool, an MCP host) must get its
+// answer when `submit` returns, not when the worker ends. On Windows the worker
+// used to inherit the caller's pipe, which held it open for the whole job.
+#[test]
+fn submit_returns_at_once_even_when_the_callers_output_is_captured() {
+    let jobs = Jobs::new();
+    let started = std::time::Instant::now();
+    // `output()` captures stdout and stderr through pipes and waits for them to close.
+    let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args(["job", "submit", "--provider", "mock", "--goal", "create hello.txt and say done", "--jobs"])
+        .arg(jobs.root())
+        .env("SWARM_MOCK_SCRIPT", "coding")
+        .env("SWARM_MOCK_LATENCY_MS", "6000") // three model calls: about 18 seconds of work
+        .env_remove("SWARM_PROVIDER")
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(took < std::time::Duration::from_secs(9), "submit blocked for {took:?}");
+    let id = serde_json::from_slice::<Value>(&output.stdout).unwrap()["job_id"].as_str().unwrap().to_string();
+
+    // The worker really is still running, and cancel stops it.
+    let status = jobs.ok(&["status", &id]);
+    assert!(matches!(status["state"].as_str(), Some("starting" | "running")), "{status}");
+    let cancelled = jobs.ok(&["cancel", &id]);
+    assert_eq!(cancelled["state"], "cancelled", "{cancelled}");
+    assert_eq!(jobs.ok(&["status", &id])["state"], "cancelled");
+}
+
+#[test]
+fn the_outcome_tells_apart_a_job_that_did_work_from_one_that_only_ended() {
+    let jobs = Jobs::new();
+    let id = jobs.submit(&[])["job_id"].as_str().unwrap().to_string();
+    jobs.finish(&id);
+    let done = jobs.ok(&["result", &id]);
+    // Changed files but no report_result call.
+    assert_eq!(done["outcome"], "changed_without_report", "{done}");
+
+    // A worker that does nothing (the plain mock only replies) ends as `completed`
+    // too, and the outcome says no work was done.
+    let idle = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args(["job", "submit", "--provider", "mock", "--goal", "do nothing at all", "--jobs"])
+        .arg(jobs.root())
+        .env_remove("SWARM_PROVIDER")
+        .env_remove("SWARM_MOCK_SCRIPT")
+        .output()
+        .unwrap();
+    let idle_id = serde_json::from_slice::<Value>(&idle.stdout).unwrap()["job_id"].as_str().unwrap().to_string();
+    jobs.finish(&idle_id);
+    let nothing = jobs.ok(&["result", &idle_id]);
+    assert_eq!(nothing["state"], "completed");
+    assert_eq!(nothing["outcome"], "no_work", "{nothing}");
+}
+
+#[test]
+fn byproducts_of_running_things_are_not_part_of_the_patch() {
+    let jobs = Jobs::new();
+    let repo = jobs.dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("kernel.py"), "x = 1\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "baseline"]);
+    let submitted = jobs.submit(&["--repo", &repo.to_string_lossy()]);
+    let id = submitted["job_id"].as_str().unwrap().to_string();
+    jobs.finish(&id);
+    // What running a Python check inside the worktree leaves behind.
+    let ws = PathBuf::from(submitted["workspace"].as_str().unwrap());
+    std::fs::create_dir_all(ws.join("__pycache__")).unwrap();
+    std::fs::write(ws.join("__pycache__").join("kernel.cpython-312.pyc"), b"\x00\x01").unwrap();
+    std::fs::write(ws.join(".swarm_tmp_run.py"), "print(1)\n").unwrap();
+
+    let result = jobs.ok(&["result", &id]);
+    let patch = std::fs::read_to_string(result["patch"]["path"].as_str().unwrap()).unwrap();
+    assert!(patch.contains("hello.txt"), "the real change is there");
+    assert!(!patch.contains("pycache") && !patch.contains(".pyc") && !patch.contains("swarm_tmp_run"), "{patch}");
+    assert!(result["patch"]["stat"].as_str().unwrap().contains("1 file changed"), "{result}");
+}
+
 #[test]
 fn unknown_jobs_bad_input_and_finished_jobs_are_handled() {
     let jobs = Jobs::new();

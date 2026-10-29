@@ -339,6 +339,33 @@ fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt;
     // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: outlives the caller, no console.
     command.creation_flags(0x0000_0008 | 0x0000_0200);
+    stop_inheriting_stdio();
+}
+
+/// Windows lets a child inherit every inheritable handle its parent has, not only
+/// the three it was given. A caller that captures our output (a shell tool, an MCP
+/// host) hands us an inheritable pipe, the worker inherits it, and the pipe never
+/// closes until the worker exits, so `submit` appears to block for the whole job.
+/// Marking our own standard handles non-inheritable before the spawn closes that
+/// leak; the worker still gets its explicit log file as stdout and stderr.
+#[cfg(windows)]
+fn stop_inheriting_stdio() {
+    use std::ffi::c_void;
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    for which in [-10i32, -11, -12] {
+        // SAFETY: plain Win32 calls on the process's own standard handles; an
+        // invalid or null handle makes SetHandleInformation fail, which we ignore.
+        unsafe {
+            let handle = GetStdHandle(which as u32);
+            if !handle.is_null() && handle as isize != -1 {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -540,14 +567,23 @@ fn write_patch(spec: &JobSpec, dir: &Path) -> Option<Value> {
     if !ws.exists() {
         return None;
     }
-    git(ws, &["add", "-N", "."]).ok();
-    let patch = Command::new("git").arg("-C").arg(ws).args(["diff", "--binary", base]).output().ok()?;
+    // Byte-code caches and the Python tool's temp script are by-products of running
+    // things, not part of what the worker changed.
+    let skip = [":(exclude)**/__pycache__/**", ":(exclude)*.pyc", ":(exclude).swarm_tmp_run.py"];
+    let mut add = vec!["add", "-N", "--", "."];
+    add.extend(skip);
+    git(ws, &add).ok();
+    let mut diff = vec!["diff", "--binary", base, "--", "."];
+    diff.extend(skip);
+    let patch = Command::new("git").arg("-C").arg(ws).args(&diff).output().ok()?;
     if !patch.status.success() {
         return None;
     }
     let path = dir.join("patch.diff");
     fs::write(&path, &patch.stdout).ok()?;
-    let stat = git(ws, &["diff", "--shortstat", base]).unwrap_or_default();
+    let mut stat_args = vec!["diff", "--shortstat", base, "--", "."];
+    stat_args.extend(skip);
+    let stat = git(ws, &stat_args).unwrap_or_default();
     Some(json!({"path": path, "bytes": patch.stdout.len(), "stat": stat,
                 "apply": format!("git apply \"{}\"", path.display())}))
 }
@@ -575,9 +611,25 @@ pub async fn job_result(jobs: &Path, id: &str) -> Result<Value> {
     }
     out["summary"] = json!(final_summary(&snap.events));
     out["files_changed"] = json!(changed_files(&snap.events));
-    if let Some(patch) = write_patch(&spec, &dir) {
+    let patch = write_patch(&spec, &dir);
+    let changed = out["files_changed"].as_array().is_some_and(|files| !files.is_empty())
+        || patch.as_ref().is_some_and(|p| p["bytes"].as_u64().unwrap_or(0) > 0);
+    if let Some(patch) = patch {
         out["patch"] = patch;
     }
+    // What the job actually amounts to. `state` only says the process ended: a
+    // worker that gave up, or never touched a file, still ends as `completed`.
+    out["outcome"] = if !is_terminal(&snap.state) {
+        Value::Null
+    } else if let Some(status) = reported.as_ref().and_then(|r| r.get("status")).and_then(Value::as_str) {
+        json!(status)
+    } else if changed {
+        json!("changed_without_report")
+    } else if snap.state == "completed" {
+        json!("no_work")
+    } else {
+        json!(snap.state)
+    };
     if !is_terminal(&snap.state) {
         out["note"] = json!("the job has not finished; this is a partial view");
     } else if reported.is_none() {
