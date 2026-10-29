@@ -147,6 +147,32 @@ pub fn builtin_catalog() -> ToolCatalog {
     ));
 
     c.register(spec(
+        "report_result",
+        ToolKind::Custom,
+        "Report the outcome of your task as structured data to whoever launched you (a person or \
+         another agent). Call it once when you are finished, or when you must stop without finishing. \
+         `status` is success, partial or failed. `summary` says what you did and found. `metrics` holds \
+         numbers a caller can compare across attempts (for example speedup, latency_us, tests_passed). \
+         `artifacts` lists workspace files worth keeping (a patch, a benchmark log). It changes no files.",
+        json!({
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["success", "partial", "failed"]},
+                "summary": {"type": "string"},
+                "metrics": {
+                    "type": "object",
+                    "description": "Name to number, e.g. {\"speedup\": 1.8, \"latency_us\": 41.2}",
+                    "additionalProperties": {"type": "number"}
+                },
+                "artifacts": {"type": "array", "items": {"type": "string"}},
+                "notes": {"type": "string", "description": "Caveats, what you would try next"}
+            },
+            "required": ["status", "summary"]
+        }),
+        8 * 1024,
+    ));
+
+    c.register(spec(
         "create_directory",
         ToolKind::Write,
         "Create a directory (and parents) inside the workspace.",
@@ -221,6 +247,7 @@ mod tests {
             "list_files",
             "search_files",
             "todo_write",
+            "report_result",
             "create_directory",
             "run_tests",
             "python",

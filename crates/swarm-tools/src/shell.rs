@@ -70,27 +70,22 @@ fn detect() -> Shell {
         }
     }
     if cfg!(windows) {
-        for name in ["sh", "bash", "sh.exe", "bash.exe"] {
-            if let Some(found) = which(name) {
-                return Shell {
-                    program: found.display().to_string(),
-                    flag: "-c".to_string(),
-                    posix: true,
-                };
+        // Git for Windows' sh first. `bash.exe` on a Windows PATH is usually the WSL
+        // launcher in System32: with no distro installed it answers every command
+        // with "execvpe(/bin/bash) failed", and with one it runs a different
+        // filesystem from the workspace. Neither is the shell a model's POSIX
+        // one-liner expects, so it is never picked.
+        for candidate in git_shells() {
+            if candidate.is_file() {
+                return Shell { program: candidate.display().to_string(), flag: "-c".to_string(), posix: true };
             }
         }
-        // git-bash installed but not on PATH.
-        for candidate in [
-            r"C:\Program Files\Git\bin\sh.exe",
-            r"C:\Program Files\Git\usr\bin\sh.exe",
-            r"C:\Windows\System32\bash.exe",
-        ] {
-            if Path::new(candidate).is_file() {
-                return Shell {
-                    program: candidate.to_string(),
-                    flag: "-c".to_string(),
-                    posix: true,
-                };
+        for name in ["sh", "bash", "sh.exe", "bash.exe"] {
+            if let Some(found) = which(name) {
+                if is_wsl_launcher(&found) {
+                    continue;
+                }
+                return Shell { program: found.display().to_string(), flag: "-c".to_string(), posix: true };
             }
         }
         return Shell { program: "cmd".to_string(), flag: "/C".to_string(), posix: false };
@@ -105,6 +100,28 @@ fn detect() -> Shell {
         }
     }
     Shell { program: "sh".to_string(), flag: "-c".to_string(), posix: true }
+}
+
+/// Where Git for Windows keeps its `sh`: next to whatever `git` is on PATH, then
+/// the usual install directories.
+fn git_shells() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(root) = which("git").as_deref().and_then(Path::parent).and_then(Path::parent) {
+        roots.push(root.to_path_buf());
+    }
+    roots.push(PathBuf::from(r"C:\Program Files\Git"));
+    roots.push(PathBuf::from(r"C:\Program Files (x86)\Git"));
+    roots
+        .into_iter()
+        .flat_map(|root| [root.join("bin").join("sh.exe"), root.join("usr").join("bin").join("sh.exe")])
+        .collect()
+}
+
+/// The WSL launcher that Windows puts on PATH as `bash.exe` (System32, or the
+/// Store alias under WindowsApps).
+pub fn is_wsl_launcher(path: &Path) -> bool {
+    let text = path.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    text.contains("\\windows\\system32\\bash") || text.contains("\\windowsapps\\bash")
 }
 
 /// Whether a program name is one of the sh family.
@@ -208,6 +225,24 @@ mod tests {
         assert_eq!(shell().posix, posix_available());
         #[cfg(unix)]
         assert!(posix_available(), "unix always has a shell");
+    }
+
+    #[test]
+    fn the_wsl_launcher_is_recognised_and_git_bash_is_not() {
+        assert!(is_wsl_launcher(Path::new(r"C:\WINDOWS\system32\bash.exe")));
+        assert!(is_wsl_launcher(Path::new(r"C:\Windows\System32\bash.exe")));
+        assert!(is_wsl_launcher(Path::new(r"C:\Users\x\AppData\Local\Microsoft\WindowsApps\bash.exe")));
+        assert!(!is_wsl_launcher(Path::new(r"C:\Program Files\Git\bin\bash.exe")));
+        assert!(!is_wsl_launcher(Path::new("/bin/bash")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_chosen_shell_is_never_the_wsl_launcher() {
+        // `SWARM_SHELL` is an explicit choice and is honoured as given.
+        if std::env::var_os("SWARM_SHELL").is_none() {
+            assert!(!is_wsl_launcher(Path::new(&shell().program)), "{:?}", shell());
+        }
     }
 
     #[test]

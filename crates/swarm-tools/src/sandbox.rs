@@ -27,8 +27,14 @@ pub struct SandboxConfig {
 
 impl SandboxConfig {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        let root: PathBuf = workspace_root.into();
+        // A relative root (`./work`) breaks as soon as a tool runs a child process
+        // from inside it: a script path built from the root is then resolved
+        // against the root again (`work/work/x.py`). Absolute from the start, so
+        // every tool and every child sees the same path.
+        let root = std::path::absolute(&root).unwrap_or(root);
         Self {
-            workspace_root: workspace_root.into(),
+            workspace_root: root,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             output_cap_bytes: DEFAULT_OUTPUT_CAP,
             allow_network: true,

@@ -113,6 +113,7 @@ impl ToolExecutor {
             "list_files" => self.tool_list_files(&call.arguments),
             "search_files" => self.tool_search_files(&call.arguments),
             "todo_write" => self.tool_todo_write(&call.arguments),
+            "report_result" => self.tool_report_result(&call.arguments),
             "create_directory" => self.tool_create_directory(&call.arguments),
             "run_tests" => self.tool_run_tests(&call.arguments).await,
             "python" => self.tool_python(&call.arguments).await,
@@ -320,6 +321,61 @@ impl ToolExecutor {
             )),
             Err(error) => ToolResult::failure(error),
         }
+    }
+
+    /// Validates a structured result. The call itself is the record: the runtime
+    /// logs every call's arguments durably, and a caller reads the last accepted
+    /// one back, so nothing is written here. A bad report fails with the reason so
+    /// the model can fix and resend it.
+    fn tool_report_result(&self, input: &Value) -> ToolResult {
+        let status = Self::str(input, "status").unwrap_or("");
+        if !matches!(status, "success" | "partial" | "failed") {
+            return ToolResult::failure("report_result: 'status' must be success, partial or failed");
+        }
+        if Self::str(input, "summary").map(str::trim).unwrap_or("").is_empty() {
+            return ToolResult::failure("report_result: 'summary' is required");
+        }
+        let mut metrics = 0;
+        match input.get("metrics") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(map)) => {
+                for (name, value) in map {
+                    if !value.is_number() {
+                        return ToolResult::failure(format!("report_result: metric '{name}' must be a number"));
+                    }
+                }
+                metrics = map.len();
+            }
+            Some(_) => return ToolResult::failure("report_result: 'metrics' must be an object of numbers"),
+        }
+        let mut artifacts = 0;
+        match input.get("artifacts") {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(list)) => {
+                let mut missing = Vec::new();
+                for item in list {
+                    let Some(path) = item.as_str() else {
+                        return ToolResult::failure("report_result: 'artifacts' must be a list of paths");
+                    };
+                    match self.config.resolve(path) {
+                        Ok(abs) if abs.exists() => artifacts += 1,
+                        Ok(_) => missing.push(path.to_string()),
+                        Err(error) => return ToolResult::failure(error.to_string()),
+                    }
+                }
+                if !missing.is_empty() {
+                    return ToolResult::failure(format!(
+                        "report_result: artifact not found in the workspace: {}",
+                        missing.join(", ")
+                    ));
+                }
+            }
+            Some(_) => return ToolResult::failure("report_result: 'artifacts' must be a list of paths"),
+        }
+        ToolResult::ok(format!(
+            "Result recorded: status={status}, {metrics} metric(s), {artifacts} artifact(s). \
+             Your task is finished: reply with one short line confirming it."
+        ))
     }
 
     fn tool_create_directory(&self, input: &Value) -> ToolResult {
@@ -632,6 +688,71 @@ mod tests {
         assert!(!failed.success && failed.change.is_none(), "a failed edit changed nothing");
         let read = ex.execute(&call("5", "read_file", json!({"path": "n.txt"}))).await;
         assert!(read.change.is_none(), "reads change nothing");
+    }
+
+    // The default workspace is the relative `./work`. Tools that start a child
+    // process from inside it used to hand the child a path that was relative to
+    // the workspace and resolved it against the workspace again (`work/work/x.py`),
+    // so the simplest question ("what is 123 * 123") failed in both python and bash.
+    #[tokio::test]
+    async fn a_relative_workspace_works_for_tools_that_run_a_child_process() {
+        let relative = std::path::PathBuf::from(format!("rel_ws_{}", std::process::id()));
+        std::fs::create_dir_all(&relative).unwrap();
+        let config = SandboxConfig::new(&relative);
+        assert!(config.root().is_absolute(), "the root is made absolute: {:?}", config.root());
+        let ex = ToolExecutor::new(config);
+
+        let py = ex.execute(&call("1", "python", json!({"code": "print(123 * 123)"}))).await;
+        if py.error.as_deref().unwrap_or("").contains("failed to spawn python") {
+            eprintln!("python is not installed here; skipping that half");
+        } else {
+            assert!(py.success && py.content.contains("15129"), "python: {py:?}");
+        }
+        if crate::shell::posix_available() {
+            let sh = ex.execute(&call("2", "bash", json!({"command": "echo $((123 * 123))"}))).await;
+            assert!(sh.success && sh.content.contains("15129"), "bash: {sh:?}");
+        }
+        let _ = std::fs::remove_dir_all(&relative);
+    }
+
+    #[tokio::test]
+    async fn report_result_accepts_a_good_report_and_says_why_it_rejects_a_bad_one() {
+        let dir = tempdir().unwrap();
+        let ex = executor_in(&dir);
+        std::fs::write(dir.path().join("best.patch"), "diff").unwrap();
+        let ok = ex
+            .execute(&call(
+                "1",
+                "report_result",
+                json!({"status": "success", "summary": "fused the loads",
+                       "metrics": {"speedup": 1.8, "latency_us": 41.2}, "artifacts": ["best.patch"],
+                       "notes": "try tiling next"}),
+            ))
+            .await;
+        assert!(ok.success && ok.content.contains("2 metric(s), 1 artifact(s)"), "{}", ok.content);
+        assert!(ok.change.is_none(), "a report changes no files");
+        assert!(matches!(
+            ex.validate("report_result", &json!({"status": "success", "summary": "x"})),
+            ToolRequestValidation::AutoApprove { .. }
+        ));
+
+        let reason = |args: Value| async {
+            let r = ex.execute(&call("2", "report_result", args)).await;
+            assert!(!r.success, "{r:?}");
+            r.error.unwrap_or_default()
+        };
+        assert!(reason(json!({"status": "great", "summary": "x"})).await.contains("status"));
+        assert!(reason(json!({"status": "success", "summary": "  "})).await.contains("summary"));
+        assert!(reason(json!({"status": "success", "summary": "x", "metrics": {"speedup": "fast"}}))
+            .await
+            .contains("'speedup' must be a number"));
+        assert!(reason(json!({"status": "success", "summary": "x", "metrics": [1]})).await.contains("object of numbers"));
+        assert!(reason(json!({"status": "partial", "summary": "x", "artifacts": ["missing.log"]}))
+            .await
+            .contains("missing.log"));
+        assert!(!reason(json!({"status": "partial", "summary": "x", "artifacts": ["../outside"]})).await.is_empty());
+        // Minimal form: just a status and a summary.
+        assert!(ex.execute(&call("3", "report_result", json!({"status": "failed", "summary": "no gain"}))).await.success);
     }
 
     #[tokio::test]
