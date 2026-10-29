@@ -49,6 +49,11 @@ pub enum Command {
     Logs(LogsArgs),
     /// Open a live dashboard for runs, tasks, agents, and events.
     Tui(InspectArgs),
+    /// Run workers in the background and collect structured results (for an
+    /// orchestrating agent or a script; every verb prints JSON).
+    Job(crate::job::JobArgs),
+    /// Serve the job commands as MCP tools over stdio, for agents that speak MCP.
+    Mcp(crate::mcp::McpArgs),
 }
 
 #[derive(Debug, Args)]
@@ -239,6 +244,14 @@ pub async fn execute(cli: Cli) -> Result<CommandOutcome> {
         Some(Command::Logs(args)) => logs(args).await,
         Some(Command::Tui(args)) => {
             crate::tui::run(args.store.store, args.run_id).await?;
+            Ok(CommandOutcome::success(String::new()))
+        }
+        Some(Command::Job(args)) => {
+            let (text, success) = crate::job::run(args).await?;
+            Ok(CommandOutcome::plain(text, success))
+        }
+        Some(Command::Mcp(args)) => {
+            crate::mcp::serve(args).await?;
             Ok(CommandOutcome::success(String::new()))
         }
     }

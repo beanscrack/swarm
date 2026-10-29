@@ -12,7 +12,7 @@ use swarm_core::budget::BillingMode;
 use swarm_core::config::{ProviderConfig, RunConfig};
 use swarm_core::provider::ProviderKind;
 use swarm_core::ProviderId;
-use swarm_providers::{BrowserChatConfig, BrowserChatProvider, ChatSite, ManagedAgentConfig, ManagedAgentProvider, MockProvider, OpenAiConfig, OpenAiProvider, Provider, ProviderRegistry};
+use swarm_providers::{coding_script, BrowserChatConfig, BrowserChatProvider, ChatSite, ManagedAgentConfig, ManagedAgentProvider, MockProvider, OpenAiConfig, OpenAiProvider, Provider, ProviderRegistry};
 use swarm_scheduler::SchedulerConfig;
 
 use crate::error::RuntimeError;
@@ -130,6 +130,12 @@ fn provider_for(pc: &ProviderConfig) -> Result<Arc<dyn Provider>, RuntimeError> 
             let mut p = MockProvider::unowned();
             p.id = pc.name.clone();
             p.model = pc.model.clone();
+            // `SWARM_MOCK_SCRIPT=coding` makes the offline mock act like a coding
+            // agent (write hello.txt, check it, finish) instead of only replying:
+            // enough to exercise tools, patches and jobs without a model.
+            if std::env::var("SWARM_MOCK_SCRIPT").as_deref() == Ok("coding") {
+                p.script = Some(coding_script());
+            }
             let provider: Arc<dyn Provider> = Arc::new(p);
             Ok(provider)
         }

@@ -649,7 +649,8 @@ fn digest_line(message: &swarm_core::message::ChatMessage) -> String {
     }
 }
 
-/// The whole prompt for one call, built from the full transcript.
+/// The whole prompt for one call, built from the full transcript, without a summary.
+#[cfg(test)]
 fn compile_prompt(request: &SendRequest, site: ChatSite, budget: usize) -> String {
     compile_with_summary(request, site, budget, None).0
 }

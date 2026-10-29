@@ -58,6 +58,21 @@ To use a running OpenAI-compatible llama-server on `127.0.0.1:8080`:
 cargo run -p swarm-cli -- run "create hello.txt containing hello and verify it" --provider local --approve-all
 ```
 
+## Driving swarm from another agent
+
+An orchestrating agent (Hermes, Claude Code, Codex) can launch workers in the
+background and collect structured results, with `swarm job ...` (JSON on stdout) or
+`swarm mcp` (the same operations as MCP tools). Each worker can get its own git
+worktree and ends by reporting status, metrics and artifacts; the result carries a
+patch. See [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) and the ready-made skill in
+`skills/swarm-orchestrator/`.
+
+```sh
+swarm job submit --provider chatgpt-web --repo ./kernels --goal "Optimise matmul.cu with tiling; bench: ..."
+swarm job wait job_... --timeout 300
+swarm job result job_...
+```
+
 ## Interactive session
 
 Plain `swarm` (no subcommand) on a terminal opens a Claude Code-style session.
