@@ -111,6 +111,39 @@ for (const endpoint of cdpEndpoints) {
 }
 const sessions = new Map();
 let nextAccessPoint = 0;
+// Tabs one access point (one Playwright browser) will hold at once. Past that the
+// site slows every chat in the browser down, so another access point is used, and
+// when all are full a new session is refused instead of piling on.
+const maxTabs = Number(option('--max-tabs', '8'));
+if (!Number.isInteger(maxTabs) || maxTabs < 1) throw new Error('invalid --max-tabs');
+// Sessions being created count as load, so two sessions asked for at the same
+// moment do not both pick the same idle browser.
+const reserved = contexts.map(() => 0);
+// An access point whose browser was closed or crashed is skipped for a while.
+const deadUntil = new Map();
+const DEAD_FOR_MS = 30_000;
+
+function accessPointLoad() {
+  const load = reserved.slice();
+  for (const session of sessions.values()) load[session.accessPoint] += 1;
+  return load;
+}
+
+/// Access points to try, best first: live before dead, then least loaded, then
+/// rotating so equal loads share the work.
+function accessPointOrder() {
+  const load = accessPointLoad();
+  const now = Date.now();
+  const count = contexts.length;
+  const turn = nextAccessPoint++ % count;
+  const dead = (index) => ((deadUntil.get(index) ?? 0) > now ? 1 : 0);
+  return contexts.map((_, index) => index).sort((a, b) =>
+    dead(a) - dead(b) || load[a] - load[b] || ((a - turn + count) % count) - ((b - turn + count) % count));
+}
+
+const browserGone = (error) =>
+  /has been closed|Target closed|Browser closed|browser has disconnected|Connection closed|Protocol error/i
+    .test(error instanceof Error ? error.message : String(error));
 
 // Launched profiles get an onboarding tab. An attached Chrome may already have
 // user tabs; never navigate one of those away from its current page.
@@ -210,7 +243,33 @@ async function selectModel(page, model) {
 }
 
 async function createSession(model) {
-  const accessPoint = nextAccessPoint++ % contexts.length;
+  let lastError;
+  let full = 0;
+  for (const accessPoint of accessPointOrder()) {
+    if (accessPointLoad()[accessPoint] >= maxTabs) { full += 1; continue; }
+    reserved[accessPoint] += 1;
+    try {
+      return await createSessionOn(accessPoint, model);
+    } catch (error) {
+      // A closed browser is that access point's problem, not the caller's: mark it
+      // and use the next one. Sign-in walls, bad models and the like are the
+      // caller's to hear about.
+      if (!browserGone(error)) throw error;
+      deadUntil.set(accessPoint, Date.now() + DEAD_FOR_MS);
+      lastError = error;
+      console.log(`access point ${accessPoint} is unavailable for ${DEAD_FOR_MS / 1000}s: ${error.message.split('\n')[0]}`);
+    } finally {
+      reserved[accessPoint] -= 1;
+    }
+  }
+  if (lastError) {
+    throw new BridgeError(503, `no access point is usable (last error: ${lastError.message.split('\n')[0]})`);
+  }
+  throw new BridgeError(503,
+    `all ${full} access point(s) are at the ${maxTabs}-tab limit; close a session or add an access point (--cdp / --profile)`);
+}
+
+async function createSessionOn(accessPoint, model) {
   const context = contexts[accessPoint];
   const page = await context.newPage();
   try {
@@ -882,6 +941,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         ready: true, sessions: sessions.size, access_points: contexts.length,
         chat_url: chatUrl, reply_source: useApi ? 'api' : 'dom',
+        // Per access point: open sessions, and which are skipped as unavailable.
+        access_point_sessions: accessPointLoad(), max_tabs: maxTabs,
+        unavailable: contexts.map((_, index) => index).filter((index) => (deadUntil.get(index) ?? 0) > Date.now()),
       });
     }
     if (req.method === 'POST' && path === '/sessions') {

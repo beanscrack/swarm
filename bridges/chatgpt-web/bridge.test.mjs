@@ -146,6 +146,60 @@ test('model picker selection, plan-gated model, unknown model', { timeout: 90000
   });
 });
 
+test('sessions are balanced over access points by load, and a freed slot is reused',
+  { timeout: 120000 }, async (t) => {
+  const fixture = fixtureServer();
+  await withBridge(t, { fixture }, async ({ base, post }) => {
+    const made = [];
+    for (let i = 0; i < 4; i += 1) made.push(await post('/sessions', { model: 'auto' }));
+    const count = (index) => made.filter((s) => s.access_point === index).length;
+    assert.deepEqual([count(0), count(1)], [2, 2], 'two browsers share four sessions evenly');
+    let health = await (await fetch(`${base}/health`)).json();
+    assert.deepEqual(health.access_point_sessions, [2, 2]);
+    assert.deepEqual(health.unavailable, []);
+
+    // Free a slot on one browser: the next session goes there, not round-robin.
+    const freed = made[0];
+    assert.equal((await fetch(`${base}/sessions/${freed.id}`, { method: 'DELETE' })).status, 200);
+    const next = await post('/sessions', { model: 'auto' });
+    assert.equal(next.access_point, freed.access_point, 'the least loaded browser takes it');
+    health = await (await fetch(`${base}/health`)).json();
+    assert.deepEqual(health.access_point_sessions, [2, 2]);
+  });
+});
+
+test('--max-tabs refuses a session when every access point is full',
+  { timeout: 120000 }, async (t) => {
+  const fixture = fixtureServer();
+  await withBridge(t, { fixture, extra: ['--max-tabs', '1'] }, async ({ post, status }) => {
+    await post('/sessions', { model: 'auto' });
+    await post('/sessions', { model: 'auto' });
+    const third = await status('/sessions', { model: 'auto' });
+    assert.equal(third.status, 503);
+    assert.match(third.body.error, /1-tab limit/);
+  });
+});
+
+test('fresh-chat requests run in parallel across access points and each gets its own chat',
+  { timeout: 120000 }, async (t) => {
+  const fixture = fixtureServer();
+  await withBridge(t, { fixture }, async ({ post }) => {
+    const sessions = [];
+    for (let i = 0; i < 4; i += 1) sessions.push(await post('/sessions', { model: 'auto' }));
+    // Two rounds, so every session also shows that a second fresh request in the
+    // same tab opens another chat instead of continuing the first.
+    for (const round of [1, 2]) {
+      const replies = await Promise.all(sessions.map((s, i) =>
+        post(`/sessions/${s.id}/messages`,
+          { request_id: `r${round}-${i}`, prompt: `agent ${i} round ${round}`, fresh: true })));
+      replies.forEach((reply, i) => assert.equal(reply.text, `REPLY:agent ${i} round ${round}`));
+      assert.equal(new Set(replies.map((r) => r.chat_url)).size, 4, 'four separate chats');
+      if (round === 1) globalThis.__firstChats = replies.map((r) => r.chat_url);
+      else replies.forEach((r, i) => assert.notEqual(r.chat_url, globalThis.__firstChats[i], 'a new chat per request'));
+    }
+  });
+});
+
 test('site rate limit surfaces as 429', { timeout: 90000 }, async (t) => {
   const fixture = fixtureServer();
   await withBridge(t, { fixture }, async ({ post, status }) => {

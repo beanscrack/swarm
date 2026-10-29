@@ -27,7 +27,7 @@ use swarm_core::event::{EventKind, RunEvent};
 use swarm_core::message::{ChatMessage, MessageToolCall};
 use swarm_core::run::Run;
 use swarm_core::task::Task;
-use swarm_core::tool::ToolRequestValidation;
+use swarm_core::tool::{ToolKind, ToolRequestValidation};
 use swarm_core::protocol::AgentPlan;
 use swarm_core::{AgentRole, ProviderId, StateMachine, TaskId, TaskState};
 use swarm_providers::{
@@ -67,6 +67,40 @@ pub struct AgentRunner {
 
 /// Tool output fed back to the model is capped this large (8 KiB).
 const MODEL_OUTPUT_CAP: usize = 8 * 1024;
+
+/// Read-only calls from one reply that may run at the same time.
+const MAX_PARALLEL_TOOLS: usize = 4;
+
+/// One tool call after it has been announced, validated and (if needed) approved,
+/// before it runs. `denial` is why it will not run, when `approved` is false.
+struct PreparedTool {
+    tc: NativeToolCall,
+    name: String,
+    approved: bool,
+    denial: Option<String>,
+    hook_call: HookCall,
+}
+
+/// Splits the calls of one reply into runs. A `true` marks a call that may share
+/// a run with its neighbours (up to `max` of them); a `false` call is a run on its
+/// own. The runs cover every index, in order, so effects keep the order they were
+/// requested in.
+fn plan_batches(concurrent: &[bool], max: usize) -> Vec<std::ops::Range<usize>> {
+    let max = max.max(1);
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < concurrent.len() {
+        let mut end = start + 1;
+        if concurrent[start] {
+            while end < concurrent.len() && concurrent[end] && end - start < max {
+                end += 1;
+            }
+        }
+        runs.push(start..end);
+        start = end;
+    }
+    runs
+}
 
 /// Inference retries per step, after the first attempt.
 const MAX_RETRIES: u32 = 3;
@@ -318,9 +352,7 @@ impl AgentRunner {
             cp.messages
                 .push(ChatMessage::assistant_with_tool_calls(resp.text.clone(), calls));
 
-            for tc in &resp.tool_calls {
-                self.process_tool(tc, run, agent, task, &mut cp, now).await?;
-            }
+            self.process_tools(&resp.tool_calls, run, agent, task, &mut cp, now).await?;
             self.save(run, agent, task, &cp, now).await?;
         }
     }
@@ -435,17 +467,69 @@ impl AgentRunner {
         Err(last.unwrap())
     }
 
-    /// Validates and executes one native tool call, appending the tool result
-    /// (capped) to the conversation and recording it durably.
-    async fn process_tool(
+    /// Validates and executes the tool calls of one model reply, appending each
+    /// result (capped) to the conversation and recording it durably.
+    ///
+    /// A reply may hold several calls. They are asked about and validated in the
+    /// order given, so approval prompts stay one at a time. Calls that only read
+    /// (files, search, symbols) and sit next to each other then run together, up to
+    /// [`MAX_PARALLEL_TOOLS`]; anything that writes or runs a command runs alone, in
+    /// order, so the effects land as if the calls had been made one by one. Results
+    /// are recorded in call order whatever order they finished in.
+    async fn process_tools(
         &self,
-        tc: &NativeToolCall,
+        calls: &[NativeToolCall],
         run: &Run,
         agent: &Agent,
         task: &Task,
         cp: &mut AgentCheckpoint,
         now: i64,
     ) -> anyhow::Result<()> {
+        let mut prepared = Vec::with_capacity(calls.len());
+        for tc in calls {
+            prepared.push(self.prepare_tool(tc, run, agent, task).await?);
+        }
+        let concurrent: Vec<bool> = prepared
+            .iter()
+            .map(|p| p.approved && self.is_read_only(&p.name))
+            .collect();
+        let mut results: Vec<Option<ToolResult>> = (0..prepared.len()).map(|_| None).collect();
+        for range in plan_batches(&concurrent, MAX_PARALLEL_TOOLS) {
+            let executions = range.clone().filter(|&i| prepared[i].approved).map(|i| {
+                let tc = &prepared[i].tc;
+                let call = ToolCall::new(tc.id.clone(), tc.name.clone(), tc.arguments.clone());
+                async move { (i, self.executor.execute(&call).await) }
+            });
+            for (i, result) in futures::future::join_all(executions).await {
+                results[i] = Some(result);
+            }
+        }
+        for (p, result) in prepared.into_iter().zip(results) {
+            self.finish_tool(p, result, run, agent, task, cp, now).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether a tool only reads, judged by the kind it was registered with.
+    fn is_read_only(&self, name: &str) -> bool {
+        self.executor.catalog().specs.iter().any(|spec| {
+            spec.name == name
+                && matches!(
+                    spec.kind,
+                    ToolKind::Read | ToolKind::Search | ToolKind::Symbol | ToolKind::InspectArtifact
+                )
+        })
+    }
+
+    /// Everything about one call that must happen in order and before it runs:
+    /// announce it, validate it, give hooks a chance to block it, and ask.
+    async fn prepare_tool(
+        &self,
+        tc: &NativeToolCall,
+        run: &Run,
+        agent: &Agent,
+        task: &Task,
+    ) -> anyhow::Result<PreparedTool> {
         let name = tc.name.clone();
         self.emit(
             run,
@@ -498,20 +582,10 @@ impl AgentRunner {
             true
         };
 
-        let (success, model_output, record, change) = if approved {
-            let call = ToolCall::new(tc.id.clone(), tc.name.clone(), tc.arguments.clone());
-            let result = self.executor.execute(&call).await;
-            let mut out = result.as_model_output();
-            if let Some(note) = match &self.hooks {
-                Some(hooks) => hooks.after(&hook_call, result.success, &out).await,
-                None => None,
-            } {
-                out.push_str(&format!("\n\n[hook] {note}"));
-            }
-            let change = result.change.clone();
-            (result.success, out, result.to_record(&tc.arguments), change)
+        let denial = if approved {
+            None
         } else {
-            let reason = match &validation {
+            Some(match &validation {
                 _ if hook_block.is_some() => {
                     format!("blocked by a hook: {}", hook_block.as_deref().unwrap_or_default())
                 }
@@ -524,11 +598,46 @@ impl AgentRunner {
                 }
                 ToolRequestValidation::AutoApprove { .. } => approval_denial
                     .unwrap_or_else(|| "tool call was not approved".to_string()),
-            };
-            let mut denied = ToolResult::failure(reason.clone());
-            denied.call_id = tc.id.clone();
-            denied.name = name.clone();
-            (false, reason, denied.to_record(&tc.arguments), None)
+            })
+        };
+        Ok(PreparedTool { tc: tc.clone(), name, approved, denial, hook_call })
+    }
+
+    /// Records one call's outcome: the hook note, the capped text the model sees,
+    /// the durable record and the usage. `result` is `None` for a call that was
+    /// denied and so never ran.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_tool(
+        &self,
+        prepared: PreparedTool,
+        result: Option<ToolResult>,
+        run: &Run,
+        agent: &Agent,
+        task: &Task,
+        cp: &mut AgentCheckpoint,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        let PreparedTool { tc, name, denial, hook_call, .. } = prepared;
+        let tc = &tc;
+        let (success, model_output, record, change) = match result {
+            Some(result) => {
+                let mut out = result.as_model_output();
+                if let Some(note) = match &self.hooks {
+                    Some(hooks) => hooks.after(&hook_call, result.success, &out).await,
+                    None => None,
+                } {
+                    out.push_str(&format!("\n\n[hook] {note}"));
+                }
+                let change = result.change.clone();
+                (result.success, out, result.to_record(&tc.arguments), change)
+            }
+            None => {
+                let reason = denial.unwrap_or_else(|| "tool call was not approved".to_string());
+                let mut denied = ToolResult::failure(reason.clone());
+                denied.call_id = tc.id.clone();
+                denied.name = name.clone();
+                (false, reason, denied.to_record(&tc.arguments), None)
+            }
         };
 
         let (model_text, truncated) = cap_for_model(&model_output);
@@ -938,6 +1047,69 @@ mod tests {
         assert_eq!(checkpoint.tool_calls.len(), 1);
         assert!(!checkpoint.tool_calls[0].success);
         assert_eq!(runner.store.load_stats(&run.id).await.unwrap().usage.tool_calls, 1);
+    }
+
+    #[test]
+    fn reads_share_a_run_and_everything_else_runs_alone_in_order() {
+        let none: Vec<std::ops::Range<usize>> = Vec::new();
+        assert_eq!(plan_batches(&[], 4), none);
+        assert_eq!(
+            plan_batches(&[true, true, false, true, true, true, true, true], 3),
+            vec![0..2, 2..3, 3..6, 6..8]
+        );
+        assert_eq!(plan_batches(&[false, false], 4), vec![0..1, 1..2]);
+        assert_eq!(
+            plan_batches(&[true; 3], 0),
+            vec![0..1, 1..2, 2..3],
+            "a zero cap still makes progress, one call at a time"
+        );
+    }
+
+    // One reply with many calls: results are recorded in call order, a write is
+    // seen by a read that follows it, and a denied call in the middle of a batch
+    // fails alone without stopping its neighbours.
+    #[tokio::test]
+    async fn one_reply_with_many_calls_records_results_in_call_order() {
+        let script = vec![
+            MockStep::tool_calls(vec![
+                NativeToolCall::new("c1", "read_file", json!({ "path": "a.txt" })),
+                NativeToolCall::new("c2", "read_file", json!({ "path": "b.txt" })),
+                NativeToolCall::new("c3", "write_file", json!({ "path": "d.txt", "content": "WRITTEN-D" })),
+                NativeToolCall::new("c4", "read_file", json!({ "path": "d.txt" })),
+                NativeToolCall::new("c5", "read_file", json!({ "path": "../outside.txt" })),
+                NativeToolCall::new("c6", "read_file", json!({ "path": "c.txt" })),
+            ]),
+            MockStep::text("done"),
+        ];
+        let (runner, run, task, mut agent, provider, dir) = fixture(script).await;
+        let ws = dir.path().join("ws");
+        for tool in ["read_file", "list_files", "search_files"] {
+            assert!(runner.is_read_only(tool), "{tool} only reads, so it may run alongside others");
+        }
+        for tool in ["write_file", "edit_file", "bash"] {
+            assert!(!runner.is_read_only(tool), "{tool} changes things, so it runs alone");
+        }
+        for (name, body) in [("a.txt", "AAA"), ("b.txt", "BBB"), ("c.txt", "CCC")] {
+            std::fs::write(ws.join(name), body).unwrap();
+        }
+        let result = runner.run(&run, &task, &mut agent, &provider).await.unwrap();
+        assert!(matches!(result, AgentOutcome::Completed { .. }), "got {result:?}");
+        let checkpoint = runner.store.load_checkpoint(&agent.id).await.unwrap().unwrap();
+        let results: Vec<(String, String)> = checkpoint
+            .messages
+            .iter()
+            .filter(|m| m.role == swarm_core::message::ChatRole::Tool)
+            .map(|m| (m.tool_call_id.clone().unwrap(), m.content.clone()))
+            .collect();
+        let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["c1", "c2", "c3", "c4", "c5", "c6"], "recorded in call order");
+        assert!(results[0].1.contains("AAA") && results[1].1.contains("BBB"));
+        assert!(results[3].1.contains("WRITTEN-D"), "a read after a write sees it: {}", results[3].1);
+        assert!(results[5].1.contains("CCC"), "a call after a denied one still runs: {}", results[5].1);
+        assert_eq!(checkpoint.tool_calls.len(), 6);
+        assert!(!checkpoint.tool_calls[4].success, "the escaping path is denied");
+        assert!(checkpoint.tool_calls[5].success);
+        assert_eq!(runner.store.load_stats(&run.id).await.unwrap().usage.tool_calls, 6);
     }
 
     /// Blocks anything named `blocked`, and tacks a note on to everything else.

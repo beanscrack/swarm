@@ -151,11 +151,38 @@ turns instead and needs no site API at all.
 
 ## Concurrency and rate limits
 
-Every `--profile` (or `--cdp`) is an access point, and sessions are handed out
-round-robin, so N signed-in profiles give N parallel chats. ChatGPT enforces
-per-account message caps: when a tab shows a limit banner, the bridge answers
-`429` and Swarm's quota gate marks that provider degraded and backs off. Add
-access points (`--profile ... --profile ...`) before raising `--agents`.
+Every `--profile` (or `--cdp`) is an access point: one Playwright browser. A new
+session goes to the access point with the fewest open chats (ties rotate), so
+several signed-in browsers share the agents evenly and a freed slot is reused.
+`--max-tabs N` (default 8) caps the chats one browser holds; when every browser
+is full a new session is refused with `503` instead of slowing them all down. A
+browser that was closed or crashed is skipped for 30 seconds and the session goes
+to the next one. `GET /health` shows `access_point_sessions`, `max_tabs` and
+`unavailable`.
+
+`start-pool.ps1 -Count 3` starts three Chrome browsers with separate profiles and
+ports and prints the bridge command to attach to all of them. Sign into ChatGPT
+once in each window; the login persists. Tell Swarm how many requests it may send
+at once with `SWARM_BROWSER_CONCURRENCY` (default 4, about 3 per browser).
+
+ChatGPT enforces per-account message caps, and every browser here is the same
+account unless you sign in differently: when a tab shows a limit banner, the
+bridge answers `429` and Swarm's quota gate marks that provider degraded and backs
+off. More browsers add parallelism, not quota.
+
+## Stateless calls and parallel tools
+
+Swarm sends each call as its own chat: `POST /sessions/{id}/messages` with
+`"fresh": true` deletes the session's previous chat, opens an empty one and sends
+the whole compiled prompt. The 6-message limit of a long chat never applies, and
+chats on different access points run in parallel. A turn the site marks complete
+with no text fails in about 15 seconds with `502` instead of holding the request.
+
+A reply may request several independent tools at once as
+`{"tool_calls":[...]}` (at most 6). The runtime asks about and validates them in
+order, runs neighbouring read-only calls (`read_file`, `list_files`,
+`search_files`) together, runs everything else alone in order, and records the
+results in call order. A write followed by a read of the same file sees the write.
 
 Replies stay in the bridge until Swarm reads them, and a retried request with
 the same `request_id` returns the stored reply, so a Swarm restart cannot

@@ -86,6 +86,18 @@ impl ChatSite {
     }
 }
 
+/// Requests Swarm sends to the bridge at once. Four suits one signed-in browser;
+/// with several access points behind the bridge (`--cdp` or `--profile` repeated,
+/// see `start-pool.ps1`) raise it with `SWARM_BROWSER_CONCURRENCY`, about three per
+/// browser.
+fn default_concurrency() -> u32 {
+    std::env::var("SWARM_BROWSER_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(4)
+}
+
 #[derive(Debug, Clone)]
 pub struct BrowserChatConfig {
     pub site: ChatSite,
@@ -102,7 +114,7 @@ impl BrowserChatConfig {
             base_url: base_url.into(),
             model: model.into(),
             billing: BillingMode::Subscription,
-            max_concurrency: 4,
+            max_concurrency: default_concurrency(),
         }
     }
 
@@ -501,12 +513,13 @@ fn format_prompt(request: &SendRequest, sent_count: usize, site: ChatSite) -> St
     out
 }
 
-const TOOL_PREAMBLE: &str = "You are the reasoning model for Swarm, an agent runtime. Follow the SYSTEM instructions below. Swarm executes tools and returns their results. To request one tool, reply with only a fenced ```swarm JSON block containing {\"tool\":{\"name\":\"tool_name\",\"arguments\":{...}}}. Never claim a tool ran until Swarm returns its result.\n";
+const TOOL_PREAMBLE: &str = "You are the reasoning model for Swarm, an agent runtime. Follow the SYSTEM instructions below. Swarm executes tools and returns their results. To request one tool, reply with only a fenced ```swarm JSON block containing {\"tool\":{\"name\":\"tool_name\",\"arguments\":{...}}}. Never claim a tool ran until Swarm returns its result. When several calls do not depend on each other's results (reading several files, searching and listing), request them together in one block as {\"tool_calls\":[{\"name\":\"tool_name\",\"arguments\":{...}},{\"name\":\"tool_name\",\"arguments\":{...}}]}, at most 6: read-only calls run at the same time, any other call runs on its own in the order you list, and you get every result back before your next reply. Never batch a call with one that needs its output.\n";
 
 const TOOL_CONTRACT: &str = "\nSWARM PROTOCOL (applies to this reply): you have no files, shell, browser, canvas, \
      or download ability, and anything you make there does not exist for Swarm. Reply with \
      exactly one fenced ```swarm block and nothing else: \
-     {\"tool\":{\"name\":\"<tool name from the list above>\",\"arguments\":{...}}}. Only when \
+     {\"tool\":{\"name\":\"<tool name from the list above>\",\"arguments\":{...}}} (or \
+     {\"tool_calls\":[...]} for independent calls). Only when \
      Swarm has already returned tool results that complete the task may you reply with a \
      plain-text summary instead.";
 
@@ -1176,6 +1189,36 @@ mod tests {
         assert!(parse_tool_calls("{\"plan\":{\"steps\":[]}}", "req")
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_batch_of_independent_calls_parses_in_order_with_distinct_ids() {
+        let text = "```swarm\n{\"tool_calls\":[\
+            {\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}},\
+            {\"name\":\"read_file\",\"arguments\":{\"path\":\"b.txt\"}},\
+            {\"name\":\"search_files\",\"arguments\":{\"pattern\":\"TODO\"}}]}\n```";
+        let calls = parse_tool_calls(text, "req-7").unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["read_file", "read_file", "search_files"]
+        );
+        assert_eq!(calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["req-7-0", "req-7-1", "req-7-2"]);
+        assert_eq!(calls[1].arguments["path"], "b.txt");
+        // One malformed entry rejects the whole reply rather than running half of it.
+        let bad = "```swarm\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}},{\"name\":\"read_file\"}]}\n```";
+        assert!(parse_tool_calls(bad, "r").is_err());
+        // The same batch survives the lost-fence rendering.
+        let rendered = "swarm{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}},{\"name\":\"read_file\",\"arguments\":{\"path\":\"b\"}}]}";
+        assert_eq!(parse_tool_calls(rendered, "r").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_prompt_tells_the_model_it_may_batch_independent_calls() {
+        let prompt = compile_prompt(&convo(1, 100), ChatSite::ChatGpt, 16_000);
+        assert!(prompt.contains("tool_calls") && prompt.contains("do not depend on each other"), "{prompt}");
+        assert!(prompt.contains("Never batch a call with one that needs its output"));
+        assert!(prompt.ends_with(TOOL_CONTRACT));
     }
 
     #[test]
