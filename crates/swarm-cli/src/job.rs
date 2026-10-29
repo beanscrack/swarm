@@ -32,6 +32,9 @@ use swarm_core::RunStatus;
 use swarm_core::event::{EventKind, RunEvent};
 use swarm_store::Store;
 
+/// Token budget of a job unless the caller sets one.
+const DEFAULT_JOB_MAX_TOKENS: u64 = 5_000_000;
+
 /// Appended to the goal so a worker knows its caller reads a structured report.
 const REPORT_FOOTER: &str = "\n\n---\nWhen you are done, call the report_result tool once with: status \
 (success, partial or failed), a short summary, metrics (numbers a caller can compare, such as speedup or \
@@ -118,6 +121,10 @@ pub struct SubmitArgs {
     /// Steps (model turns) the worker may take.
     #[arg(long)]
     pub max_steps: Option<u32>,
+    /// Tokens the worker may use over the whole job, input plus output, counted on
+    /// every call (the whole conversation is sent each time). Default 5000000.
+    #[arg(long)]
+    pub max_tokens: Option<u64>,
     /// Do not append the report_result instruction to the goal.
     #[arg(long)]
     pub no_report_footer: bool,
@@ -305,6 +312,9 @@ pub fn submit_job(jobs: &Path, args: SubmitArgs) -> Result<Value> {
     if let Some(steps) = args.max_steps {
         command.args(["--max-steps", &steps.to_string()]);
     }
+    // Jobs are autonomous and read real code, so they get far more than the 200000
+    // a plain run does (that figure is the offline mock's); it is still a bound.
+    command.args(["--max-tokens", &args.max_tokens.unwrap_or(DEFAULT_JOB_MAX_TOKENS).to_string()]);
     command.stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
     detach(&mut command);
     let child = command.spawn().context("start the job process")?;
@@ -479,11 +489,18 @@ async fn status_of(spec: &JobSpec, dir: &Path) -> Value {
             out["tool_calls"] = json!(stats.usage.tool_calls);
             out["tokens"] = json!(stats.usage.total_tokens());
         }
+        // Next to the usage so "ran out of budget" is visible without reading logs.
+        out["token_limit"] = json!(run.budget.max_total_tokens);
         out["last_action"] = last_action(&snap.events);
         out["reported"] = json!(reported_result(&snap.events).is_some());
     }
     if matches!(snap.state.as_str(), "failed" | "interrupted") {
-        out["log_tail"] = json!(tail(&dir.join("run.log"), 12));
+        let log_tail = tail(&dir.join("run.log"), 12);
+        // The run prints why it failed as a `reason:` line ("budget exceeded for
+        // tokens: requested N against limit M", "transport error: ...").
+        let reason = log_tail.lines().rev().find_map(|line| line.strip_prefix("reason: ")).map(str::to_string);
+        out["reason"] = json!(reason);
+        out["log_tail"] = json!(log_tail);
     }
     out
 }
@@ -623,12 +640,14 @@ pub async fn job_result(jobs: &Path, id: &str) -> Result<Value> {
         Value::Null
     } else if let Some(status) = reported.as_ref().and_then(|r| r.get("status")).and_then(Value::as_str) {
         json!(status)
+    } else if snap.state != "completed" {
+        // Failed, cancelled or interrupted without a report: say so, whatever it
+        // had already written (that is still in files_changed and the patch).
+        json!(snap.state)
     } else if changed {
         json!("changed_without_report")
-    } else if snap.state == "completed" {
-        json!("no_work")
     } else {
-        json!(snap.state)
+        json!("no_work")
     };
     if !is_terminal(&snap.state) {
         out["note"] = json!("the job has not finished; this is a partial view");

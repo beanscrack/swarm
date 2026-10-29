@@ -85,6 +85,11 @@ pub struct RunArgs {
     /// edit-test-commit tasks can exhaust before they finish.
     #[arg(long)]
     max_steps: Option<u32>,
+    /// Tokens (input plus output, over every call) the whole run may use. The
+    /// default is 200000, which a task that reads a large repository can spend in
+    /// a handful of calls.
+    #[arg(long)]
+    max_tokens: Option<u64>,
     /// Print only the final one-line summary (no live transcript).
     #[arg(long)]
     plain: bool,
@@ -277,6 +282,12 @@ fn run_config(args: &RunArgs) -> Result<RunConfig> {
             bail!("--max-steps must be at least 1");
         }
         cfg.budget.max_steps_per_agent = steps;
+    }
+    if let Some(tokens) = args.max_tokens {
+        if tokens == 0 {
+            bail!("--max-tokens must be at least 1");
+        }
+        cfg.budget.max_total_tokens = tokens;
     }
     apply_provider_overrides(
         &mut cfg,

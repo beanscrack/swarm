@@ -247,6 +247,31 @@ fn byproducts_of_running_things_are_not_part_of_the_patch() {
     assert!(result["patch"]["stat"].as_str().unwrap().contains("1 file changed"), "{result}");
 }
 
+// Found by an orchestrator whose workers died at 200000 tokens after 15 calls: a
+// job's token budget has to be settable, generous by default, and its exhaustion has
+// to read as exactly that, not as a worker that found nothing.
+#[test]
+fn the_token_budget_is_settable_generous_by_default_and_its_exhaustion_is_named() {
+    let jobs = Jobs::new();
+    let starved = jobs.submit(&["--max-tokens", "300"])["job_id"].as_str().unwrap().to_string();
+    // `wait` exits non-zero when a job did not complete, which is the point here.
+    let (waited, all_completed) = jobs.run(&["wait", &starved, "--timeout", "90"]);
+    assert!(waited["done"] == true && !all_completed, "{waited}");
+    let status = jobs.ok(&["status", &starved]);
+    assert_eq!(status["state"], "failed", "{status}");
+    assert_eq!(status["token_limit"], 300);
+    let reason = status["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("budget") && reason.contains("token"), "the reason names the budget: {status}");
+    assert_eq!(jobs.ok(&["result", &starved])["outcome"], "failed");
+
+    let normal = jobs.submit(&[])["job_id"].as_str().unwrap().to_string();
+    jobs.finish(&normal);
+    let status = jobs.ok(&["status", &normal]);
+    assert_eq!(status["state"], "completed", "{status}");
+    assert_eq!(status["token_limit"], 5_000_000, "a job's default is not the mock's 200000");
+    assert!(status.get("reason").is_none() || status["reason"].is_null());
+}
+
 #[test]
 fn unknown_jobs_bad_input_and_finished_jobs_are_handled() {
     let jobs = Jobs::new();

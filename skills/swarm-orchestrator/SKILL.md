@@ -70,6 +70,11 @@ a summary of what you changed and why it was faster or not, metrics {speedup:
 - A job that reports `interrupted` lost its process; `swarm_resume` continues it.
 - A worker that never calls `report_result` still leaves `summary` and
   `files_changed`; read those instead, and tighten the goal next time.
+- A `failed` job is not a worker that found nothing: read `reason`, `tokens` and
+  `token_limit` in `swarm_status`. Budget exhaustion is final (a failed run cannot be
+  resumed); resubmit with a larger `max_tokens` and `workspace` set to the failed
+  job's workspace so the new worker starts from the files already written. Big repos
+  burn tokens fast, since every call carries the whole conversation.
 - Read `outcome`, not `state`. A job can end `completed` having done nothing:
   `outcome` is `no_work` then (resubmit under a new `key`; a key stays with a failed
   job), or `changed_without_report` when it edited files without reporting.

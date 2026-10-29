@@ -44,8 +44,8 @@ completed.
 
 | Command | What it does |
 | --- | --- |
-| `swarm job submit --goal TEXT [--repo PATH] [--base REF] [--label L] [--key K] [--provider P] [--max-steps N]` | Starts a job, returns `{job_id, state, workspace, branch}` immediately. `--key` makes a repeat submit return the same job. `--workspace DIR` works in an existing directory instead. `--goal-file F` reads the goal from a file. |
-| `swarm job status ID` | `state` (`starting`, `running`, `completed`, `failed`, `cancelled`, `interrupted`), elapsed seconds, model and tool calls, last action, and whether it has reported. |
+| `swarm job submit --goal TEXT [--repo PATH] [--base REF] [--label L] [--key K] [--provider P] [--max-steps N] [--max-tokens N]` | Starts a job, returns `{job_id, state, workspace, branch}` immediately. `--key` makes a repeat submit return the same job. `--workspace DIR` works in an existing directory instead. `--goal-file F` reads the goal from a file. |
+| `swarm job status ID` | `state` (`starting`, `running`, `completed`, `failed`, `cancelled`, `interrupted`), elapsed seconds, model and tool calls, `tokens` used against `token_limit`, last action, whether it has reported, and for a failed job the `reason` (for example `budget exceeded for tokens: requested 236662 against limit 200000`). |
 | `swarm job wait ID... [--timeout S] [--any]` | Blocks until all jobs finish (first one with `--any`) or the timeout. Returns `done`, `timed_out`, `still_running` and every job's status. |
 | `swarm job result ID` | `outcome`, `report` (the worker's own status, summary, metrics, artifacts, notes), `summary` (its final message), `files_changed`, and for repo jobs `patch` (`path`, `stat`, `apply`). |
 | `swarm job cancel ID` | Stops the job's process tree. A finished job is left alone. |
@@ -106,6 +106,18 @@ list the patch file you made as an artifact.
 ```
 
 ## Things that matter
+
+- **Token budget.** A job may use 5,000,000 tokens unless you pass `--max-tokens`
+  (a plain `swarm run` defaults to 200,000, the offline mock's figure, which a task
+  that reads a large repository can spend in a handful of calls). Tokens are counted
+  on every call, and every call carries the whole conversation, so the cost grows
+  with context size times steps; `--max-steps` does not bound it. A job that hits the
+  limit ends `failed` and `status` says why, so read `tokens`, `token_limit` and
+  `reason` before concluding a worker found nothing. The failure is final: a run
+  that stopped on its budget cannot be resumed with more (tried: the run reports the
+  old failure). Submit a new job instead, with `--workspace` set to the failed job's
+  workspace so the new worker starts from the files already written, and a larger
+  `--max-tokens`.
 
 - **Read `outcome`, not `state`.** `state` only says the process ended. A worker that
   gave up, or never touched a file, still ends as `completed`. `outcome` is the

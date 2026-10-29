@@ -120,6 +120,7 @@ async fn call_tool(jobs: &Path, name: &str, arguments: &Value) -> Result<Value> 
                 model: text(arguments, "model"),
                 agents: number(arguments, "agents").map(|n| n as u32),
                 max_steps: number(arguments, "max_steps").map(|n| n as u32),
+                max_tokens: number(arguments, "max_tokens"),
                 no_report_footer: arguments.get("no_report_footer").and_then(Value::as_bool).unwrap_or(false),
                 ..Default::default()
             },
@@ -171,6 +172,7 @@ by reporting structured status and metrics, which swarm_result returns.",
                     "model": {"type": "string"},
                     "agents": {"type": "integer", "description": "Agents inside the job (default 1)."},
                     "max_steps": {"type": "integer", "description": "Model turns the worker may take (default 40)."},
+                    "max_tokens": {"type": "integer", "description": "Tokens the job may use in total, input plus output on every call (default 5000000). A job over a large repository can spend 200000 in a few calls, so raise it for big trees; a job that hits it fails with the reason in swarm_status."},
                     "no_report_footer": {"type": "boolean"}
                 },
                 "required": ["goal"]
