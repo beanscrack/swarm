@@ -438,6 +438,50 @@ async function fencedCode(element) {
   return rendered.trim();
 }
 
+/// Text of every side panel and dialog on the page, used to tell which one a click opened.
+async function panelTexts(page) {
+  return page.evaluate(() => [...document.querySelectorAll('aside, [role="dialog"], [role="complementary"]')]
+    .map((node) => node.innerText || '')).catch(() => []);
+}
+
+/// A model that cannot be talked out of it makes its "file" in ChatGPT's own sandbox: the reply is
+/// a card ("Created FINDINGS.md", buttons "Open preview of FINDINGS.md" and "Download file") and the
+/// text exists only in a side panel. Swarm sees a reply that claims a file and carries none of it, and
+/// the chat is deleted when the session closes, so the work is lost (four research workers lost their
+/// reports that way). Opening the preview puts the whole document into the page; read it and hand it
+/// back with the reply. Downloads are not used: a CDP-attached Chrome does not surface them.
+async function readAttachments(page, unitSelector) {
+  const unit = page.locator(unitSelector).last();
+  const buttons = unit.locator('button[aria-label^="Open preview of "]');
+  const count = Math.min(await buttons.count().catch(() => 0), 3);
+  const parts = [];
+  let total = 0;
+  for (let index = 0; index < count && total < 60000; index += 1) {
+    const button = buttons.nth(index);
+    const label = (await button.getAttribute('aria-label').catch(() => '')) || '';
+    const name = label.replace(/^Open preview of /, '').trim() || `attachment-${index + 1}`;
+    const before = await panelTexts(page);
+    await button.click({ timeout: 4000 }).catch(() => {});
+    // The panel opens with its title and fills in the document a moment later, so a first
+    // look reads only a header. Keep the longest new text and stop once it has held still.
+    let text = '';
+    let stable = 0;
+    for (let tick = 0; tick < 40 && (stable < 6 || text.length < 120); tick += 1) {
+      await page.waitForTimeout(250);
+      const fresh = (await panelTexts(page)).filter((value) => value.length > 20 && !before.includes(value));
+      const best = fresh.sort((a, b) => b.length - a.length)[0] || '';
+      if (best.length > text.length) { text = best; stable = 0; } else if (text) { stable += 1; }
+      if (tick >= 12 && stable >= 6) break;
+    }
+    trace('attachment', name, text.length, 'chars');
+    await page.keyboard.press('Escape').catch(() => {});
+    const body = text.trim() || '(the preview panel did not open, so the file content could not be read)';
+    parts.push(`[ATTACHMENT ${name}]\n${body}\n[/ATTACHMENT]`);
+    total += body.length;
+  }
+  return parts.length ? `\n\n${parts.join('\n\n')}` : '';
+}
+
 async function readViaDom(page, previous, deadline) {
   // Which markup shape the site is using is decided by which candidate has a
   // finished new turn, so all shapes are probed together. The "still
@@ -465,7 +509,8 @@ async function readViaDom(page, previous, deadline) {
     if (found && !(await isGenerating(page))) {
       const rendered = await page.locator(found.selector).last()
         .evaluate(fencedCode).catch(() => found.text);
-      const text = String(rendered ?? '').trim();
+      const attachments = await readAttachments(page, found.selector).catch(() => '');
+      const text = (String(rendered ?? '').trim() + attachments).trim();
       if (text) return { text, model: null, usage: null };
       // A turn the site marks complete that holds no text (measured: a prompt that
       // asks for a JSON object gets exactly this). Polling on would hold the request

@@ -200,6 +200,27 @@ test('fresh-chat requests run in parallel across access points and each gets its
   });
 });
 
+test('a file the model made in ChatGPT\'s own sandbox is read back from its preview panel',
+  { timeout: 90000 }, async (t) => {
+  const fixture = fixtureServer();
+  await withBridge(t, { fixture, extra: ['--no-api'] }, async ({ post }) => {
+    const session = await post('/sessions', { model: 'auto' });
+    const reply = await post(`/sessions/${session.id}/messages`,
+      { request_id: 'doc-1', prompt: 'make document please', fresh: true });
+    assert.equal(reply.source, 'dom');
+    assert.match(reply.text, /Created REPORT\.md/);
+    // The card alone would be a claim with no content; the panel text rides along.
+    assert.match(reply.text, /\[ATTACHMENT REPORT\.md\]/);
+    assert.match(reply.text, /DOC-LINE-1 the finding/);
+    assert.match(reply.text, /DOC-LINE-2 the detail/);
+    assert.match(reply.text, /\[\/ATTACHMENT\]/);
+    // An ordinary reply is untouched: no attachment block is invented.
+    const plain = await post(`/sessions/${session.id}/messages`,
+      { request_id: 'doc-2', prompt: 'just text', fresh: true });
+    assert.equal(plain.text, 'REPLY:just text');
+  });
+});
+
 test('site rate limit surfaces as 429', { timeout: 90000 }, async (t) => {
   const fixture = fixtureServer();
   await withBridge(t, { fixture }, async ({ post, status }) => {

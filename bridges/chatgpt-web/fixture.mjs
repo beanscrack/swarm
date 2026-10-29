@@ -146,6 +146,24 @@ const html = `<!doctype html><title>ChatGPT fixture</title>
         link.href = '/fixture/swarm.json';
         link.textContent = 'Download swarm.json';
         bubble.append(link);
+      } else if (prompt.startsWith('make document')) {
+        // The model "creates a file" in its own sandbox: only a card is in the reply, and the text
+        // lives in a side panel that opens when the preview button is pressed.
+        bubble.innerText = 'Created REPORT.md';
+        const name = document.createElement('span');
+        name.setAttribute('role', 'link');
+        name.setAttribute('aria-label', 'Open REPORT.md');
+        name.textContent = 'REPORT.md';
+        const preview = document.createElement('button');
+        preview.setAttribute('aria-label', 'Open preview of REPORT.md');
+        preview.onclick = () => {
+          const panel = document.createElement('aside');
+          panel.innerText = 'REPORT.md\\n\\nDOC-LINE-1 the finding\\nDOC-LINE-2 the detail';
+          document.body.append(panel);
+        };
+        const download = document.createElement('button');
+        download.setAttribute('aria-label', 'Download file');
+        bubble.append(name, preview, download);
       } else {
         bubble.innerText = 'REPLY:' + prompt.slice(0, 400);
       }
