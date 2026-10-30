@@ -21,7 +21,7 @@ use tokio::time::sleep;
 
 use swarm_core::agent::{Agent, AgentCheckpoint};
 use swarm_core::state::AgentState;
-use swarm_core::budget::BudgetUsage;
+use swarm_core::budget::{BudgetUsage, ResourceBudget};
 use swarm_core::config::ApprovalPolicy;
 use swarm_core::event::{EventKind, RunEvent};
 use swarm_core::message::{ChatMessage, MessageToolCall};
@@ -205,6 +205,14 @@ impl AgentRunner {
                 return self
                     .finish_failed(run, agent, task, format!("budget: {e}"), false)
                     .await;
+            }
+            // Budget-pressure steering: a worker that discovers the ceiling only by dying at
+            // it spends its last calls starting work it never reports. Nudge once per
+            // threshold with the real numbers; the level rides the checkpoint, so a resumed
+            // run does not repeat a nudge the agent already acted on.
+            if let Some(pressure) = budget_pressure(&run.budget, &stats.usage, cp.pressure_notified) {
+                cp.messages.push(ChatMessage::user(pressure.text));
+                cp.pressure_notified = pressure.level;
             }
             if !self.registry.gate.can_dispatch(&key) {
                 return self
@@ -776,8 +784,95 @@ fn cap_for_model(out: &str) -> (String, bool) {
     }
 }
 
+/// One budget-pressure nudge: the threshold that armed it and the message for the agent.
+struct Pressure {
+    level: u32,
+    text: String,
+}
+
+/// A nudge for an agent approaching a ceiling, at 60 / 80 / 95 percent of whichever ceiling
+/// binds first. `notified` is the highest level already sent, so each threshold fires at most
+/// once per run.
+///
+/// The failure mode this targets is a worker that discovers the ceiling only by dying at it:
+/// it spends its last calls starting work it never reports, and the orchestrator inherits an
+/// unfinished tree. The message carries the real numbers and asks for the deliverable, not for
+/// fewer words.
+fn budget_pressure(budget: &ResourceBudget, usage: &BudgetUsage, notified: u32) -> Option<Pressure> {
+    let ratio = |limit: u64, used: u64| -> f64 {
+        if limit == 0 {
+            0.0
+        } else {
+            used as f64 / limit as f64
+        }
+    };
+    let tokens = ratio(budget.max_total_tokens, usage.total_tokens());
+    let calls = ratio(budget.max_inference_calls, usage.inference_calls);
+    let (what, used, limit, ratio) = if tokens >= calls {
+        ("tokens", usage.total_tokens(), budget.max_total_tokens, tokens)
+    } else {
+        ("inference calls", usage.inference_calls, budget.max_inference_calls, calls)
+    };
+    let level = if ratio >= 0.95 {
+        95
+    } else if ratio >= 0.80 {
+        80
+    } else if ratio >= 0.60 {
+        60
+    } else {
+        return None;
+    };
+    if level <= notified {
+        return None;
+    }
+    Some(Pressure {
+        level,
+        text: format!(
+            "BUDGET CHECK ({level}% of {what}): {used} of {limit} {what} used. The run is stopped at \
+             the ceiling, mid-sentence, with no report. Do not start new work now: write your \
+             deliverable to a file immediately and append to it as you verify, then call \
+             report_result with what you have. A partial file with real numbers beats a killed run.",
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::budget_pressure;
+
+    #[test]
+    fn pressure_arms_at_the_thresholds_and_fires_once_each() {
+        let budget = ResourceBudget { max_total_tokens: 1000, max_inference_calls: 100, ..Default::default() };
+        let usage = |tokens: u64| BudgetUsage {
+            inference_calls: 10,
+            input_tokens: tokens,
+            output_tokens: 0,
+            spend_micros: 0,
+            tool_calls: 0,
+        };
+        assert!(budget_pressure(&budget, &usage(500), 0).is_none(), "half way is not pressure");
+        let armed = budget_pressure(&budget, &usage(600), 0).expect("60% arms");
+        assert_eq!(armed.level, 60);
+        assert!(armed.text.contains("60% of tokens"), "{}", armed.text);
+        assert!(budget_pressure(&budget, &usage(650), 60).is_none(), "one nudge per threshold");
+        assert_eq!(budget_pressure(&budget, &usage(960), 60).expect("95% arms").level, 95);
+    }
+
+    #[test]
+    fn the_tighter_ceiling_names_the_pressure() {
+        let budget =
+            ResourceBudget { max_total_tokens: 1_000_000, max_inference_calls: 100, ..Default::default() };
+        let usage = BudgetUsage {
+            inference_calls: 85,
+            input_tokens: 1000,
+            output_tokens: 0,
+            spend_micros: 0,
+            tool_calls: 0,
+        };
+        let armed = budget_pressure(&budget, &usage, 0).expect("the call ceiling binds first");
+        assert_eq!(armed.level, 80);
+        assert!(armed.text.contains("85 of 100 inference calls"), "{}", armed.text);
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use swarm_core::budget::ResourceBudget;

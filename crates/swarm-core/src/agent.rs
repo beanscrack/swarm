@@ -67,6 +67,10 @@ pub struct AgentCheckpoint {
     pub tool_calls: Vec<ToolCallRecord>,
     pub child_task_ids: Vec<TaskId>,
     pub usage: BudgetUsage,
+    /// Highest budget-pressure threshold already reported to the agent, in percent
+    /// (0 = never). Defaulted so checkpoints written before this field still load.
+    #[serde(default)]
+    pub pressure_notified: u32,
 }
 
 impl AgentCheckpoint {

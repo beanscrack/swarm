@@ -101,6 +101,16 @@ fn number(arguments: &Value, key: &str) -> Option<u64> {
     arguments.get(key).and_then(Value::as_u64)
 }
 
+fn strings(arguments: &Value, key: &str) -> Vec<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().filter_map(Value::as_str).map(str::to_string).filter(|s| !s.is_empty()).collect()
+        })
+        .unwrap_or_default()
+}
+
 fn job_id(arguments: &Value) -> Result<String> {
     text(arguments, "job_id").ok_or_else(|| anyhow::anyhow!("job_id is required"))
 }
@@ -117,10 +127,17 @@ async fn call_tool(jobs: &Path, name: &str, arguments: &Value) -> Result<Value> 
                 label: text(arguments, "label"),
                 key: text(arguments, "key"),
                 provider: text(arguments, "provider"),
+                base_url: text(arguments, "base_url"),
                 model: text(arguments, "model"),
                 agents: number(arguments, "agents").map(|n| n as u32),
                 max_steps: number(arguments, "max_steps").map(|n| n as u32),
                 max_tokens: number(arguments, "max_tokens"),
+                max_inference_calls: number(arguments, "max_inference_calls"),
+                max_wall_clock_secs: number(arguments, "max_wall_clock_secs"),
+                verify: text(arguments, "verify"),
+                max_rounds: number(arguments, "max_rounds").map(|n| n as u32),
+                verify_timeout_secs: number(arguments, "verify_timeout_secs"),
+                allow_push: strings(arguments, "allow_push"),
                 no_report_footer: arguments.get("no_report_footer").and_then(Value::as_bool).unwrap_or(false),
                 ..Default::default()
             },
@@ -144,7 +161,17 @@ async fn call_tool(jobs: &Path, name: &str, arguments: &Value) -> Result<Value> 
         "swarm_result" => job::job_result(jobs, &job_id(arguments)?).await,
         "swarm_cancel" => job::cancel_job(jobs, &job_id(arguments)?).await,
         "swarm_list" => job::list_jobs(jobs, text(arguments, "label").as_deref(), text(arguments, "state").as_deref()).await,
-        "swarm_resume" => job::resume_job(jobs, &job_id(arguments)?).await,
+        "swarm_resume" => job::resume_job(
+            jobs,
+            &job_id(arguments)?,
+            job::BudgetRaise {
+                max_tokens: number(arguments, "max_tokens"),
+                max_steps: number(arguments, "max_steps").map(|n| n as u32),
+                max_inference_calls: number(arguments, "max_inference_calls"),
+                max_wall_clock_secs: number(arguments, "max_wall_clock_secs"),
+            },
+        )
+        .await,
         "swarm_clean" => job::clean_job(jobs, &job_id(arguments)?),
         other => anyhow::bail!("unknown tool `{other}`"),
     }
@@ -170,9 +197,16 @@ by reporting structured status and metrics, which swarm_result returns.",
                     "key": {"type": "string", "description": "Idempotency key: the same key returns the same job."},
                     "provider": {"type": "string", "description": "Provider (mock, local, chatgpt-web, ...); default SWARM_PROVIDER."},
                     "model": {"type": "string"},
+                    "base_url": {"type": "string", "description": "Provider endpoint override, e.g. http://127.0.0.1:8790/v1 for a local OpenAI-compatible server. Without it the job inherits $SWARM_BASE_URL, which pins every MCP job to the host's configured provider (a browser bridge on some hosts, which stalls long runs)."},
                     "agents": {"type": "integer", "description": "Agents inside the job (default 1)."},
                     "max_steps": {"type": "integer", "description": "Model turns the worker may take (default 40)."},
+                    "max_inference_calls": {"type": "integer", "description": "Inference calls the worker may make. Defaults to max-steps x agents, so raising max-steps alone is enough; set this only to give a retrying worker more calls than its step budget."},
+                    "max_wall_clock_secs": {"type": "integer", "description": "Wall-clock limit for the job in seconds (default 3600). Raise it for repositories where builds and tests are slow; the run fails when it is exceeded."},
                     "max_tokens": {"type": "integer", "description": "Tokens the job may use in total, input plus output on every call (default 5000000). A job over a large repository can spend 200000 in a few calls, so raise it for big trees; a job that hits it fails with the reason in swarm_status."},
+                    "verify": {"type": "string", "description": "A command run in the workspace when the worker stops; exit code 0 means the work holds. If it fails, its output goes to a fresh worker on the same workspace (up to max_rounds). Result outcome is `verified` only when it passes, `verify_failed` otherwise. Use your repo's test/build gate, e.g. `go test ./...`."},
+                    "max_rounds": {"type": "integer", "description": "Worker runs a verify job may use, the first included (default 3)."},
+                    "verify_timeout_secs": {"type": "integer", "description": "Seconds one verify run may take (default 1800)."},
+                    "allow_push": {"type": "array", "items": {"type": "string"}, "description": "Refs the worker's shell may `git push` to: branch names, `remote/branch`, or `*` for anything. Omit (the default) to refuse every push from the worker - the orchestrator keeps remote writes. A guardrail on the command string, not a sandbox."},
                     "no_report_footer": {"type": "boolean"}
                 },
                 "required": ["goal"]
@@ -223,8 +257,22 @@ Use it when a worker is stuck or its approach has stopped being worth the time."
         {
             "name": "swarm_resume",
             "description": "Continue a job whose state is `interrupted` (its process died before the run finished): \
-same workspace, same provider, picking up from its saved progress. Any other state is refused.",
-            "inputSchema": {"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}
+same workspace, same provider, picking up from its saved progress. Works for an `interrupted` job \
+with no extra arguments, and for a `failed` job whose reason is budget exhaustion - which needs a \
+raised ceiling, since usage is cumulative: pass max_tokens / max_steps / max_inference_calls / \
+max_wall_clock_secs above what the job already spent (swarm_status reports them). A completed, \
+cancelled, or genuinely failed job is refused.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string"},
+                    "max_tokens": {"type": "integer", "description": "New whole-job token ceiling; must exceed the tokens already spent."},
+                    "max_steps": {"type": "integer", "description": "New per-agent step ceiling; also raises inference calls in step."},
+                    "max_inference_calls": {"type": "integer"},
+                    "max_wall_clock_secs": {"type": "integer"}
+                },
+                "required": ["job_id"]
+            }
         },
         {
             "name": "swarm_clean",
@@ -258,6 +306,18 @@ mod tests {
         for tool in list["result"]["tools"].as_array().unwrap() {
             assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
             assert!(tool["description"].as_str().unwrap().len() > 20);
+        }
+        // The submit schema must advertise every knob an MCP client needs: without
+        // base_url every MCP job is pinned to the host's $SWARM_BASE_URL provider.
+        let submit = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "swarm_submit")
+            .unwrap();
+        let props = submit["inputSchema"]["properties"].as_object().unwrap();
+        for key in ["base_url", "max_tokens", "max_inference_calls", "max_wall_clock_secs", "verify", "allow_push"] {
+            assert!(props.contains_key(key), "swarm_submit schema must advertise {key}");
         }
     }
 

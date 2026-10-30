@@ -81,6 +81,11 @@ pub struct RunArgs {
     model: Option<String>,
     #[arg(long)]
     base_url: Option<String>,
+    /// Refs this run's workers may `git push` to: a branch, `remote/branch`, or `*` for
+    /// anything. Repeatable. The default - no flag - blocks every push from the worker
+    /// shell, so the orchestrator keeps ownership of remote writes.
+    #[arg(long = "allow-push")]
+    allow_push: Vec<String>,
     /// Steps (model turns) each agent may take; the default is 40, which long
     /// edit-test-commit tasks can exhaust before they finish.
     #[arg(long)]
@@ -90,6 +95,14 @@ pub struct RunArgs {
     /// a handful of calls.
     #[arg(long)]
     max_tokens: Option<u64>,
+    /// Inference calls the whole run may make. Defaults to the run config's
+    /// pairing of agents x steps, and --max-steps raises it in step with itself.
+    #[arg(long)]
+    max_inference_calls: Option<u64>,
+    /// Wall-clock limit for the whole run in seconds (default 3600). A worker
+    /// over a large repository can spend most of an hour in builds and tests.
+    #[arg(long)]
+    max_wall_clock_secs: Option<u64>,
     /// Print only the final one-line summary (no live transcript).
     #[arg(long)]
     plain: bool,
@@ -163,6 +176,17 @@ pub struct ResumeArgs {
     base_url: Option<String>,
     #[arg(long)]
     agents: Option<u32>,
+    /// Raise the run's token ceiling. Usage is cumulative, so a run that died on
+    /// its budget resumes only with a ceiling above what it already spent.
+    #[arg(long)]
+    max_tokens: Option<u64>,
+    /// Raise the per-agent step ceiling (also raises inference calls in step).
+    #[arg(long)]
+    max_steps: Option<u32>,
+    #[arg(long)]
+    max_inference_calls: Option<u64>,
+    #[arg(long)]
+    max_wall_clock_secs: Option<u64>,
     #[arg(long)]
     approve_all: bool,
     #[arg(long)]
@@ -282,6 +306,26 @@ fn run_config(args: &RunArgs) -> Result<RunConfig> {
             bail!("--max-steps must be at least 1");
         }
         cfg.budget.max_steps_per_agent = steps;
+        // `max_steps_per_agent` and the run-wide `max_inference_calls` are
+        // paired in RunConfig (agents x steps). Raising only the first just
+        // moves the wall: the agent dies at the default 40 calls with
+        // `budget exceeded for inference_calls` instead of at its step limit.
+        cfg.budget.max_inference_calls = cfg
+            .budget
+            .max_inference_calls
+            .max(cfg.agents as u64 * steps as u64);
+    }
+    if let Some(calls) = args.max_inference_calls {
+        if calls == 0 {
+            bail!("--max-inference-calls must be at least 1");
+        }
+        cfg.budget.max_inference_calls = calls;
+    }
+    if let Some(secs) = args.max_wall_clock_secs {
+        if secs == 0 {
+            bail!("--max-wall-clock-secs must be at least 1");
+        }
+        cfg.budget.max_wall_clock_secs = secs;
     }
     if let Some(tokens) = args.max_tokens {
         if tokens == 0 {
@@ -417,7 +461,8 @@ pub(crate) fn tool_names(cfg: &RunConfig, workspace: &Path) -> Result<Vec<String
     let sandbox = SandboxConfig::new(workspace)
         .command_timeout(Duration::from_secs(cfg.tools.command_timeout_secs))
         .output_cap_bytes(cfg.tools.max_output_bytes)
-        .allow_network(cfg.tools.allow_network);
+        .allow_network(cfg.tools.allow_network)
+        .allow_push(cfg.tools.allow_push.clone());
     Ok(ToolExecutor::new(sandbox).tool_names())
 }
 
@@ -502,7 +547,8 @@ pub(crate) async fn drive_turn(
     let sandbox = SandboxConfig::new(workspace)
         .command_timeout(Duration::from_secs(cfg.tools.command_timeout_secs))
         .output_cap_bytes(cfg.tools.max_output_bytes)
-        .allow_network(cfg.tools.allow_network);
+        .allow_network(cfg.tools.allow_network)
+        .allow_push(cfg.tools.allow_push.clone());
     let executor = Arc::new(ToolExecutor::new(sandbox));
     let runtime = Runtime::new(store.clone(), registry, executor, scheduler)
         .with_approval(cfg.tools.approval)
@@ -687,7 +733,8 @@ pub(crate) async fn run_summary(store: &Store, id: &RunId) -> Result<String> {
 }
 
 async fn run(args: RunArgs) -> Result<CommandOutcome> {
-    let cfg = run_config(&args)?;
+    let mut cfg = run_config(&args)?;
+    cfg.tools.allow_push.extend(args.allow_push.iter().cloned());
     let workspace = workspace_for(&cfg, &args.workspace)?;
     std::fs::create_dir_all(&workspace)
         .with_context(|| format!("create workspace {}", workspace.display()))?;
@@ -708,6 +755,34 @@ async fn run(args: RunArgs) -> Result<CommandOutcome> {
         text: outcome_text(&outcome, args.plain || !tty),
         success: outcome.succeeded(),
     })
+}
+
+/// Raise (never lower) a run's ceilings, for resuming a run that stopped on budget.
+/// `max_steps` also raises inference calls in step, mirroring
+/// `apply_provider_overrides`, so the two ceilings cannot contradict each other.
+fn apply_budget_raise(
+    budget: &mut swarm_core::budget::ResourceBudget,
+    agent_target: u32,
+    max_tokens: Option<u64>,
+    max_steps: Option<u32>,
+    max_inference_calls: Option<u64>,
+    max_wall_clock_secs: Option<u64>,
+) {
+    if let Some(tokens) = max_tokens {
+        budget.max_total_tokens = budget.max_total_tokens.max(tokens);
+    }
+    if let Some(calls) = max_inference_calls {
+        budget.max_inference_calls = budget.max_inference_calls.max(calls);
+    }
+    if let Some(secs) = max_wall_clock_secs {
+        budget.max_wall_clock_secs = budget.max_wall_clock_secs.max(secs);
+    }
+    if let Some(steps) = max_steps {
+        budget.max_steps_per_agent = budget.max_steps_per_agent.max(steps);
+        budget.max_inference_calls = budget
+            .max_inference_calls
+            .max(u64::from(agent_target) * u64::from(steps));
+    }
 }
 
 /// Continue an unfinished run: same transcript, same approvals, no new run.
@@ -735,6 +810,38 @@ async fn resume(args: ResumeArgs) -> Result<CommandOutcome> {
     )?;
     cfg.model = run.model.clone().unwrap_or_else(|| cfg.model.clone());
     cfg.budget = run.budget;
+    apply_budget_raise(
+        &mut cfg.budget,
+        run.agent_target,
+        args.max_tokens,
+        args.max_steps,
+        args.max_inference_calls,
+        args.max_wall_clock_secs,
+    );
+    // The agent enforces the budget stored on the RUN ROW (swarm-runtime/src/agent.rs
+    // checks `run.budget` against cumulative usage before every inference call), so a
+    // raise must be persisted - a local cfg raise would be silently ignored.
+    if cfg.budget != run.budget {
+        let mut raised = run.clone();
+        raised.budget = cfg.budget;
+        store.update_run(&raised).await?;
+    }
+    // The raise is necessary but not sufficient: a budget death leaves the agent `failed`
+    // and its task `failed`, so the scheduler would have nothing to dispatch and the run
+    // would re-finalize, replaying the old reason. Revive them - the agent's conversation
+    // is checkpointed after every step, so the work is still there.
+    let raised_ceilings = args.max_tokens.is_some()
+        || args.max_steps.is_some()
+        || args.max_inference_calls.is_some()
+        || args.max_wall_clock_secs.is_some();
+    let revived = store.recover_budget_death(&id, swarm_core::time::now_millis(), raised_ceilings).await?;
+    if revived.reset_agents > 0 {
+        let mut running = store.load_run_required(&id).await?;
+        // Assignment, not `transition`: the run state machine has no failed -> running
+        // edge, because a budget death is a pause the machine does not model.
+        running.status = RunStatus::Running;
+        store.update_run(&running).await?;
+    }
     cfg.zero_cost = run.zero_cost;
     cfg.scheduler.zero_cost = run.zero_cost;
     let workspace = workspace_for(&cfg, &args.workspace)?;
@@ -967,6 +1074,28 @@ mod tests {
     use tempfile::TempDir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn a_resume_raise_only_raises_and_steps_carry_inference_calls() {
+        let mut budget = RunConfig::mock("goal", 1).budget;
+        budget.max_total_tokens = 100;
+        budget.max_inference_calls = 10;
+        budget.max_wall_clock_secs = 60;
+        budget.max_steps_per_agent = 10;
+        // Smaller ceilings are ignored: usage is cumulative, so lowering the ceiling
+        // on a resumed run would fail the very next inference call.
+        apply_budget_raise(&mut budget, 1, Some(50), None, Some(5), Some(30));
+        assert_eq!(
+            (budget.max_total_tokens, budget.max_inference_calls, budget.max_wall_clock_secs),
+            (100, 10, 60)
+        );
+        // Raising works, and raising steps raises inference calls in step.
+        apply_budget_raise(&mut budget, 2, Some(500), Some(60), None, Some(90));
+        assert_eq!(budget.max_total_tokens, 500);
+        assert_eq!(budget.max_wall_clock_secs, 90);
+        assert_eq!(budget.max_steps_per_agent, 60);
+        assert!(budget.max_inference_calls >= 120, "steps x agents, got {}", budget.max_inference_calls);
+    }
 
     #[tokio::test]
     async fn mock_run_is_inspectable() {

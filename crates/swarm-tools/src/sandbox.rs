@@ -23,6 +23,9 @@ pub struct SandboxConfig {
     pub output_cap_bytes: u64,
     /// Whether tools may initiate network I/O (informational in v1).
     pub allow_network: bool,
+    /// Refs `git push` may target from a worker shell: branch, `remote/branch`, or `*`.
+    /// Empty refuses every push. A guardrail on the command string, not a sandbox.
+    pub allow_push: Vec<String>,
 }
 
 impl SandboxConfig {
@@ -38,6 +41,7 @@ impl SandboxConfig {
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             output_cap_bytes: DEFAULT_OUTPUT_CAP,
             allow_network: true,
+            allow_push: Vec::new(),
         }
     }
 
@@ -53,6 +57,11 @@ impl SandboxConfig {
 
     pub fn allow_network(mut self, b: bool) -> Self {
         self.allow_network = b;
+        self
+    }
+
+    pub fn allow_push(mut self, refs: Vec<String>) -> Self {
+        self.allow_push = refs;
         self
     }
 

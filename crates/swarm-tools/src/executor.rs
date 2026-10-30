@@ -167,6 +167,19 @@ impl ToolExecutor {
     }
 
     async fn run_shell(&self, command: &str, timeout: Duration) -> ToolResult {
+        // Push guardrail. The orchestrator owns remote writes: a worker that pushes
+        // creates branches and PRs nobody asked for, under the human's own credentials.
+        // `--allow-push <ref>` names the refs this job may push to; anything else is
+        // refused here. This is a guardrail on the command string, not a security
+        // boundary - a worker that goes looking for a way around it can find one; an
+        // accidental or default-path push cannot.
+        if let Some(violation) = push_violation(command, &self.config.allow_push) {
+            return ToolResult::failure(format!(
+                "push refused: {violation}\nRefs allowed for this job: {:?}\n\
+                 Do not work around this. Write your report file and finish: the orchestrator pushes.",
+                self.config.allow_push
+            ));
+        }
         // The tool is called `bash` and models write POSIX for it, so prefer a
         // real sh (git-bash ships one on most Windows dev boxes). `cmd /C` is
         // the last resort, not the Windows default: `pwd; ls -la` is exit 255
@@ -591,6 +604,92 @@ fn collect_paths(dir: &Path, base: &Path, out: &mut Vec<String>, max: usize) {
 fn rel_str(p: &Path, base: &Path) -> String {
     let rel = p.strip_prefix(base).unwrap_or(p);
     rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Why this shell command may not push, if it may not.
+///
+/// Scans each `;` / `|` / `&` / newline separated segment for a `git ... push` invocation and
+/// checks the refspec against `allowed`, whose entries are branch names, `remote/branch`, or
+/// `*`. A bare `git push` with no refspec is refused unless `*` is present, so a guard-railed
+/// job fails closed: the worker has to name the ref the orchestrator granted.
+fn push_violation(command: &str, allowed: &[String]) -> Option<String> {
+    for segment in command.split([';', '|', '&', '\n']) {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let Some(at) = tokens.iter().position(|t| *t == "git") else { continue };
+        let rest = &tokens[at + 1..];
+        let Some(push) = rest.iter().position(|t| *t == "push") else { continue };
+        let args: Vec<&str> =
+            rest[push + 1..].iter().copied().filter(|t| !t.starts_with('-')).collect();
+        // `git push [remote] [refspec]`: the refspec is what decides.
+        let (remote, refspec) = match args.len() {
+            0 => (None, None),
+            1 => (Some(args[0]), None),
+            _ => (Some(args[0]), Some(args[1])),
+        };
+        if allowed.iter().any(|a| a == "*") {
+            continue;
+        }
+        let Some(refspec) = refspec else {
+            return Some(format!(
+                "`{}` pushes with no refspec, and a guard-railed job must name the granted ref",
+                segment.trim()
+            ));
+        };
+        let branch = refspec.rsplit(':').next().unwrap_or(refspec).trim_start_matches("refs/heads/");
+        let granted = allowed.iter().any(|a| {
+            let a = a.trim_start_matches("refs/heads/");
+            branch == a
+                || branch == a.rsplit('/').next().unwrap_or(a)
+                || a.ends_with(&format!("/{branch}"))
+        });
+        if !granted {
+            return Some(format!(
+                "`{}` targets `{}` (remote {}), which is not in this job's --allow-push list",
+                segment.trim(),
+                branch,
+                remote.unwrap_or("(default)")
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod push_guard_tests {
+    use super::push_violation;
+
+    fn list(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn naming_the_granted_ref_is_the_only_way_to_push() {
+        let allowed = list(&["codex/gh332-publication-composition"]);
+        assert!(
+            push_violation("git push origin codex/gh332-publication-composition", &allowed).is_none()
+        );
+        assert!(
+            push_violation(
+                "git push origin HEAD:refs/heads/codex/gh332-publication-composition",
+                &allowed
+            )
+            .is_none(),
+            "an explicit refspec names the same ref"
+        );
+        let v = push_violation("git push origin main", &allowed).unwrap();
+        assert!(v.contains("main"), "{v}");
+        assert!(push_violation("git push", &allowed).unwrap().contains("no refspec"));
+        assert!(push_violation("go test ./...", &allowed).is_none(), "not a push");
+        assert!(
+            push_violation("git add -A && git push origin main", &allowed).is_some(),
+            "a chained push is caught"
+        );
+        assert!(
+            push_violation("git push origin codex/x", &list(&[])).is_some(),
+            "no allowance means no push at all"
+        );
+        assert!(push_violation("git push origin main", &list(&["*"])).is_none(), "`*` is the open case");
+    }
 }
 
 #[cfg(test)]

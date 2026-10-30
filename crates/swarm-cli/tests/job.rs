@@ -306,3 +306,120 @@ fn unknown_jobs_bad_input_and_finished_jobs_are_handled() {
     assert!(!resume.status.success());
     assert!(String::from_utf8_lossy(&resume.stderr).contains("only an interrupted job"));
 }
+
+fn needs_posix_shell() -> bool {
+    let posix = swarm_tools::shell::posix_available();
+    if !posix {
+        eprintln!("skipped: the verify commands in this test are POSIX shell");
+    }
+    posix
+}
+
+#[test]
+fn a_verify_job_that_passes_is_verified() {
+    if !needs_posix_shell() {
+        return;
+    }
+    let jobs = Jobs::new();
+    let submitted = jobs.submit(&["--verify", "test -f hello.txt"]);
+    assert_eq!(submitted["verify"], "test -f hello.txt");
+    let id = submitted["job_id"].as_str().unwrap().to_string();
+    jobs.finish(&id);
+
+    let result = jobs.ok(&["result", &id]);
+    assert_eq!(result["outcome"], "verified", "{result}");
+    assert_eq!(result["verify"]["passed"], true, "{result}");
+    assert_eq!(result["verify"]["rounds"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(result["verify"]["phase"], "done");
+}
+
+#[test]
+fn a_failed_check_sends_a_new_worker_back_and_the_second_round_can_pass() {
+    if !needs_posix_shell() {
+        return;
+    }
+    let jobs = Jobs::new();
+    // Fails the first time it runs, passes after: the retry is what makes it pass.
+    let check = "if [ -f .seen ]; then exit 0; fi; touch .seen; echo first-round-failure; exit 1";
+    let submitted = jobs.submit(&["--verify", check, "--max-rounds", "3"]);
+    let id = submitted["job_id"].as_str().unwrap().to_string();
+    jobs.finish(&id);
+
+    let result = jobs.ok(&["result", &id]);
+    assert_eq!(result["outcome"], "verified", "{result}");
+    let rounds = result["verify"]["rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 2, "{result}");
+    assert_eq!(rounds[0]["passed"], false);
+    assert!(rounds[0]["output"].as_str().unwrap().contains("first-round-failure"), "{result}");
+    assert_eq!(rounds[1]["passed"], true);
+
+    // The second worker ran in its own store and was told why the first one failed.
+    let job_dir = jobs.root().join(&id);
+    assert!(job_dir.join("store.r2").join("swarm.db").is_file());
+    let log = std::fs::read_to_string(job_dir.join("run.log")).unwrap();
+    assert!(log.contains("[verify] round 1/3: worker starting"), "{log}");
+    assert!(log.contains("[verify] round 2: check passed"), "{log}");
+}
+
+#[test]
+fn a_check_that_never_passes_ends_as_verify_failed_with_its_output() {
+    if !needs_posix_shell() {
+        return;
+    }
+    let jobs = Jobs::new();
+    let submitted = jobs.submit(&["--verify", "echo still-broken; exit 3", "--max-rounds", "2"]);
+    let id = submitted["job_id"].as_str().unwrap().to_string();
+    jobs.finish(&id);
+
+    let result = jobs.ok(&["result", &id]);
+    // The worker finished its runs, so the job is `completed`; the outcome is the check's verdict.
+    assert_eq!(result["state"], "completed", "{result}");
+    assert_eq!(result["outcome"], "verify_failed", "{result}");
+    let rounds = result["verify"]["rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 2, "{result}");
+    assert_eq!(rounds[1]["exit_code"], 3);
+    assert!(rounds[1]["output"].as_str().unwrap().contains("still-broken"));
+    assert!(result["note"].as_str().unwrap().contains("still failed"), "{result}");
+}
+
+#[test]
+fn a_job_waiting_on_its_check_is_still_running() {
+    if !needs_posix_shell() {
+        return;
+    }
+    let jobs = Jobs::new();
+    // The worker finishes in seconds; the check takes longer. In between the job must not read as done.
+    let submitted = jobs.submit(&["--verify", "sleep 6; test -f hello.txt"]);
+    let id = submitted["job_id"].as_str().unwrap().to_string();
+    let mut saw_verifying = false;
+    for _ in 0..60 {
+        let status = jobs.ok(&["status", &id]);
+        if status["verify"]["phase"] == "verifying" {
+            assert_eq!(status["state"], "running", "a verifying job is not finished: {status}");
+            saw_verifying = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(saw_verifying, "never saw the verifying phase");
+    jobs.finish(&id);
+    assert_eq!(jobs.ok(&["result", &id])["outcome"], "verified");
+}
+
+#[test]
+fn a_verify_job_cannot_be_resumed() {
+    if !needs_posix_shell() {
+        return;
+    }
+    let jobs = Jobs::new();
+    let id = jobs.submit(&["--verify", "true"])["job_id"].as_str().unwrap().to_string();
+    jobs.finish(&id);
+    let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args(["job", "resume", &id, "--jobs"])
+        .arg(jobs.root())
+        .output()
+        .expect("run swarm");
+    assert!(!output.status.success(), "resume must refuse a --verify job");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("--verify loop") && error.contains("--workspace"), "{error}");
+}

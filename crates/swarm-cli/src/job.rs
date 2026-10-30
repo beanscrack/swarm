@@ -35,6 +35,10 @@ use swarm_store::Store;
 /// Token budget of a job unless the caller sets one.
 const DEFAULT_JOB_MAX_TOKENS: u64 = 5_000_000;
 
+/// Worker runs a --verify job gets, and the time one check may take.
+const DEFAULT_VERIFY_ROUNDS: u32 = 3;
+const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 1_800;
+
 /// Appended to the goal so a worker knows its caller reads a structured report.
 const REPORT_FOOTER: &str = "\n\n---\nWhen you are done, call the report_result tool once with: status \
 (success, partial or failed), a short summary, metrics (numbers a caller can compare, such as speedup or \
@@ -78,10 +82,26 @@ pub enum JobCommand {
         #[arg(long)]
         state: Option<String>,
     },
-    /// Continue an interrupted job (its process died before the run finished).
-    Resume { id: String },
+    /// Continue a job: one that was interrupted (its process died before the run
+    /// finished), or one that died on its budget, which needs a raised ceiling.
+    Resume {
+        id: String,
+        /// Raise the token ceiling for the resumed run (whole-job total).
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Raise the per-agent step ceiling (also raises inference calls in step).
+        #[arg(long)]
+        max_steps: Option<u32>,
+        #[arg(long)]
+        max_inference_calls: Option<u64>,
+        #[arg(long)]
+        max_wall_clock_secs: Option<u64>,
+    },
     /// Remove a --repo job's worktree and branch (the patch and logs stay).
     Clean { id: String },
+    /// Runs a --verify job's worker rounds and verifications (started by `submit`; not for people).
+    #[command(hide = true)]
+    Supervise { id: String },
 }
 
 #[derive(Debug, Args, Default, Clone)]
@@ -121,6 +141,12 @@ pub struct SubmitArgs {
     /// Steps (model turns) the worker may take.
     #[arg(long)]
     pub max_steps: Option<u32>,
+    /// Inference calls the worker may make (defaults to max-steps x agents).
+    #[arg(long)]
+    pub max_inference_calls: Option<u64>,
+    /// Wall-clock limit for the job in seconds (default 3600).
+    #[arg(long)]
+    pub max_wall_clock_secs: Option<u64>,
     /// Tokens the worker may use over the whole job, input plus output, counted on
     /// every call (the whole conversation is sent each time). Default 5000000.
     #[arg(long)]
@@ -128,6 +154,21 @@ pub struct SubmitArgs {
     /// Do not append the report_result instruction to the goal.
     #[arg(long)]
     pub no_report_footer: bool,
+    /// A command run in the workspace once the worker stops; exit code 0 means the
+    /// work holds. When it fails, its output goes to a fresh worker run on the same
+    /// workspace, up to --max-rounds. The job's outcome is `verified` only when it passes.
+    #[arg(long)]
+    pub verify: Option<String>,
+    /// Worker runs a --verify job may use, the first one included (default 3).
+    #[arg(long)]
+    pub max_rounds: Option<u32>,
+    /// Seconds a single --verify run may take before it counts as failed (default 1800).
+    #[arg(long)]
+    pub verify_timeout_secs: Option<u64>,
+    /// Refs the worker may `git push` to (branch, `remote/branch`, or `*`). Repeatable.
+    /// With none, every push the worker attempts is refused by the tool layer.
+    #[arg(long = "allow-push")]
+    pub allow_push: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -153,7 +194,52 @@ struct JobSpec {
     base_url: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    /// The worker's limits, kept so a verify job's later rounds run with the same ones.
+    #[serde(default)]
+    agents: Option<u32>,
+    #[serde(default)]
+    max_steps: Option<u32>,
+    #[serde(default)]
+    max_inference_calls: Option<u64>,
+    #[serde(default)]
+    max_wall_clock_secs: Option<u64>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(default)]
+    no_report_footer: bool,
+    /// Verification: the command, how many worker runs it may use, and how long it may take.
+    #[serde(default)]
+    verify: Option<String>,
+    #[serde(default)]
+    max_rounds: u32,
+    #[serde(default)]
+    verify_timeout_secs: u64,
+    /// Refs the worker's shell may push to; empty blocks every push. Kept on the job so a
+    /// resume and a verify job's later rounds run under the same grant.
+    #[serde(default)]
+    allow_push: Vec<String>,
+    /// Where a verify job's supervisor has got to (`verify.json`); not part of job.json.
+    #[serde(skip)]
+    live: Option<VerifyState>,
 }
+
+/// A verify job's progress. Only the supervisor writes it, so it never races the
+/// `cancelled` flag in job.json.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct VerifyState {
+    /// `worker`, `verifying` or `done`.
+    phase: String,
+    round: u32,
+    /// The store of the round in progress (the latest round once done).
+    store: PathBuf,
+    /// One entry per finished verification: round, passed, exit_code, output (tail).
+    rounds: Vec<Value>,
+    passed: Option<bool>,
+}
+
+/// Verify output kept per round, and handed back to the next worker: the end of it is
+/// where a failing test says why, and every call of the worker carries it.
+const VERIFY_OUTPUT_CAP: usize = 4_000;
 
 pub async fn run(args: JobArgs) -> Result<(String, bool)> {
     let jobs = jobs_dir(args.jobs.as_deref());
@@ -167,8 +253,12 @@ pub async fn run(args: JobArgs) -> Result<(String, bool)> {
         JobCommand::Result { id } => (job_result(&jobs, &id).await?, true),
         JobCommand::Cancel { id } => (cancel_job(&jobs, &id).await?, true),
         JobCommand::List { label, state } => (list_jobs(&jobs, label.as_deref(), state.as_deref()).await?, true),
-        JobCommand::Resume { id } => (resume_job(&jobs, &id).await?, true),
+        JobCommand::Resume { id, max_tokens, max_steps, max_inference_calls, max_wall_clock_secs } => {
+            let raise = BudgetRaise { max_tokens, max_steps, max_inference_calls, max_wall_clock_secs };
+            (resume_job(&jobs, &id, raise).await?, true)
+        }
         JobCommand::Clean { id } => (clean_job(&jobs, &id)?, true),
+        JobCommand::Supervise { id } => (supervise_job(&jobs, &id).await?, true),
     };
     Ok((serde_json::to_string_pretty(&value)?, ok))
 }
@@ -200,10 +290,29 @@ fn job_dir(jobs: &Path, id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Fold a verify job's `verify.json` into its spec: the store to read is the latest
+/// round's, and `live` says whether the supervisor is still going.
+fn overlay_verify(spec: &mut JobSpec, dir: &Path) {
+    if spec.verify.is_none() {
+        return;
+    }
+    if let Some(state) = fs::read_to_string(dir.join("verify.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<VerifyState>(&text).ok())
+    {
+        if !state.store.as_os_str().is_empty() {
+            spec.store = state.store.clone();
+        }
+        spec.live = Some(state);
+    }
+}
+
 fn load_spec(jobs: &Path, id: &str) -> Result<(JobSpec, PathBuf)> {
     let dir = job_dir(jobs, id)?;
     let text = fs::read_to_string(dir.join("job.json")).with_context(|| format!("read job {id}"))?;
-    Ok((serde_json::from_str(&text).with_context(|| format!("parse job {id}"))?, dir))
+    let mut spec: JobSpec = serde_json::from_str(&text).with_context(|| format!("parse job {id}"))?;
+    overlay_verify(&mut spec, &dir);
+    Ok((spec, dir))
 }
 
 fn save_spec(dir: &Path, spec: &JobSpec) -> Result<()> {
@@ -217,7 +326,8 @@ fn all_specs(jobs: &Path) -> Vec<(JobSpec, PathBuf)> {
         .flatten()
         .filter_map(|entry| {
             let dir = entry.path();
-            let spec: JobSpec = serde_json::from_str(&fs::read_to_string(dir.join("job.json")).ok()?).ok()?;
+            let mut spec: JobSpec = serde_json::from_str(&fs::read_to_string(dir.join("job.json")).ok()?).ok()?;
+            overlay_verify(&mut spec, &dir);
             Some((spec, dir))
         })
         .collect();
@@ -285,63 +395,217 @@ pub fn submit_job(jobs: &Path, args: SubmitArgs) -> Result<Value> {
         fs::create_dir_all(&work)?;
         (work, None, None, None, None)
     };
-    let store = dir.join("store");
+    let verify = args.verify.clone().filter(|command| !command.trim().is_empty());
+    if args.verify.is_some() && verify.is_none() {
+        bail!("--verify is empty");
+    }
+    let mut spec = JobSpec {
+        id: id.clone(),
+        key: args.key.clone(),
+        label: args.label.clone(),
+        goal,
+        workspace: workspace.clone(),
+        store: dir.join("store"),
+        repo,
+        base,
+        base_commit,
+        branch,
+        pid: None,
+        started_at: now_ms(),
+        cancelled: false,
+        provider: Some(provider),
+        base_url,
+        model: args.model.clone(),
+        agents: args.agents,
+        max_steps: args.max_steps,
+        max_inference_calls: args.max_inference_calls,
+        max_wall_clock_secs: args.max_wall_clock_secs,
+        max_tokens: args.max_tokens,
+        no_report_footer: args.no_report_footer,
+        max_rounds: if verify.is_some() { args.max_rounds.unwrap_or(DEFAULT_VERIFY_ROUNDS).max(1) } else { 0 },
+        verify_timeout_secs: args.verify_timeout_secs.unwrap_or(DEFAULT_VERIFY_TIMEOUT_SECS).max(1),
+        verify,
+        allow_push: args.allow_push.clone(),
+        live: None,
+    };
 
-    let full_goal = if args.no_report_footer { goal.clone() } else { format!("{goal}{REPORT_FOOTER}") };
-    let exe = std::env::var_os("SWARM_JOB_EXE").map(PathBuf::from).map_or_else(std::env::current_exe, Ok)?;
+    let exe = job_exe()?;
     let log = File::create(dir.join("run.log"))?;
-    let mut command = Command::new(exe);
-    command
-        .arg("run")
-        .arg(&full_goal)
-        .args(["--provider", &provider])
-        .arg("--store")
-        .arg(&store)
-        .arg("--workspace")
-        .arg(&workspace)
-        .args(["--approve-all", "--plain"]);
-    if let Some(url) = &base_url {
-        command.args(["--base-url", url]);
-    }
-    if let Some(model) = &args.model {
-        command.args(["--model", model]);
-    }
-    if let Some(agents) = args.agents {
-        command.args(["--agents", &agents.to_string()]);
-    }
-    if let Some(steps) = args.max_steps {
-        command.args(["--max-steps", &steps.to_string()]);
-    }
-    // Jobs are autonomous and read real code, so they get far more than the 200000
-    // a plain run does (that figure is the offline mock's); it is still a bound.
-    command.args(["--max-tokens", &args.max_tokens.unwrap_or(DEFAULT_JOB_MAX_TOKENS).to_string()]);
+    let mut command = if spec.verify.is_some() {
+        // A supervisor outlives this call: it runs the worker, verifies, and goes again.
+        // The spec is saved first because the supervisor reads it.
+        save_spec(&dir, &spec)?;
+        let mut command = Command::new(exe);
+        command.arg("job").arg("--jobs").arg(jobs).arg("supervise").arg(&id);
+        command
+    } else {
+        worker_command(&spec, &spec.full_goal(), &spec.store)?
+    };
     command.stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
     detach(&mut command);
     let child = command.spawn().context("start the job process")?;
     let pid = child.id();
     drop(child);
 
-    let spec = JobSpec {
-        id: id.clone(),
-        key: args.key.clone(),
-        label: args.label.clone(),
-        goal,
-        workspace: workspace.clone(),
-        store,
-        repo,
-        base,
-        base_commit,
-        branch,
-        pid: Some(pid),
-        started_at: now_ms(),
-        cancelled: false,
-        provider: Some(provider),
-        base_url,
-        model: args.model.clone(),
-    };
+    spec.pid = Some(pid);
     save_spec(&dir, &spec)?;
     Ok(json!({"job_id": id, "state": "starting", "label": spec.label, "pid": pid,
-              "workspace": workspace, "branch": spec.branch, "reused": false}))
+              "workspace": workspace, "branch": spec.branch, "reused": false,
+              "verify": spec.verify, "max_rounds": spec.verify.as_ref().map(|_| spec.max_rounds)}))
+}
+
+fn job_exe() -> Result<PathBuf> {
+    Ok(std::env::var_os("SWARM_JOB_EXE").map(PathBuf::from).map_or_else(std::env::current_exe, Ok)?)
+}
+
+impl JobSpec {
+    /// The goal as the worker sees it: the caller's text plus the report instruction.
+    fn full_goal(&self) -> String {
+        if self.no_report_footer { self.goal.clone() } else { format!("{}{REPORT_FOOTER}", self.goal) }
+    }
+}
+
+/// `swarm run` for this job, writing to `store`. The caller sets stdio.
+fn worker_command(spec: &JobSpec, goal: &str, store: &Path) -> Result<Command> {
+    let mut command = Command::new(job_exe()?);
+    command
+        .arg("run")
+        .arg(goal)
+        .args(["--provider", spec.provider.as_deref().unwrap_or_default()])
+        .arg("--store")
+        .arg(store)
+        .arg("--workspace")
+        .arg(&spec.workspace)
+        .args(["--approve-all", "--plain"]);
+    if let Some(url) = &spec.base_url {
+        command.args(["--base-url", url]);
+    }
+    if let Some(model) = &spec.model {
+        command.args(["--model", model]);
+    }
+    for granted in &spec.allow_push {
+        command.args(["--allow-push", granted]);
+    }
+    if let Some(agents) = spec.agents {
+        command.args(["--agents", &agents.to_string()]);
+    }
+    if let Some(steps) = spec.max_steps {
+        command.args(["--max-steps", &steps.to_string()]);
+    }
+    if let Some(calls) = spec.max_inference_calls {
+        command.args(["--max-inference-calls", &calls.to_string()]);
+    }
+    if let Some(secs) = spec.max_wall_clock_secs {
+        command.args(["--max-wall-clock-secs", &secs.to_string()]);
+    }
+    // Jobs are autonomous and read real code, so they get far more than the 200000
+    // a plain run does (that figure is the offline mock's); it is still a bound.
+    command.args(["--max-tokens", &spec.max_tokens.unwrap_or(DEFAULT_JOB_MAX_TOKENS).to_string()]);
+    Ok(command)
+}
+
+/// What a verify job's next worker is told: the original goal, then why the last
+/// attempt did not hold. The workspace still has that attempt's changes.
+fn retry_goal(full_goal: &str, verify: &str, round: u32, exit_code: Option<i32>, output: &str) -> String {
+    let code = exit_code.map_or_else(|| "none (it was killed or timed out)".to_string(), |code| code.to_string());
+    format!(
+        "{full_goal}\n\n---\nVERIFICATION FAILED after attempt {round}. A check runs when you stop, and it failed.\n\
+         Check command: {verify}\nExit code: {code}\nOutput (end):\n```\n{output}\n```\n\
+         The workspace still holds the changes that attempt made (see `git status` and `git diff`). Find the cause \
+         and fix it, then run the check command yourself before you stop. Do not weaken, skip or edit the check to \
+         make it pass."
+    )
+}
+
+/// The last `cap` bytes of `text`, on a character boundary.
+fn tail_chars(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let mut start = text.len() - cap;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("\u{2026}{}", &text[start..])
+}
+
+fn write_verify(dir: &Path, state: &VerifyState) -> Result<()> {
+    let temp = dir.join("verify.json.tmp");
+    fs::write(&temp, serde_json::to_string_pretty(state)?)?;
+    fs::rename(&temp, dir.join("verify.json"))?;
+    Ok(())
+}
+
+/// Run `command` in the workspace: its exit code (None when killed or timed out)
+/// and the end of its combined output.
+async fn run_verify(spec: &JobSpec, command: &str) -> (Option<i32>, String) {
+    let mut process = swarm_tools::shell::shell().command(command);
+    process
+        .current_dir(&spec.workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) => return (None, format!("could not start the check: {error}")),
+    };
+    let pid = child.id();
+    let wait = tokio::time::timeout(Duration::from_secs(spec.verify_timeout_secs), child.wait_with_output());
+    match wait.await {
+        Ok(Ok(output)) => {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            (output.status.code(), tail_chars(text.trim(), VERIFY_OUTPUT_CAP))
+        }
+        Ok(Err(error)) => (None, format!("the check failed to run: {error}")),
+        Err(_) => {
+            if let Some(pid) = pid {
+                kill_tree(pid);
+            }
+            (None, format!("the check ran past {} seconds and was stopped", spec.verify_timeout_secs))
+        }
+    }
+}
+
+/// The process behind a --verify job: worker, check, and if the check fails a new
+/// worker told why, until the check passes or the rounds run out. It records where it
+/// is in verify.json, and leaves job.json (and so `cancel`) alone.
+pub async fn supervise_job(jobs: &Path, id: &str) -> Result<Value> {
+    let (spec, dir) = load_spec(jobs, id)?;
+    let Some(verify) = spec.verify.clone() else { bail!("job {id} has no --verify command") };
+    let base_goal = spec.full_goal();
+    let mut state = VerifyState::default();
+    let mut goal = base_goal.clone();
+    for round in 1..=spec.max_rounds {
+        let store = if round == 1 { dir.join("store") } else { dir.join(format!("store.r{round}")) };
+        state.round = round;
+        state.phase = "worker".to_string();
+        state.store = store.clone();
+        write_verify(&dir, &state)?;
+        println!("[verify] round {round}/{}: worker starting", spec.max_rounds);
+
+        let log = fs::OpenOptions::new().create(true).append(true).open(dir.join("run.log"))?;
+        let mut worker = worker_command(&spec, &goal, &store)?;
+        worker.stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
+        let status = tokio::task::spawn_blocking(move || worker.status()).await??;
+        println!("[verify] round {round}: worker exited ({status})");
+
+        state.phase = "verifying".to_string();
+        write_verify(&dir, &state)?;
+        let (code, output) = run_verify(&spec, &verify).await;
+        let passed = code == Some(0);
+        println!("[verify] round {round}: check {} (exit {code:?})", if passed { "passed" } else { "failed" });
+        state.rounds.push(json!({"round": round, "passed": passed, "exit_code": code, "output": output}));
+        state.passed = Some(passed);
+        if passed {
+            break;
+        }
+        goal = retry_goal(&base_goal, &verify, round, code, &output);
+    }
+    state.phase = "done".to_string();
+    write_verify(&dir, &state)?;
+    Ok(json!({"job_id": id, "passed": state.passed, "rounds": state.rounds.len()}))
 }
 
 #[cfg(windows)]
@@ -435,8 +699,13 @@ async fn snapshot(spec: &JobSpec) -> Snapshot {
         (Some(store), Some(run)) => store.latest_events(&run.id, 20_000).await.unwrap_or_default(),
         _ => Vec::new(),
     };
+    // A verify job is running until its supervisor says done, whatever the latest
+    // worker run says: the check and the next round have not happened yet.
+    let verify_pending = spec.live.as_ref().is_some_and(|live| live.phase != "done");
     let state = if spec.cancelled {
         "cancelled"
+    } else if verify_pending {
+        if alive { "running" } else { "interrupted" }
     } else {
         match run.as_ref().map(|run| run.status) {
             Some(RunStatus::Completed) => "completed",
@@ -480,6 +749,16 @@ async fn status_of(spec: &JobSpec, dir: &Path) -> Value {
         "workspace": spec.workspace,
         "branch": spec.branch,
     });
+    if let Some(verify) = &spec.verify {
+        let live = spec.live.as_ref();
+        out["verify"] = json!({
+            "command": verify,
+            "phase": live.map_or("starting", |live| live.phase.as_str()),
+            "round": live.map_or(0, |live| live.round),
+            "max_rounds": spec.max_rounds,
+            "passed": live.and_then(|live| live.passed),
+        });
+    }
     let finished_at = snap.run.as_ref().filter(|_| is_terminal(&snap.state)).map(|run| run.updated_at);
     out["elapsed_s"] = json!(((finished_at.unwrap_or_else(now_ms) - spec.started_at).max(0)) / 1000);
     if let (Some(store), Some(run)) = (&snap.store, &snap.run) {
@@ -649,9 +928,26 @@ pub async fn job_result(jobs: &Path, id: &str) -> Result<Value> {
     } else {
         json!("no_work")
     };
+    // A verify job's outcome is what its check said, not what the worker claimed.
+    if let (Some(verify), Some(live), true) = (&spec.verify, &spec.live, is_terminal(&snap.state)) {
+        if live.phase == "done" {
+            out["verify"]["rounds"] = Value::Array(live.rounds.clone());
+            out["outcome"] = match live.passed {
+                Some(true) if changed => json!("verified"),
+                Some(true) => json!("verified_no_change"),
+                _ => json!("verify_failed"),
+            };
+            if live.passed != Some(true) {
+                out["note"] = json!(format!(
+                    "the check `{verify}` still failed after {} round(s); see verify.rounds for its output",
+                    live.rounds.len()
+                ));
+            }
+        }
+    }
     if !is_terminal(&snap.state) {
         out["note"] = json!("the job has not finished; this is a partial view");
-    } else if reported.is_none() {
+    } else if reported.is_none() && out["note"].is_null() {
         out["note"] = json!("the worker did not call report_result; read summary and files_changed instead");
     }
     Ok(out)
@@ -671,13 +967,58 @@ pub async fn cancel_job(jobs: &Path, id: &str) -> Result<Value> {
     Ok(json!({"job_id": id, "state": "cancelled"}))
 }
 
-/// Continue a job whose process died before its run finished: same store, same
-/// workspace, same provider, a new process.
-pub async fn resume_job(jobs: &Path, id: &str) -> Result<Value> {
+/// Ceilings to raise when resuming a job that stopped on its budget. Usage is
+/// cumulative, so a budget-exhausted run needs a ceiling above what it spent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BudgetRaise {
+    pub max_tokens: Option<u64>,
+    pub max_steps: Option<u32>,
+    pub max_inference_calls: Option<u64>,
+    pub max_wall_clock_secs: Option<u64>,
+}
+
+impl BudgetRaise {
+    fn is_empty(&self) -> bool {
+        let Self { max_tokens, max_steps, max_inference_calls, max_wall_clock_secs } = *self;
+        max_tokens.is_none() && max_steps.is_none() && max_inference_calls.is_none()
+            && max_wall_clock_secs.is_none()
+    }
+}
+
+/// True when a dead job's log says the run ended on a budget limit. The runner
+/// prints the cause as a `reason:` line ("budget exceeded for tokens: requested N
+/// against limit M") - the same text `job status` reports as `reason`.
+fn budget_death_in(dir: &Path) -> bool {
+    tail(&dir.join("run.log"), 40)
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("reason: "))
+        .is_some_and(|reason| reason.contains("budget exceeded"))
+}
+
+/// Continue a job whose process died before its run finished, or one that stopped
+/// on its budget (with a raised ceiling): same store, same workspace, same provider,
+/// a new process.
+pub async fn resume_job(jobs: &Path, id: &str, raise: BudgetRaise) -> Result<Value> {
     let (mut spec, dir) = load_spec(jobs, id)?;
+    if spec.verify.is_some() {
+        bail!("job {id} has a --verify loop, which cannot be resumed; submit a new job with --workspace {} to carry on from its files", spec.workspace.display());
+    }
     let snap = snapshot(&spec).await;
-    if snap.state != "interrupted" {
-        bail!("job {id} is {}; only an interrupted job can be resumed", snap.state);
+    // A budget-exhausted run is a pause, not a failure: its transcript is in the
+    // store and it continues from its last checkpoint. Because usage is cumulative,
+    // resuming it without a raised ceiling would die on the very next call.
+    let budget_death = snap.state == "failed" && budget_death_in(&dir);
+    if snap.state != "interrupted" && !budget_death {
+        bail!(
+            "job {id} is {}; only an interrupted job, or one that died on its budget, can be resumed",
+            snap.state
+        );
+    }
+    if budget_death && raise.is_empty() {
+        bail!(
+            "job {id} died on its budget; resume it with a raised ceiling, e.g. --max-tokens <above the tokens shown by `job status`>"
+        );
     }
     let run = snap.run.ok_or_else(|| anyhow!("job {id} has no run to resume"))?;
     let exe = std::env::var_os("SWARM_JOB_EXE").map(PathBuf::from).map_or_else(std::env::current_exe, Ok)?;
@@ -699,6 +1040,23 @@ pub async fn resume_job(jobs: &Path, id: &str) -> Result<Value> {
     }
     if let Some(model) = &spec.model {
         command.args(["--model", model]);
+    }
+    for granted in &spec.allow_push {
+        command.args(["--allow-push", granted]);
+    }
+    // Ceilings travel to `swarm resume`, which persists them on the run row: the
+    // agent enforces the stored budget against cumulative usage.
+    if let Some(tokens) = raise.max_tokens {
+        command.args(["--max-tokens", &tokens.to_string()]);
+    }
+    if let Some(steps) = raise.max_steps {
+        command.args(["--max-steps", &steps.to_string()]);
+    }
+    if let Some(calls) = raise.max_inference_calls {
+        command.args(["--max-inference-calls", &calls.to_string()]);
+    }
+    if let Some(secs) = raise.max_wall_clock_secs {
+        command.args(["--max-wall-clock-secs", &secs.to_string()]);
     }
     command.stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
     detach(&mut command);
@@ -751,6 +1109,28 @@ mod tests {
     use super::*;
     use swarm_core::RunId;
 
+    #[test]
+    fn a_budget_death_is_told_apart_from_a_real_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("run.log");
+        std::fs::write(
+            &log,
+            "step 40 done\nrun 7 failed\nreason: budget: budget exceeded for tokens: requested 4500000 against limit 4500000\n",
+        )
+        .unwrap();
+        assert!(budget_death_in(dir.path()), "a ceiling the worker ran out of is resumable");
+        std::fs::write(&log, "step 4 done\nreason: transport error: connection refused\n").unwrap();
+        assert!(!budget_death_in(dir.path()), "a real failure stays a failure");
+        std::fs::write(&log, "step 4 done\n").unwrap();
+        assert!(!budget_death_in(dir.path()), "no reason line is not a budget death");
+    }
+
+    #[test]
+    fn an_empty_raise_is_detected() {
+        assert!(BudgetRaise::default().is_empty());
+        assert!(!BudgetRaise { max_tokens: Some(1), ..Default::default() }.is_empty());
+    }
+
     fn event(kind: EventKind, payload: Value) -> RunEvent {
         RunEvent::new(kind, RunId::new(), payload)
     }
@@ -796,6 +1176,25 @@ mod tests {
             result("4", "write_file", true, json!({"path": "c.cu"}), json!({"before": null})),
         ];
         assert_eq!(changed_files(&events), ["a.cu", "c.cu"]);
+    }
+
+    #[test]
+    fn the_retry_goal_keeps_the_original_task_and_says_why_it_failed() {
+        let goal = retry_goal("fix the parser", "go test ./...", 2, Some(1), "FAIL TestParse");
+        assert!(goal.starts_with("fix the parser"), "{goal}");
+        assert!(goal.contains("attempt 2") && goal.contains("go test ./...") && goal.contains("FAIL TestParse"));
+        assert!(goal.contains("Exit code: 1") && goal.contains("Do not weaken"), "{goal}");
+        let killed = retry_goal("g", "c", 1, None, "");
+        assert!(killed.contains("killed or timed out"), "{killed}");
+    }
+
+    #[test]
+    fn verify_output_keeps_its_end_on_a_character_boundary() {
+        assert_eq!(tail_chars("short", 100), "short");
+        let text = format!("{}{}", "a".repeat(50), "\u{e9}".repeat(10));
+        let cut = tail_chars(&text, 7);
+        assert!(cut.starts_with('\u{2026}') && cut.ends_with('\u{e9}'), "{cut}");
+        assert!(cut.chars().count() <= 8);
     }
 
     #[test]

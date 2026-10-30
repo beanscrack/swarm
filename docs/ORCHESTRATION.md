@@ -44,7 +44,7 @@ completed.
 
 | Command | What it does |
 | --- | --- |
-| `swarm job submit --goal TEXT [--repo PATH] [--base REF] [--label L] [--key K] [--provider P] [--max-steps N] [--max-tokens N]` | Starts a job, returns `{job_id, state, workspace, branch}` immediately. `--key` makes a repeat submit return the same job. `--workspace DIR` works in an existing directory instead. `--goal-file F` reads the goal from a file. |
+| `swarm job submit --goal TEXT [--repo PATH] [--base REF] [--label L] [--key K] [--provider P] [--max-steps N] [--max-tokens N] [--verify CMD] [--max-rounds N]` | Starts a job, returns `{job_id, state, workspace, branch}` immediately. `--key` makes a repeat submit return the same job. `--workspace DIR` works in an existing directory instead. `--goal-file F` reads the goal from a file. |
 | `swarm job status ID` | `state` (`starting`, `running`, `completed`, `failed`, `cancelled`, `interrupted`), elapsed seconds, model and tool calls, `tokens` used against `token_limit`, last action, whether it has reported, and for a failed job the `reason` (for example `budget exceeded for tokens: requested 236662 against limit 200000`). |
 | `swarm job wait ID... [--timeout S] [--any]` | Blocks until all jobs finish (first one with `--any`) or the timeout. Returns `done`, `timed_out`, `still_running` and every job's status. |
 | `swarm job result ID` | `outcome`, `report` (the worker's own status, summary, metrics, artifacts, notes), `summary` (its final message), `files_changed`, and for repo jobs `patch` (`path`, `stat`, `apply`). |
@@ -118,6 +118,23 @@ list the patch file you made as an artifact.
   old failure). Submit a new job instead, with `--workspace` set to the failed job's
   workspace so the new worker starts from the files already written, and a larger
   `--max-tokens`.
+
+- **Make the job prove its work: `--verify`.** `swarm job submit ... --verify "go test ./..."
+  [--max-rounds 3] [--verify-timeout-secs 1800]` runs that command in the workspace each
+  time the worker stops. Exit code 0 means the work holds. When it fails, the end of its
+  output (4,000 characters) goes into a fresh worker run on the *same* workspace, with the
+  original goal and an instruction not to weaken the check, up to `--max-rounds` worker
+  runs in total. The `outcome` is then the check's verdict, not the worker's claim:
+  `verified` (it passed and files changed), `verified_no_change` (it passed with nothing
+  changed, e.g. already fixed) or `verify_failed` (still failing after the last round;
+  `verify.rounds` holds each run's exit code and output). While a check or a later round
+  is pending the job's `state` stays `running`, and `status` shows `verify.phase`
+  (`worker`, `verifying`, `done`) and `verify.round`. Each round has its own store
+  (`store`, `store.r2`, ...) and the patch is cumulative; `files_changed` and the token
+  figures cover the latest round only. Budgets (`--max-tokens`, steps) apply per round.
+  A verify job cannot be resumed; resubmit with `--workspace`. Use a check that fails when
+  the work is wrong and cannot be passed by editing it (a repo test or build gate, not a
+  script the worker wrote). MCP: `verify`, `max_rounds`, `verify_timeout_secs` on `swarm_submit`.
 
 - **Read `outcome`, not `state`.** `state` only says the process ended. A worker that
   gave up, or never touched a file, still ends as `completed`. `outcome` is the

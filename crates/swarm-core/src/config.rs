@@ -187,6 +187,11 @@ pub struct ToolSandboxConfig {
     pub command_timeout_secs: u64,
     pub memory_limit_mb: Option<u64>,
     pub allow_network: bool,
+    /// Refs this run's workers may `git push` to: branch names, `remote/branch`, or `*`.
+    /// Empty (the default) means no push is allowed - the orchestrator owns remote writes.
+    /// This is a guardrail on the shell command string, not a sandbox boundary.
+    #[serde(default)]
+    pub allow_push: Vec<String>,
     pub approval: ApprovalPolicy,
 }
 
@@ -199,6 +204,7 @@ impl Default for ToolSandboxConfig {
             command_timeout_secs: 120,
             memory_limit_mb: None,
             allow_network: false,
+            allow_push: Vec::new(),
             approval: ApprovalPolicy::AskDangerous,
         }
     }

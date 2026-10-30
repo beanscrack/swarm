@@ -75,6 +75,10 @@ a summary of what you changed and why it was faster or not, metrics {speedup:
   resumed); resubmit with a larger `max_tokens` and `workspace` set to the failed
   job's workspace so the new worker starts from the files already written. Big repos
   burn tokens fast, since every call carries the whole conversation.
+- Pass `verify` (a repo test or build command) on `swarm_submit` for any worker that
+  changes code. It runs when the worker stops; on failure its output goes to a new worker
+  on the same workspace, up to `max_rounds`. `outcome` is `verified` only when the check
+  passed, `verify_failed` when it never did. Trust that over the worker's own report.
 - Read `outcome`, not `state`. A job can end `completed` having done nothing:
   `outcome` is `no_work` then (resubmit under a new `key`; a key stays with a failed
   job), or `changed_without_report` when it edited files without reporting.
