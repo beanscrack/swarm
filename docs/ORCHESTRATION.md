@@ -126,7 +126,8 @@ list the patch file you made as an artifact.
   original goal and an instruction not to weaken the check, up to `--max-rounds` worker
   runs in total. The `outcome` is then the check's verdict, not the worker's claim:
   `verified` (it passed and files changed), `verified_no_change` (it passed with nothing
-  changed, e.g. already fixed) or `verify_failed` (still failing after the last round;
+  changed, e.g. already fixed, after the worker used tools), `unverified_no_work` (it passed but the
+  worker changed nothing and used no tools, so the pass proves nothing) or `verify_failed` (still failing after the last round;
   `verify.rounds` holds each run's exit code and output). While a check or a later round
   is pending the job's `state` stays `running`, and `status` shows `verify.phase`
   (`worker`, `verifying`, `done`) and `verify.round`. Each round has its own store

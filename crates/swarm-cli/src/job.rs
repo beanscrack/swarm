@@ -932,11 +932,27 @@ pub async fn job_result(jobs: &Path, id: &str) -> Result<Value> {
     if let (Some(verify), Some(live), true) = (&spec.verify, &spec.live, is_terminal(&snap.state)) {
         if live.phase == "done" {
             out["verify"]["rounds"] = Value::Array(live.rounds.clone());
+            // Tools the worker really used (planning and reporting are not work). A check that passes on an
+            // untouched tree proves nothing when the worker never looked at the tree: a chat model can answer
+            // from its own connectors and never call a swarm tool.
+            let worked = snap
+                .events
+                .iter()
+                .filter(|event| event.kind == EventKind::ToolRequested)
+                .filter(|event| !matches!(event.payload.get("name").and_then(Value::as_str), Some("todo_write" | "report_result")))
+                .count();
+            out["verify"]["worker_tool_calls"] = json!(worked);
             out["outcome"] = match live.passed {
                 Some(true) if changed => json!("verified"),
+                Some(true) if worked == 0 => json!("unverified_no_work"),
                 Some(true) => json!("verified_no_change"),
                 _ => json!("verify_failed"),
             };
+            if live.passed == Some(true) && !changed && worked == 0 {
+                out["note"] = json!(
+                    "the check passed, but the worker changed nothing and used no tools (it may have answered from the                      model's own connectors), so nothing was verified; read summary skeptically or resubmit"
+                );
+            }
             if live.passed != Some(true) {
                 out["note"] = json!(format!(
                     "the check `{verify}` still failed after {} round(s); see verify.rounds for its output",

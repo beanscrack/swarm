@@ -423,3 +423,26 @@ fn a_verify_job_cannot_be_resumed() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("--verify loop") && error.contains("--workspace"), "{error}");
 }
+
+#[test]
+fn a_passing_check_on_a_worker_that_used_no_tools_is_not_verified() {
+    if !needs_posix_shell() {
+        return;
+    }
+    let jobs = Jobs::new();
+    // The plain mock only replies: no tool calls, no changes. The check passes on the untouched tree.
+    let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args(["job", "submit", "--provider", "mock", "--goal", "do nothing at all", "--verify", "true", "--jobs"])
+        .arg(jobs.root())
+        .env_remove("SWARM_PROVIDER")
+        .env_remove("SWARM_MOCK_SCRIPT")
+        .output()
+        .unwrap();
+    let id = serde_json::from_slice::<Value>(&output.stdout).unwrap()["job_id"].as_str().unwrap().to_string();
+    jobs.finish(&id);
+    let result = jobs.ok(&["result", &id]);
+    assert_eq!(result["verify"]["passed"], true, "{result}");
+    assert_eq!(result["verify"]["worker_tool_calls"], 0, "{result}");
+    assert_eq!(result["outcome"], "unverified_no_work", "{result}");
+    assert!(result["note"].as_str().unwrap().contains("used no tools"), "{result}");
+}
