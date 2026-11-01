@@ -266,6 +266,38 @@ test('DOM fallback reads rendered turns without the conversation API',
   });
 });
 
+test('a GitHub connector card that only reads is allowed once; one that writes is declined',
+  { timeout: 90000 }, async (t) => {
+  const fixture = fixtureServer();
+  await withBridge(t, { fixture, extra: ['--no-api', '--response-timeout-ms', '30000'] },
+    async ({ post, logs }) => {
+    const session = await post('/sessions', { model: 'auto' });
+    const read = await post(`/sessions/${session.id}/messages`, { request_id: 'c-1', prompt: 'connector github read' });
+    // "Allow", never "Always allow": the connector gets no standing permission.
+    assert.equal(read.text, 'CONNECTOR:Allow');
+    const write = await post(`/sessions/${session.id}/messages`, { request_id: 'c-2', prompt: 'connector github write' });
+    assert.equal(write.text, 'CONNECTOR:Decline');
+    assert.match(logs(), /\[connector\] allowed: ChatGPT wants to use GitHub to read/);
+    assert.match(logs(), /\[connector\] declined \(it would change GitHub\): ChatGPT wants to use GitHub to post a comment/);
+  });
+});
+
+test('a card for another connector, or any card with --no-connector-approve, is left for a person',
+  { timeout: 90000 }, async (t) => {
+  for (const [prompt, extra] of [
+    ['connector other', []],
+    ['connector github read', ['--no-connector-approve']],
+  ]) {
+    const fixture = fixtureServer();
+    await withBridge(t, { fixture, extra: ['--no-api', ...extra] }, async ({ post, status }) => {
+      const session = await post('/sessions', { model: 'auto' });
+      const reply = await status(`/sessions/${session.id}/messages`, { request_id: 'c-left', prompt });
+      // Nobody answered the card, so the turn waits out the (6s) response timeout.
+      assert.equal(reply.status, 504, `${prompt} ${extra}: ${JSON.stringify(reply.body)}`);
+    });
+  }
+});
+
 test('the 2026 turn markup is read through its turn-state marker',
   { timeout: 90000 }, async (t) => {
   const fixture = fixtureServer();
@@ -337,4 +369,16 @@ test('the sidebar menu deletes when the site refuses the API delete',
       const after = await list();
       assert.ok(!after.includes(chatId), `chat ${chatId} survived the menu delete`);
     });
+});
+
+test('/login reports signed-in browsers and flags a logged-out one',
+  { timeout: 90000 }, async (t) => {
+  await withBridge(t, { fixture: fixtureServer() }, async ({ base }) => {
+    const login = await (await fetch(`${base}/login`)).json();
+    assert.deepEqual(login.access_points, [{ signed_in: true }, { signed_in: true }]);
+  });
+  await withBridge(t, { fixture: fixtureServer(), chatPath: '/app?signedout=1' }, async ({ base }) => {
+    const login = await (await fetch(`${base}/login`)).json();
+    assert.deepEqual(login.access_points, [{ signed_in: false }, { signed_in: false }]);
+  });
 });

@@ -84,6 +84,7 @@ impl Chat {
             }
             "reload" => self.cmd_reload(),
             "agents" => self.cmd_agents(args),
+            "bridge" => self.cmd_bridge(args).await,
             "model" => self.cmd_model(args),
             "permissions" => self.cmd_permissions(args).await,
             "allow" => self.cmd_allow(args),
@@ -719,7 +720,7 @@ impl Chat {
                         format!(
                             "{} at {shown} {}",
                             provider.name,
-                            if reachable { "is reachable" } else { "did not answer (is the bridge or server running?)" }
+                            if reachable { "is reachable" } else { "did not answer (is the bridge or server running? /bridge starts the ChatGPT one)" }
                         ),
                     );
                 }

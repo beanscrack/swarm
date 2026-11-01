@@ -66,6 +66,7 @@ pub const COMMANDS: &[SlashSpec] = &[
     cmd!(Run, "queue", [], "[list|rm <n>|clear]", "Show or edit goals waiting to run"),
     cmd!(Run, "busy", [], "[queue|interrupt]", "What Enter does while a turn is running"),
     cmd!(Run, "agents", [], "[n]", "Swarm size for the next turns"),
+    cmd!(Setup, "bridge", [], "[agents|status|stop]", "Start the ChatGPT browser bridge and open its browsers"),
     cmd!(Setup, "model", [], "[name]", "Show or change the model"),
     cmd!(Setup, "permissions", ["approve", "perm"], "[ask|danger|all]", "Tool approval policy"),
     cmd!(Setup, "allow", [], "[tool]", "List or allow a tool for this session"),

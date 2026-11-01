@@ -12,6 +12,7 @@
 //! the [`Action`]s the user's keys produce.
 
 mod aside;
+mod bridge;
 mod goal;
 mod hooks_ui;
 mod mentions;
@@ -133,6 +134,8 @@ pub(crate) struct Chat {
     pub(crate) hooks: Arc<Hooks>,
     /// Hook files that were skipped or had mistakes in them, for `/hooks`.
     pub(crate) hook_notes: Vec<String>,
+    /// `/bridge`: the ChatGPT bridge process this session started.
+    pub(crate) bridge: Option<bridge::Bridge>,
 }
 
 impl Chat {
@@ -752,6 +755,7 @@ pub async fn chat(args: ChatArgs) -> Result<commands::CommandOutcome> {
         loop_job: None,
         hooks,
         hook_notes,
+        bridge: None,
     };
     chat.last_run = chat.session.turns.last().and_then(|turn| RunId::parse(&turn.run_id).ok());
     chat.welcome();
@@ -907,6 +911,7 @@ mod tests {
             loop_job: None,
             hooks: Arc::new(Hooks::new(Vec::new(), PathBuf::new(), "chat-test")),
             hook_notes: Vec::new(),
+            bridge: None,
         };
         Rig { chat, ui, rows, _dir: dir }
     }
@@ -1447,5 +1452,62 @@ mod tests {
         done.status = goal::GoalStatus::Done;
         store.kv_set(KV_NAMESPACE, KV_GOAL, &serde_json::to_string(&done).unwrap()).await.unwrap();
         assert!(load_goal(&store, &args).await.is_none());
+    }
+
+    /// A stand-in bridge: `/health` and `/login` over loopback, two browsers,
+    /// one of them signed out.
+    fn fake_bridge() -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut request = [0u8; 1024];
+                let n = stream.read(&mut request).unwrap_or(0);
+                let first = String::from_utf8_lossy(&request[..n]).lines().next().unwrap_or_default().to_string();
+                let body = if first.contains("/login") {
+                    r#"{"access_points":[{"signed_in":true},{"signed_in":false}]}"#
+                } else {
+                    r#"{"ready":true,"sessions":1,"access_points":2,"reply_source":"dom","access_point_sessions":[1,0]}"#
+                };
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn bridge_adopts_a_running_bridge_switches_provider_and_asks_for_sign_in() {
+        let mut rig = rig(None).await;
+        let port = fake_bridge();
+        let mut preset = swarm_runtime::chatgpt_web_provider_config();
+        preset.base_url = Some(format!("http://127.0.0.1:{port}"));
+        rig.chat.cfg.providers.push(preset);
+        // A config that lists chatgpt-web has already accepted that it costs money.
+        rig.chat.cfg.zero_cost = false;
+        rig.chat.cfg.scheduler.zero_cost = false;
+        assert_eq!(rig.chat.cfg.provider.as_str(), "mock");
+
+        assert_eq!(rig.chat.submit(&mut rig.ui, "/bridge --agents 5".into()).await, Flow::Continue);
+        let text = rig.text();
+        assert!(text.contains("already answering"), "{text}");
+        assert!(text.contains("2 browser(s) for 5 agent(s)"), "{text}");
+        assert!(text.contains("sign in to ChatGPT in the 1 browser window"), "{text}");
+        assert_eq!(rig.chat.cfg.provider.as_str(), "chatgpt-web");
+        assert_eq!(rig.chat.cfg.agents, 5);
+        let provider = rig.chat.cfg.providers.iter().find(|p| p.name.as_str() == "chatgpt-web").unwrap();
+        assert_eq!(provider.max_concurrency, Some(5));
+
+        rig.chat.submit(&mut rig.ui, "/bridge status".into()).await;
+        let text = rig.text();
+        assert!(text.contains("browser 1 \u{00b7} signed in"), "{text}");
+        assert!(text.contains("browser 2 \u{00b7} NOT signed in"), "{text}");
+        assert!(text.contains("not started by this session"), "{text}");
+
+        rig.chat.submit(&mut rig.ui, "/bridge stop".into()).await;
+        assert!(rig.text().contains("this session did not start it, so it is left alone"), "a bridge that is not ours is never killed");
+        rig.chat.submit(&mut rig.ui, "/bridge nonsense".into()).await;
+        assert!(rig.text().contains("usage: /bridge"), "{}", rig.text());
     }
 }

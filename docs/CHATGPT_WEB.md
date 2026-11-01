@@ -34,6 +34,40 @@ Playwright launched. Sign in once through `npm run chrome` (plain Chrome, no
 automation), then attach the bridge with `--cdp`. Treat that first real run as a
 smoke test: one agent, one task, browser visible, and watch the Chrome tab.
 
+## Start it from inside Swarm
+
+In an interactive `swarm` session, one command does everything below, on
+Windows, Linux and macOS:
+
+```
+/bridge 6          # or: /bridge --agents 6
+/bridge status     # which browsers are signed in, chats per browser
+/bridge stop       # stop the bridge (the browser windows stay open)
+```
+
+`/bridge N` opens one Chrome per three agents (at most 8), each with its own
+profile and DevTools port, starts the bridge attached to them, switches the
+session to the `chatgpt-web` provider, and sets the agent count and request
+concurrency to N. A browser that is not signed in is already sitting on
+chatgpt.com: sign in there (the login is kept for next time), then `/bridge
+status` to confirm. Browsers that are already open are reused, so running it
+again is safe; running it with a different N restarts the bridge it started with
+the new size. A bridge you started yourself in another terminal is detected and
+used as it is, never killed.
+
+The bridge process belongs to the session and ends with it. The Chrome windows
+are detached, so they keep their sign-in and survive the session. Profiles live
+in `bridges/chatgpt-web/.chrome-pool/browser-N` (the same ones `start-pool.ps1`
+uses), DevTools ports are 9230 and up, and the bridge log is
+`swarm-chatgpt-bridge.log` in the system temp directory. The first run also does
+`npm ci` for the bridge.
+
+Needs `node` and `npm` on `PATH` and a Chrome or Chromium. Overrides:
+`SWARM_CHROME` (browser path) and `SWARM_BRIDGE_DIR` (the `bridges/chatgpt-web`
+directory, when swarm runs from outside a checkout). On Linux a desktop session
+is required (`DISPLAY` or `WAYLAND_DISPLAY`); over plain SSH, start the bridge by
+hand as below. The bridge's `GET /login` reports `signed_in` per browser.
+
 ## Start the browser
 
 Install the bridge dependency once:

@@ -397,7 +397,7 @@ fn relax_token_ceiling(cfg: &mut RunConfig) {
 /// Apply `--provider/--model/--base-url/--approve-all` to a config. Shared by
 /// `swarm run` and the interactive session so both resolve providers the same
 /// way (presets, workspace binding, zero-cost policy).
-fn apply_provider_overrides(
+pub(crate) fn apply_provider_overrides(
     cfg: &mut RunConfig,
     provider: Option<&str>,
     model: Option<&str>,

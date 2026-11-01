@@ -29,6 +29,15 @@ const html = `<!doctype html><title>ChatGPT fixture</title>
   // /app?shape=2026 renders the current (2026) ChatGPT markup: role-keyed turn
   // units, a hidden "ChatGPT said:" label, and completion on the turn wrapper.
   const shape = new URL(location.href).searchParams.get('shape');
+  // /app?signedout=1: a logged-out visitor still gets a composer, plus Log in /
+  // Sign up buttons in the header, as on the live site.
+  if (new URL(location.href).searchParams.get('signedout')) {
+    for (const label of ['Log in', 'Sign up']) {
+      const button = document.createElement('button');
+      button.textContent = label;
+      document.querySelector('header').append(button);
+    }
+  }
   // Sidebar row + actions menu, mirroring the live site's pairing (chat link and
   // "Chat actions" button 1:1 in DOM order) so the menu delete path is testable.
   const side = document.getElementById('side');
@@ -119,6 +128,32 @@ const html = `<!doctype html><title>ChatGPT fixture</title>
     document.body.append(stop);
     await fetch('/fixture/turn', { method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ id: conv, prompt }) });
+    if (prompt.startsWith('connector ')) {
+      // A connector asks before it acts: the answer waits for a button, as the live
+      // site does. The reply says which button was pressed.
+      const asks = prompt.includes('write') ? 'ChatGPT wants to use GitHub to post a comment on pull request 12 in coalign/platform.'
+        : prompt.includes('other') ? 'ChatGPT wants to use Google Drive to read the file plan.md.'
+        : 'ChatGPT wants to use GitHub to read the open pull requests in coalign/platform.';
+      const card = document.createElement('div');
+      card.setAttribute('role', 'dialog');
+      const words = document.createElement('p');
+      words.textContent = asks;
+      card.append(words);
+      for (const name of ['Allow', 'Always allow', 'Decline']) {
+        const choice = document.createElement('button');
+        choice.textContent = name;
+        choice.onclick = () => {
+          card.remove();
+          bubble.innerText = 'CONNECTOR:' + name;
+          bubble.setAttribute('aria-busy', 'false');
+          turn?.setAttribute('data-talvt-turn-state', 'complete');
+          stop.remove();
+        };
+        card.append(choice);
+      }
+      document.body.append(card);
+      return;
+    }
     setTimeout(() => {
       if (/TOOL RESULT/.test(prompt)) {
         bubble.innerText = 'The file is verified. Done.';

@@ -11,3 +11,8 @@ bridges/gemini-web/.gemini-browser-profile/
 bridges/chatgpt-web/node_modules/
 bridges/chatgpt-web/.chatgpt-browser-profile/
 bridges/chatgpt-web/.chrome-cdp/
+
+# ChatGPT bridge: Chrome profiles hold login cookies; never commit them
+bridges/chatgpt-web/.chrome-pool/
+bridges/chatgpt-web/.chrome-cdp/
+bridges/chatgpt-web/*.log

@@ -29,6 +29,11 @@ const useApi = !args.includes('--no-api');
 // Deleting the chat on close is the polite default; --keep-chats leaves the
 // conversation in history (useful when debugging a failed run).
 const keepChats = args.includes('--keep-chats');
+// ChatGPT pauses mid-answer and asks before a connector acts (an Allow / Decline
+// card). Nobody is watching the bridge's browser, so the answer stalls until the
+// response timeout. Read-only GitHub requests are allowed; --no-connector-approve
+// leaves every card for a person.
+const approveConnectors = !args.includes('--no-connector-approve');
 const responseTimeoutMs = Number(option('--response-timeout-ms', '600000'));
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid --port');
 if (!Number.isFinite(responseTimeoutMs) || responseTimeoutMs < 1000) throw new Error('invalid --response-timeout-ms');
@@ -147,6 +152,8 @@ const browserGone = (error) =>
 
 // Launched profiles get an onboarding tab. An attached Chrome may already have
 // user tabs; never navigate one of those away from its current page.
+// The landing tab of each access point is kept so `/login` can read it later.
+const welcomePages = [];
 for (let index = 0; index < contexts.length; index++) {
   const context = contexts[index];
   const welcome = profiles.length
@@ -155,6 +162,7 @@ for (let index = 0; index < contexts.length; index++) {
   if (!welcome.url().startsWith(chatUrl)) {
     await welcome.goto(chatUrl, { waitUntil: 'domcontentloaded' });
   }
+  welcomePages.push(welcome);
 }
 
 class BridgeError extends Error {
@@ -618,6 +626,114 @@ async function loginWall(page) {
     /sign (in|up)|log ?in to|continue to chatgpt|create a free account|authenticat/i.test(text));
 }
 
+/// Is the browser behind this landing tab signed in? `true` / `false`, or `null`
+/// when the page is not somewhere that can tell (still loading, closed, or on a
+/// page the user navigated to). A signed-out chatgpt.com still shows a composer,
+/// so a visible composer alone proves nothing: the Log in / Sign up buttons and
+/// the sign-in modal are what mark it signed out.
+async function signedIn(page) {
+  if (!page || page.isClosed()) return null;
+  const url = page.url();
+  if (/auth\.openai\.com|accounts\.google\.com|appleid\.apple\.com|login\.microsoftonline\.com|\/auth\//.test(url)) {
+    return false;
+  }
+  if (!url.startsWith(chatUrl)) return null;
+  if (await loginWall(page)) return false;
+  const signedOutButton = page.locator('[data-testid="login-button"], [data-testid="signup-button"]')
+    .or(page.getByRole('button', { name: /^(log in|sign up)$/i }))
+    .or(page.getByRole('link', { name: /^(log in|sign up)$/i }))
+    .first();
+  if (await signedOutButton.isVisible().catch(() => false)) return false;
+  return (await firstVisible(page, COMPOSER, 1500)) ? true : null;
+}
+
+// Buttons of a connector confirmation card. "Always allow" is deliberately not an
+// allow label: it would grant the connector standing permission, and this only
+// answers the one request that is blocking the turn.
+const CONNECTOR_ALLOW = '^(allow|allow once|confirm|approve|continue|yes)$';
+const CONNECTOR_DECLINE = "^(decline|deny|don['’]?t allow|do not allow|cancel|reject|no|block)$";
+// What the card says it wants to do, with the button labels removed. Reading a
+// pull request or a file matches none of these; changing GitHub does.
+const CONNECTOR_WRITE = /\b(creat|post|comment|merg|push|commit|delet|remov|clos|writ|edit|updat|submit|approv|assign|fork|revert|dismiss|publish|upload|request changes)/i;
+
+/// The confirmation card the page is showing, if any: a pair of Allow and Decline
+/// buttons in one small container, with that container's own text. The buttons are
+/// tagged in the page so Playwright can click them for real.
+async function connectorCard(page) {
+  return page.evaluate(({ allow, decline }) => {
+    const yesRe = new RegExp(allow, 'i');
+    const noRe = new RegExp(decline, 'i');
+    for (const old of document.querySelectorAll('[data-swarm-connector]')) old.removeAttribute('data-swarm-connector');
+    const label = (node) => (node.innerText || node.getAttribute('aria-label') || '').trim();
+    const shown = (node) => !!(node.offsetWidth || node.offsetHeight || node.getClientRects().length);
+    const clickable = (root) => [...root.querySelectorAll('button, [role="button"]')].filter(shown);
+    const textOf = (root) => {
+      const copy = root.cloneNode(true);
+      for (const button of copy.querySelectorAll('button, [role="button"]')) button.remove();
+      return (copy.textContent || '').replace(/\s+/g, ' ').trim();
+    };
+    for (const yes of clickable(document).filter((node) => yesRe.test(label(node)))) {
+      for (let node = yes.parentElement; node; node = node.parentElement) {
+        const no = clickable(node).find((other) => other !== yes && noRe.test(label(other)));
+        if (!no) continue;
+        // The card's own wording may sit a few levels above the buttons; stop
+        // before the container grows to hold the conversation, whose text can
+        // mention GitHub for reasons that have nothing to do with the card.
+        let context = node;
+        for (let up = 0; up < 4 && context.parentElement && textOf(context.parentElement).length <= 800; up += 1) {
+          context = context.parentElement;
+        }
+        yes.setAttribute('data-swarm-connector', 'allow');
+        no.setAttribute('data-swarm-connector', 'decline');
+        return { text: textOf(context).slice(0, 600) };
+      }
+    }
+    return null;
+  }, { allow: CONNECTOR_ALLOW, decline: CONNECTOR_DECLINE }).catch(() => null);
+}
+
+/// Answers a connector card once: allow a GitHub request that only reads, decline
+/// a GitHub request that would change something (so the model hears "no" at once
+/// instead of the turn hanging), leave any other connector alone. Returns what it
+/// did, or null when there was no card.
+async function answerConnectorCard(page) {
+  const card = await connectorCard(page);
+  if (!card) return null;
+  const github = /github/i.test(card.text);
+  const writes = CONNECTOR_WRITE.test(card.text);
+  const action = !github ? 'left' : writes ? 'decline' : 'allow';
+  if (action !== 'left') {
+    await page.locator(`[data-swarm-connector="${action}"]`).first().click({ timeout: 3000 }).catch(() => {});
+  }
+  return { action, text: card.text };
+}
+
+/// Runs for the length of one message: while ChatGPT works on the reply, look for
+/// a connector card every second and answer it. Covers every way of waiting for
+/// the reply, since the card can appear in any of them.
+async function withConnectorApproval(page, work) {
+  if (!approveConnectors) return work();
+  let live = true;
+  const reported = new Set();
+  const loop = (async () => {
+    while (live) {
+      await page.waitForTimeout(1000).catch(() => { live = false; });
+      if (!live) break;
+      const done = await answerConnectorCard(page).catch(() => null);
+      if (!done || reported.has(done.text + done.action)) continue;
+      reported.add(done.text + done.action);
+      const verb = { allow: 'allowed', decline: 'declined (it would change GitHub)', left: 'left for a person (not GitHub)' }[done.action];
+      console.log(`[connector] ${verb}: ${done.text.slice(0, 200)}`);
+    }
+  })();
+  try {
+    return await work();
+  } finally {
+    live = false;
+    await loop;
+  }
+}
+
 /// Type the prompt into the composer and prove the DOM took it, retrying when a
 /// late hydration resets the editor.
 ///
@@ -700,7 +816,7 @@ async function sendLogged(session, prompt, fresh = false) {
     session.rotate = false;
   }
   session.log.push({ role: 'user', text: prompt });
-  const reply = await sendMessage(session, prompt);
+  const reply = await withConnectorApproval(session.page, () => sendMessage(session, prompt));
   session.log.push({ role: 'assistant', text: reply.text });
   if (fresh) {
     session.log = [];
@@ -990,6 +1106,11 @@ const server = http.createServer(async (req, res) => {
         access_point_sessions: accessPointLoad(), max_tabs: maxTabs,
         unavailable: contexts.map((_, index) => index).filter((index) => (deadUntil.get(index) ?? 0) > Date.now()),
       });
+    }
+    if (req.method === 'GET' && path === '/login') {
+      // One entry per access point, in --cdp / --profile order.
+      const states = await Promise.all(welcomePages.map((page) => signedIn(page).catch(() => null)));
+      return json(res, 200, { access_points: states.map((signed_in) => ({ signed_in })) });
     }
     if (req.method === 'POST' && path === '/sessions') {
       const body = await readJson(req);
