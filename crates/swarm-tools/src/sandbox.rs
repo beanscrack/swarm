@@ -26,6 +26,7 @@ pub struct SandboxConfig {
     /// Refs `git push` may target from a worker shell: branch, `remote/branch`, or `*`.
     /// Empty refuses every push. A guardrail on the command string, not a sandbox.
     pub allow_push: Vec<String>,
+    pub docker_image: Option<String>,
 }
 
 impl SandboxConfig {
@@ -42,6 +43,7 @@ impl SandboxConfig {
             output_cap_bytes: DEFAULT_OUTPUT_CAP,
             allow_network: true,
             allow_push: Vec::new(),
+            docker_image: None,
         }
     }
 
@@ -67,6 +69,11 @@ impl SandboxConfig {
 
     pub fn root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    pub fn docker_image(mut self, image: Option<String>) -> Self {
+        self.docker_image = image;
+        self
     }
 
     /// Resolve a tool-supplied path to an absolute path inside the sandbox, or
@@ -115,6 +122,14 @@ pub fn resolve_within(root: &Path, p: &str) -> Result<PathBuf, ToolError> {
     let normalized = normalize_lexical(&candidate);
     let root_norm = normalize_lexical(root);
     if normalized == root_norm || normalized.starts_with(&root_norm) {
+        if let Ok(actual_root) = std::fs::canonicalize(&root_norm) {
+            let mut ancestor = normalized.as_path();
+            while std::fs::symlink_metadata(ancestor).is_err() {
+                let Some(parent) = ancestor.parent() else { break; }; ancestor = parent;
+            }
+            let actual = std::fs::canonicalize(ancestor).map_err(|_| ToolError::PathEscape { path:p.into() })?;
+            if !actual.starts_with(actual_root) { return Err(ToolError::PathEscape { path:p.into() }); }
+        }
         Ok(normalized)
     } else {
         Err(ToolError::PathEscape {

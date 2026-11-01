@@ -41,13 +41,13 @@ pub fn project_instructions(workspace: &Path) -> Option<String> {
 pub fn system_prompt(role: AgentRole, mode: RunMode) -> String {
     let role_prompt: &'static str = match role {
         AgentRole::Worker => {
-            "You are a coding agent. Use the provided tools to complete the task inside the workspace. Verify your work (run tests/read files back). When finished, reply with a brief summary and NO tool calls. You cannot create, edit, read, download, or test anything by yourself: a file exists only because a tool call in this conversation created it. Never say a file was written, read, verified, or attached unless you issued that tool call and saw its result."
+            "You are a coding agent. Use the provided tools to complete the task inside the workspace. Verify your work (run tests/read files back). When finished, reply with a brief summary and NO tool calls. You cannot create, edit, read, download, or test anything by yourself: a file exists only because a tool call in this conversation created it. Never say a file was written, read, verified, or attached unless you issued that tool call and saw its result. Use command-line tools through the bash tool (for GitHub, the gh CLI), never a chat connector or app. Unless the task says so, do not post, comment, merge, push, or change anything outside the workspace. When the task covers several items, end with one plain-text block per item (identifier, verdict, findings with file:line and a suggested fix, evidence), cover every item exactly once, and say plainly when you could not examine one."
         }
         AgentRole::Planner => {
-            "You are a planner. Decompose the objective into worker tasks. Each worker must verify its own output. Prefer independent tasks that can run in parallel. If a task requires another task's output, list the earlier task's zero-based index in depends_on. Do not create a standalone verification task without that dependency. Reply with a fenced ```swarm JSON block: {\"plan\":{\"steps\":[{\"description\":\"specific worker objective\",\"kind\":\"implementation\",\"priority\":0,\"depends_on\":[]}],\"expected_artifacts\":[],\"success_criteria\":[]}}. Do not call tools."
+            "You are a planner. Decompose the objective into worker tasks. Each worker must verify its own output. Prefer independent tasks that can run in parallel. If a task requires another task's output, list the earlier task's zero-based index in depends_on. Do not create a standalone verification task without that dependency. Two ways to delegate. (1) When you can split the work from the objective alone, reply with a fenced ```swarm JSON block: {\"plan\":{\"steps\":[{\"description\":\"specific worker objective\",\"kind\":\"implementation\",\"priority\":0,\"depends_on\":[]}],\"expected_artifacts\":[],\"success_criteria\":[]}}. (2) When the work is over a set of items you must look up first (open pull requests, changed files, failing tests, cases), list them yourself with your tools (for GitHub use the gh CLI through the bash tool, never a ChatGPT connector or app), then call the spawn_agents tool once with one task per group of about 2 items (1 for anything large, such as a pull request with thousands of changed lines: a worker reads about 8 KB per step, so a big diff takes many steps; group more only when items are tiny), split so every item is in exactly one task. There may be more tasks than agents; the extras queue. But you may start at most 16 workers in total across ALL your spawn_agents calls, so with many items count first: give every task at least ceil(items / 16) items, and put the large ones in tasks of their own only if that stays within 16. spawn_agents runs the tasks in parallel in separate agent sessions, waits, and returns every worker's result. Workers cannot see this conversation, so each task must be self-contained: name the repository and the exact identifiers, the commands to use, what to check, that it is read-only unless the objective says otherwise, and the report format, which is one plain-text block per item with a verdict, findings (severity, file:line, explanation, suggested fix) and the evidence. Do not review or fix items yourself. When the results are in, check that every item appears exactly once and send any missing or unexamined item back in a follow-up spawn_agents call. Then reply in plain text, with no tool calls: one combined report ordered by severity, followed by a coverage list of every item. Unless the objective asks for it, nothing is posted, merged, pushed or changed outside the workspace."
         }
         AgentRole::Reviewer => {
-            "You are a reviewer. Independently check the task result against its objective: read the artifacts, run tests where available, and say whether the result holds. When finished, reply with a brief verdict and NO tool calls."
+            "You are a reviewer. Independently inspect the relevant files/diffs and attempt real checks without modifying source files. Use at least two substantive tools. Before finishing, call report_result with status, summary, verdict (APPROVE, REQUEST_CHANGES, INCONCLUSIVE), blockers (file, positive line, claim, verification: executed|code_inspection|unverified, repro_command and observed_output or null), and checks (exact command, exact observed_output excerpt). Distinguish code inspection from executed reproductions. Swarm checks every claimed command and output against recorded tool results. If you cannot complete the review, report INCONCLUSIVE. Then reply with a brief summary."
         }
     };
     format!("{role_prompt}\n\nRun mode: {}.", mode_str(mode))
@@ -78,6 +78,29 @@ fn mode_str(mode: RunMode) -> &'static str {
     }
 }
 
+/// Fixed rules put in front of every worker a planner starts. The planner writes
+/// the task text, and a chat model paraphrases or drops rules there (a worker
+/// reviewed PRs through ChatGPT's own GitHub connector and said gh was
+/// unavailable), so Swarm states them itself and the planner cannot weaken them.
+/// Provider-neutral: the provider adds its own tool-call format on every turn.
+pub const WORKER_RULES: &str = "SWARM WORKER RULES (set by Swarm, not by the planner):\n\
+- You act only by requesting Swarm tools; the shell tool is `bash`. Never use a chat connector or app (GitHub, Drive), a browser, or a sandbox of your own: anything done there does not exist for Swarm and the result is thrown away.\n\
+- For GitHub use the gh CLI through the bash tool (gh pr view / diff / checks <n> --repo <owner/repo>). gh is installed and logged in on the machine Swarm runs on. If you think it is unavailable, you were looking in your own sandbox: run `gh --version` through bash to check before saying so.\n\
+- This task is read-only unless it says otherwise: do not post, comment, merge, push, or change anything outside the workspace.\n\
+- Read the actual diff of every item through bash before you judge it; Swarm checks the commands you ran against your report and sends it back if they do not match. You see about 8 KB of a command's output per step, so do not page blindly through a big diff: save it (`gh pr diff <n> --repo <owner/repo> > pr<n>.diff`), list its files with line numbers (`grep -n '^diff --git' pr<n>.diff`), then read the slices that matter (`sed -n '<from>,<to>p' pr<n>.diff`): source and logic first, tests next, and skip lockfiles, generated and vendored files.\n\
+- Finish with plain text and no tool call, as the whole reply and not as a file or download: one block per item, each starting with its identifier and a `Verdict:` line (no issues / issues found / could not review, with the reason), then for each finding its severity, file:line, one sentence on the problem and one on the fix. Keep the whole report under 1,500 characters: your report is cut to a share of the planner's window. Cover every item exactly once and say plainly which one you could not examine and why.\n";
+
+/// The user message for a worker: the planner's task under [`WORKER_RULES`] when a
+/// planner started it, the plain task otherwise.
+fn worker_message(run: &Run, task: &Task) -> String {
+    let body = format!("Objective: {}\nTask: {}\n{}", run.objective, task.title, task.objective);
+    if task.role == AgentRole::Worker && task.parent_id.is_some() {
+        format!("{WORKER_RULES}\n{body}")
+    } else {
+        body
+    }
+}
+
 /// Builds the initial message list for an agent starting on `task` in `run`.
 pub fn initial_messages(run: &Run, task: &Task) -> Vec<ChatMessage> {
     initial_messages_with(run, task, None)
@@ -96,7 +119,7 @@ pub fn initial_messages_with(
             format!("Objective: {}\nTask: {}\n{}\nWorker subtasks: {}",
                 run.objective, task.title, task.objective, run.agent_target.saturating_sub(1))
         } else {
-            format!("Objective: {}\nTask: {}\n{}", run.objective, task.title, task.objective)
+            worker_message(run, task)
         }),
     ]
 }
@@ -139,6 +162,29 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, ChatRole::System);
         assert_eq!(msgs[1].role, ChatRole::User);
+    }
+
+    #[test]
+    fn a_worker_a_planner_started_gets_the_fixed_rules_in_front_of_its_task() {
+        let (run, mut task) = fixture();
+        let alone = initial_messages(&run, &task);
+        assert!(!alone[1].content.contains("SWARM WORKER RULES"), "a lone worker is unchanged");
+
+        task.parent_id = Some(TaskId::new());
+        task.objective = "review PRs 1-4 with the GitHub connector".to_string();
+        let spawned = initial_messages(&run, &task);
+        let user = &spawned[1].content;
+        assert!(user.starts_with("SWARM WORKER RULES"), "rules come first: {user}");
+        assert!(user.contains("never use a chat connector") || user.contains("Never use a chat connector"));
+        assert!(user.contains("gh --version"), "{user}");
+        let rules_at = user.find("SWARM WORKER RULES").unwrap();
+        let task_at = user.find("review PRs 1-4").unwrap();
+        assert!(rules_at < task_at, "the planner's text cannot come before or replace the rules");
+        assert!(user.contains("Objective: ship the thing"), "the mock reads this line: {user}");
+
+        task.role = AgentRole::Reviewer;
+        let reviewer = initial_messages(&run, &task);
+        assert!(!reviewer[1].content.contains("SWARM WORKER RULES"), "reviewers get no worker rules");
     }
 
     #[test]

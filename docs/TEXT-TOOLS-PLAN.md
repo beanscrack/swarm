@@ -1,7 +1,16 @@
 # Text tool protocol: turning tool-call-free endpoints into agents
 
 Status: prototype, phase 1 landed (parser + prompt, `crates/swarm-providers/src/text_tools.rs`).
-Wiring is phases 2-3.
+Explicit transport selection is wired through run/chat/resume, jobs, and MCP:
+`--tool-protocol auto|native|text`, `SWARM_TOOL_PROTOCOL`, or top-level
+`tool_protocol = "text"` in run TOML. Jobs persist the selection for verification
+rounds and resume. `auto` uses declared capabilities; it does not probe the server.
+Direct `swarm resume` invocations must repeat the override.
+
+The offline CLI integration test `forced_text_protocol_acts_and_continues_from_real_tool_results`
+uses a streaming OpenAI-compatible server returning only text calls: read a file,
+receive its real contents, write the result, and report completion. A live Swift/F12
+run is still required to establish model reliability.
 
 ## The gap
 

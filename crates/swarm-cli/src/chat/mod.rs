@@ -922,11 +922,13 @@ mod tests {
         assert!(rig.chat.last_result.contains("understood"), "{}", rig.chat.last_result);
         let text = rig.text();
         assert!(text.contains("\u{273b} "), "the turn closes with the flourish line: {text}");
-        assert!(text.contains("139 tokens"), "{text}");
+        // The mock estimates usage from the prompt, so this moves with the worker
+        // system prompt's length.
+        assert!(text.contains("248 tokens"), "{text}");
         // The next turn is told about the first.
         rig.chat.submit(&mut rig.ui, "and again".into()).await;
         assert_eq!(rig.chat.session.turns.len(), 2);
-        assert!(rig.chat.session.totals.tokens > 139);
+        assert!(rig.chat.session.totals.tokens > 248);
     }
 
     #[tokio::test]

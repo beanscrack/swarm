@@ -295,6 +295,23 @@ impl MockSession {
                 .and_then(|n| n.parse::<usize>().ok()).unwrap_or(1);
             let objective = user.and_then(|m| m.content.lines()
                 .find_map(|line| line.strip_prefix("Objective: "))).unwrap_or("the objective");
+            // An objective asking for "via spawn_agents" exercises the lead path: the
+            // planner starts two workers with the tool, then answers with what came back.
+            if objective.contains("via spawn_agents") && request.tools.iter().any(|t| t.name == "spawn_agents") {
+                let results = request.messages.iter().rev()
+                    .find(|m| m.role == swarm_core::message::ChatRole::Tool);
+                return Ok(match results {
+                    None => MockStep::tool_calls(vec![NativeToolCall::new(
+                        "call_spawn",
+                        "spawn_agents",
+                        json!({"tasks": [
+                            {"title": "first half", "description": "review the first half"},
+                            {"description": "review the second half"},
+                        ]}),
+                    )]),
+                    Some(done) => MockStep::text(format!("combined report\n{}", done.content)),
+                });
+            }
             let steps: Vec<_> = (1..=workers).map(|i| json!({
                 "description": format!("Complete independent work item {i} for: {objective}"),
                 "kind": "implementation", "priority": 0,

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use swarm_core::config::{ApprovalPolicy, RunConfig};
+use swarm_core::config::{ApprovalPolicy, RunConfig, ToolProtocolSelection, TaskPreset};
 use swarm_core::event::RunEvent;
 use swarm_core::run::{Run, RunMode};
 use swarm_core::{ProviderId, RunId, RunStatus};
@@ -65,6 +65,9 @@ pub struct StoreArgs {
 #[derive(Debug, Args)]
 pub struct RunArgs {
     goal: String,
+    /// Budget and task-role defaults; explicit ceilings take precedence.
+    #[arg(long)]
+    preset: Option<TaskPreset>,
     #[arg(long)]
     provider: Option<String>,
     #[arg(long)]
@@ -81,6 +84,12 @@ pub struct RunArgs {
     model: Option<String>,
     #[arg(long)]
     base_url: Option<String>,
+    /// Tool transport: auto follows provider capabilities; text forces fenced JSON calls.
+    #[arg(long, env = "SWARM_TOOL_PROTOCOL")]
+    tool_protocol: Option<ToolProtocolSelection>,
+    #[arg(long)]
+    sandbox_image: Option<String>,
+
     /// Refs this run's workers may `git push` to: a branch, `remote/branch`, or `*` for
     /// anything. Repeatable. The default - no flag - blocks every push from the worker
     /// shell, so the orchestrator keeps ownership of remote writes.
@@ -133,6 +142,9 @@ pub struct ChatArgs {
     pub model: Option<String>,
     #[arg(long)]
     pub base_url: Option<String>,
+    /// Tool transport: auto follows provider capabilities; text forces fenced JSON calls.
+    #[arg(long, env = "SWARM_TOOL_PROTOCOL")]
+    pub tool_protocol: Option<ToolProtocolSelection>,
     #[arg(long)]
     pub agents: Option<u32>,
     #[arg(long)]
@@ -174,6 +186,13 @@ pub struct ResumeArgs {
     model: Option<String>,
     #[arg(long)]
     base_url: Option<String>,
+    /// Tool transport: auto follows provider capabilities; text forces fenced JSON calls.
+    #[arg(long, env = "SWARM_TOOL_PROTOCOL")]
+    tool_protocol: Option<ToolProtocolSelection>,
+    #[arg(long)]
+    sandbox_image: Option<String>,
+    #[arg(long)]
+    config: Option<PathBuf>,
     #[arg(long)]
     agents: Option<u32>,
     /// Raise the run's token ceiling. Usage is cumulative, so a run that died on
@@ -239,6 +258,7 @@ pub(crate) fn default_chat_args() -> ChatArgs {
         provider: None,
         model: None,
         base_url: None,
+        tool_protocol: None,
         agents: None,
         approve_all: false,
         resume: None,
@@ -295,11 +315,18 @@ fn run_config(args: &RunArgs) -> Result<RunConfig> {
         RunConfig::mock(&args.goal, args.agents.unwrap_or(1))
     };
     cfg.objective = args.goal.clone();
+    if let Some(image) = &args.sandbox_image { cfg.tools.docker_image = Some(image.clone()); }
+    if let Some(preset) = args.preset { cfg.preset = preset; }
     if let Some(agents) = args.agents {
         if agents == 0 {
             bail!("--agents must be at least 1");
         }
         cfg.agents = agents;
+    }
+    if let Some((tokens, steps)) = cfg.preset.limits() {
+        cfg.budget.max_total_tokens = tokens;
+        cfg.budget.max_steps_per_agent = steps;
+        cfg.budget.max_inference_calls = cfg.agents.max(1) as u64 * steps as u64;
     }
     if let Some(steps) = args.max_steps {
         if steps == 0 {
@@ -338,10 +365,33 @@ fn run_config(args: &RunArgs) -> Result<RunConfig> {
         args.provider.as_deref(),
         args.model.as_deref(),
         args.base_url.as_deref(),
+        args.tool_protocol,
         &args.workspace,
         args.approve_all,
     )?;
+    // A ceiling from `--max-tokens` or a config file is the user's; only the mock
+    // config's built-in default is relaxed.
+    if args.max_tokens.is_none() && args.config.is_none() && args.preset.is_none() {
+        relax_token_ceiling(&mut cfg);
+    }
     Ok(cfg)
+}
+
+/// A provider that is not billed per call (a local model, a chat subscription) has no
+/// spend for the token ceiling to guard: its token figure is an estimate of the prompt
+/// re-sent on every step, and enforcing the mock config's 200000 ended a six-worker PR
+/// review mid-way while steps, calls and wall-clock time were nowhere near their limits.
+/// So the built-in default ceiling is lifted for those providers; calls, steps and
+/// wall-clock time still bound the run and an on-demand provider keeps the ceiling.
+fn relax_token_ceiling(cfg: &mut RunConfig) {
+    let free = cfg
+        .providers
+        .iter()
+        .find(|p| p.name == cfg.provider)
+        .is_some_and(|p| p.billing != swarm_core::budget::BillingMode::OnDemand);
+    if free {
+        cfg.budget.max_total_tokens = swarm_core::budget::ResourceBudget::default().max_total_tokens;
+    }
 }
 
 /// Apply `--provider/--model/--base-url/--approve-all` to a config. Shared by
@@ -352,16 +402,20 @@ fn apply_provider_overrides(
     provider: Option<&str>,
     model: Option<&str>,
     base_url: Option<&str>,
+    tool_protocol: Option<ToolProtocolSelection>,
     workspace: &Path,
     approve_all: bool,
 ) -> Result<()> {
+    if let Some(protocol) = tool_protocol {
+        cfg.tool_protocol = protocol;
+    }
     if let Some(name) = provider {
-        let preset = match name {
+        let preset = if cfg.providers.iter().any(|p| p.name.as_str() == name) { None } else { match name {
             "local" => Some(local_provider_config()),
             "chatgpt-web" => Some(swarm_runtime::chatgpt_web_provider_config()),
             "gemini-web" => Some(swarm_runtime::gemini_web_provider_config()),
             _ => None,
-        };
+        }};
         if let Some(selected) = preset {
             cfg.provider = selected.name.clone();
             cfg.model = selected.model.clone();
@@ -401,6 +455,7 @@ fn apply_provider_overrides(
             bail!("--base-url requires an OpenAI-compatible or browser-chat provider");
         }
         selected.base_url = Some(url.to_string());
+        selected.endpoints.clear();
     }
     if !cfg.may_run(&cfg.providers[selected_index]) {
         bail!(
@@ -428,9 +483,11 @@ pub(crate) fn chat_config(args: &ChatArgs) -> Result<RunConfig> {
         args.provider.as_deref(),
         args.model.as_deref(),
         args.base_url.as_deref(),
+        args.tool_protocol,
         &args.workspace,
         args.approve_all,
     )?;
+    relax_token_ceiling(&mut cfg);
     Ok(cfg)
 }
 
@@ -462,7 +519,10 @@ pub(crate) fn tool_names(cfg: &RunConfig, workspace: &Path) -> Result<Vec<String
         .command_timeout(Duration::from_secs(cfg.tools.command_timeout_secs))
         .output_cap_bytes(cfg.tools.max_output_bytes)
         .allow_network(cfg.tools.allow_network)
-        .allow_push(cfg.tools.allow_push.clone());
+        .allow_push(cfg.tools.allow_push.clone())
+        .docker_image(cfg.tools.docker_image.clone());
+    if sandbox.docker_image.is_some() && !sandbox.allow_push.is_empty() { bail!("isolated workers cannot receive push grants"); }
+    swarm_tools::isolation::prepare_repository(&sandbox).map_err(|e| anyhow!(e))?;
     Ok(ToolExecutor::new(sandbox).tool_names())
 }
 
@@ -550,11 +610,18 @@ pub(crate) async fn drive_turn(
         .allow_network(cfg.tools.allow_network)
         .allow_push(cfg.tools.allow_push.clone());
     let executor = Arc::new(ToolExecutor::new(sandbox));
+    let mut instructions = swarm_runtime::project_instructions(workspace).unwrap_or_default();
+    let repo_map = if let Some(path) = &cfg.repo_map_file {
+        Some(std::fs::read_to_string(path).with_context(|| format!("read repository map {}", path.display()))?
+            .chars().take(cfg.repo_map_chars).collect::<String>())
+    } else { swarm_runtime::repo_map::repository_map(workspace, cfg.repo_map_chars) };
+    if let Some(map) = repo_map { instructions.push_str("\n\n"); instructions.push_str(&map); }
     let runtime = Runtime::new(store.clone(), registry, executor, scheduler)
         .with_approval(cfg.tools.approval)
+        .with_tool_protocol(cfg.tool_protocol)
         // Claude Code reads CLAUDE.md from the project root; do the same for
         // AGENTS.md/CLAUDE.md so repo instructions reach every agent.
-        .with_instructions(swarm_runtime::project_instructions(workspace));
+        .with_instructions(Some(instructions));
     let created = match existing {
         // Resuming continues the run that is already in the store; a new goal
         // creates one. The scheduler picks up persisted task state either way.
@@ -799,12 +866,16 @@ async fn resume(args: ResumeArgs) -> Result<CommandOutcome> {
     }
     // Rebuild the run's settings: the stored provider name resolves through the
     // same preset path as `--provider`, and the stored budget is respected.
-    let mut cfg = RunConfig::mock(&run.objective, run.agent_target.max(1));
+    let mut cfg = if let Some(path) = &args.config {
+        toml::from_str::<RunConfig>(&std::fs::read_to_string(path)?)?
+    } else { RunConfig::mock(&run.objective, run.agent_target.max(1)) };
+    if let Some(image) = &args.sandbox_image { cfg.tools.docker_image = Some(image.clone()); }
     apply_provider_overrides(
         &mut cfg,
-        args.provider.as_deref().or(Some(run.provider.as_str())),
+        args.provider.as_deref().or_else(|| if args.config.is_none() { Some(run.provider.as_str()) } else { None }),
         args.model.as_deref(),
         args.base_url.as_deref(),
+        args.tool_protocol,
         &args.workspace,
         args.approve_all,
     )?;
@@ -1076,6 +1147,34 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
+    fn the_default_token_ceiling_is_lifted_only_for_a_provider_not_billed_per_call() {
+        let default = swarm_core::budget::ResourceBudget::default().max_total_tokens;
+        let chat = |provider: &str| {
+            let args = ChatArgs { provider: Some(provider.to_string()), agents: Some(4), ..default_chat_args() };
+            chat_config(&args).unwrap().budget.max_total_tokens
+        };
+        assert_eq!(chat("chatgpt-web"), default, "a chat subscription has no spend to guard");
+        assert_eq!(chat("local"), default);
+        assert_eq!(chat("mock"), default, "the mock is zero-cost");
+        // The calls bound is untouched: 4 agents x 40.
+        let cfg = chat_config(&ChatArgs { provider: Some("chatgpt-web".into()), agents: Some(4), ..default_chat_args() }).unwrap();
+        assert_eq!(cfg.budget.max_inference_calls, 160);
+    }
+
+    #[test]
+    fn a_ceiling_the_user_set_is_not_lifted() {
+        let mut cfg = RunConfig::mock("goal", 1);
+        cfg.budget.max_total_tokens = 300;
+        // `--max-tokens`/a config file: run_config skips the relaxation; simulated here by
+        // not calling it, then checking the on-demand case keeps its ceiling too.
+        assert_eq!(cfg.budget.max_total_tokens, 300);
+        let mut metered = RunConfig::mock("goal", 1);
+        metered.providers[0].billing = swarm_core::budget::BillingMode::OnDemand;
+        relax_token_ceiling(&mut metered);
+        assert_eq!(metered.budget.max_total_tokens, 200_000, "an on-demand provider keeps the ceiling");
+    }
+
+    #[test]
     fn a_resume_raise_only_raises_and_steps_carry_inference_calls() {
         let mut budget = RunConfig::mock("goal", 1).budget;
         budget.max_total_tokens = 100;
@@ -1279,6 +1378,105 @@ mod tests {
                 .to_string()
                 .contains("not configured")
         );
+    }
+
+    #[tokio::test]
+    async fn forced_text_protocol_acts_and_continues_from_real_tool_results() {
+        use serde_json::{Value, json};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::matchers::{method, path};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("work");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("input.txt"), "evidence-73").unwrap();
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(body.get("tools").is_none(), "text mode must omit native tools");
+                assert!(body["messages"].as_array().unwrap().iter().any(|m|
+                    m["role"] == "system" && m["content"].as_str().unwrap_or("").contains("read_file")));
+                let step = seen.fetch_add(1, Ordering::SeqCst);
+                let text = match step {
+                    0 => json!({"tool":"read_file", "arguments":{"path":"input.txt"}}).to_string(),
+                    1 => {
+                        assert!(body["messages"].as_array().unwrap().iter().any(|m|
+                            m["role"] == "tool" && m["content"].as_str().unwrap_or("").contains("evidence-73")),
+                            "the next inference must receive the real file contents");
+                        json!({"tool":"write_file", "arguments":{"path":"output.txt", "content":"evidence-73"}}).to_string()
+                    },
+                    2 => json!({"tool":"report_result", "arguments":{"status":"success", "summary":"Copied evidence-73", "artifacts":["output.txt"]}}).to_string(),
+                    _ => "Copied evidence-73 to output.txt.".into(),
+                };
+                let chunk = json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]});
+                ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
+            }).mount(&server).await;
+        let cli = Cli::try_parse_from([
+            "swarm", "run", "Copy input.txt to output.txt using tools", "--provider", "local",
+            "--base-url", &format!("{}/v1", server.uri()), "--tool-protocol", "text",
+            "--workspace", workspace.to_str().unwrap(), "--store", temp.path().join("store").to_str().unwrap(),
+            "--approve-all", "--plain", "--max-steps", "6",
+        ]).unwrap();
+        let outcome = execute(cli).await.unwrap();
+        assert!(outcome.success, "{}", outcome.text);
+        assert_eq!(std::fs::read_to_string(workspace.join("output.txt")).unwrap(), "evidence-73");
+        assert!(calls.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[tokio::test]
+    async fn reviewer_requires_and_accepts_recorded_inspection_and_checks() {
+        use serde_json::{Value,json};
+        let temp = TempDir::new().unwrap(); let workspace = temp.path().join("work");
+        std::fs::create_dir_all(&workspace).unwrap(); std::fs::write(workspace.join("a.txt"),"review target").unwrap();
+        let server = MockServer::start().await; let steps = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST")).and(path("/v1/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let step = steps.fetch_add(1,Ordering::SeqCst);
+                let text = match step {
+                    0 => json!({"tool":"read_file","arguments":{"path":"a.txt"}}).to_string(),
+                    1 => json!({"tool":"run_tests","arguments":{"command":"echo REVIEW_CHECK"}}).to_string(),
+                    2 => json!({"tool":"report_result","arguments":{"status":"success","summary":"inspected and checked",
+                        "verdict":"APPROVE","blockers":[],"checks":[{"command":"echo REVIEW_CHECK","observed_output":"REVIEW_CHECK"}]}}).to_string(),
+                    _ => "Review complete".into(),
+                };
+                let chunk = json!({"choices":[{"delta":{"content":text},"finish_reason":"stop"}]});
+                ResponseTemplate::new(200).set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
+            }).mount(&server).await;
+        let cli = Cli::try_parse_from(["swarm","run","Review a.txt","--provider","local","--preset","reviewer",
+            "--tool-protocol","text","--base-url",&format!("{}/v1",server.uri()),"--workspace",workspace.to_str().unwrap(),
+            "--store",temp.path().join("store").to_str().unwrap(),"--approve-all","--plain"]).unwrap();
+        let result = execute(cli).await.unwrap(); assert!(result.success,"{}",result.text);
+        let store = Store::open(&temp.path().join("store")).await.unwrap(); let run = select_run(&store,None).await.unwrap();
+        let events = store.latest_events(&run.id,1000).await.unwrap();
+        let report = crate::job::reported_result(&events).unwrap();
+        let audit: Value = swarm_runtime::review::audit_review(&workspace,&events,Some(&report),2);
+        assert_eq!(audit["trusted"],true,"{audit}");
+        let empty = execute(Cli::try_parse_from(["swarm","run","Review without doing anything","--provider","mock","--preset","reviewer",
+            "--workspace",workspace.to_str().unwrap(),"--store",temp.path().join("empty").to_str().unwrap(),"--approve-all","--plain"]).unwrap()).await.unwrap();
+        assert!(!empty.success,"an empty reviewer must fail its evidence gate");
+    }
+
+    #[test]
+    fn tool_protocol_defaults_and_overrides_are_validated() {
+        let mut config = RunConfig::mock("goal", 1);
+        config.tool_protocol = ToolProtocolSelection::Text;
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("swarm.toml");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        for (extra, expected) in [(vec![], ToolProtocolSelection::Text), (vec!["--tool-protocol", "native"], ToolProtocolSelection::Native)] {
+            let mut argv = vec!["swarm", "run", "goal", "--config", path.to_str().unwrap()];
+            argv.extend(extra);
+            let Cli { command: Some(Command::Run(args)) } = Cli::try_parse_from(argv).unwrap() else { unreachable!() };
+            assert_eq!(run_config(&args).unwrap().tool_protocol, expected);
+        }
+        assert!(Cli::try_parse_from(["swarm", "run", "goal", "--tool-protocol", "invalid"]).is_err());
+        let old = toml::to_string(&RunConfig::mock("old", 1)).unwrap().replace("tool_protocol = \"auto\"\n", "");
+        assert_eq!(toml::from_str::<RunConfig>(&old).unwrap().tool_protocol, ToolProtocolSelection::Auto);
     }
 
     #[tokio::test]

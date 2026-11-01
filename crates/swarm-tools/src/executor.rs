@@ -167,6 +167,9 @@ impl ToolExecutor {
     }
 
     async fn run_shell(&self, command: &str, timeout: Duration) -> ToolResult {
+        if self.config.docker_image.is_some() {
+            return self.run_isolated("/bin/sh", &["-c".into(), command.into()], timeout).await;
+        }
         // Push guardrail. The orchestrator owns remote writes: a worker that pushes
         // creates branches and PRs nobody asked for, under the human's own credentials.
         // `--allow-push <ref>` names the refs this job may push to; anything else is
@@ -206,6 +209,22 @@ impl ToolExecutor {
                 None,
                 false,
             ),
+        }
+    }
+
+    async fn run_isolated(&self, program: &str, args: &[String], timeout: Duration) -> ToolResult {
+        let mut container = match crate::isolation::container_command(&self.config, program, args) {
+            Ok(command) => command, Err(error) => return ToolResult::failure(error),
+        };
+        container.command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        match tokio::time::timeout(timeout, container.command.output()).await {
+            Ok(Ok(output)) => {
+                let (content, a) = cap_output(&output.stdout, self.config.output_cap_bytes);
+                let (stderr, b) = cap_output(&output.stderr, self.config.output_cap_bytes);
+                ToolResult::command(content, stderr, output.status.code(), a || b)
+            }
+            Ok(Err(error)) => ToolResult::failure(format!("isolated command failed: {error}")),
+            Err(_) => ToolResult::failure("isolated command timed out; container stopped"),
         }
     }
 
@@ -341,6 +360,15 @@ impl ToolExecutor {
     /// one back, so nothing is written here. A bad report fails with the reason so
     /// the model can fix and resend it.
     fn tool_report_result(&self, input: &Value) -> ToolResult {
+        if input.get("verdict").is_some() || input.get("blockers").is_some() {
+            let report = match serde_json::from_value::<swarm_core::review::ReviewReport>(input.clone()) {
+                Ok(report) => report,
+                Err(error) => return ToolResult::failure(format!("invalid review report: {error}")),
+            };
+            if let Err(error) = report.validate() {
+                return ToolResult::failure(error);
+            }
+        }
         let status = Self::str(input, "status").unwrap_or("");
         if !matches!(status, "success" | "partial" | "failed") {
             return ToolResult::failure("report_result: 'status' must be success, partial or failed");
@@ -456,6 +484,7 @@ impl ToolExecutor {
             for entry in read.flatten() {
                 let p = entry.path();
                 let rels = rel_str(&p, &base);
+                if p.is_symlink() { continue; }
                 if p.is_dir() {
                     stack.push(p);
                 } else if let Ok(bytes) = std::fs::read(&p) {
@@ -494,6 +523,10 @@ impl ToolExecutor {
     // ---- interpreter / vcs tools -----------------------------------------
 
     async fn tool_python(&self, input: &Value) -> ToolResult {
+        if self.config.docker_image.is_some() {
+            let Some(code) = Self::str(input, "code") else { return ToolResult::failure("python code required"); };
+            return self.run_isolated("python3", &["-c".into(), code.into()], Self::timeout_for(input, &self.config)).await;
+        }
         let code = match Self::str(input, "code") {
             Some(c) if !c.trim().is_empty() => c.to_string(),
             _ => return ToolResult::failure("python: 'code' is required"),
@@ -553,6 +586,7 @@ impl ToolExecutor {
             return ToolResult::failure("git: 'args' must be a non-empty array");
         }
         let timeout = Self::timeout_for(input, &self.config);
+        if self.config.docker_image.is_some() { return self.run_isolated("git", &args, timeout).await; }
         let mut cmd = tokio::process::Command::new("git");
         cmd.args(&args);
         cmd.current_dir(&self.config.workspace_root);
@@ -593,6 +627,7 @@ fn collect_paths(dir: &Path, base: &Path, out: &mut Vec<String>, max: usize) {
         if out.len() >= max {
             return;
         }
+        if p.is_symlink() { continue; }
         if p.is_dir() {
             collect_paths(&p, base, out, max);
         }

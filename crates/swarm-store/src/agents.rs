@@ -6,6 +6,13 @@ use sqlx::Row;
 use swarm_core::{AgentId, AgentRole, RunId, TaskId, agent::{Agent, AgentCheckpoint}, state::AgentState};
 
 impl Store {
+    /// Latest agent bound to a task, including its checkpoint after recovery.
+    pub async fn agent_for_task(&self, task: &TaskId) -> Result<Option<Agent>> {
+        let row = sqlx::query("SELECT * FROM agents WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1")
+            .bind(task.as_str()).fetch_optional(&self.pool).await?;
+        row.as_ref().map(row_to_agent).transpose()
+    }
+
     pub async fn create_agent(&self, agent: &Agent) -> Result<()> {
         sqlx::query(
             "INSERT INTO agents (id, run_id, task_id, parent_id, role, state, depth, steps, created_at, updated_at) \
@@ -188,6 +195,7 @@ mod tests {
             tool_calls: vec![],
             child_task_ids: vec![],
             usage: BudgetUsage::default(),
+            ..Default::default()
         };
         store.save_checkpoint(&agent.id, &run_id, &cp, 100).await.unwrap();
         let cp = store.load_checkpoint(&agent.id).await.unwrap().unwrap();

@@ -1,5 +1,10 @@
 ﻿# Orchestrating swarm from another agent
 
+Current dispatch policy: builder/test-writer jobs require a red baseline `--verify` gate.
+Use `--preset reviewer` for evidence-gated reviews or `--preset general` for exploration.
+See [AGENT-CONTRACTS.md](AGENT-CONTRACTS.md) for the full configuration and acceptance contracts.
+
+
 An agent such as Hermes, Claude Code or Codex can use swarm as a pool of workers:
 launch several in the background, carry on, then collect structured results. The
 worker is a swarm agent with file, shell, python and git tools. The orchestrator

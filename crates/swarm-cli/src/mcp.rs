@@ -30,7 +30,7 @@ const INSTRUCTIONS: &str = "Swarm runs coding workers in the background. Launch 
 work with swarm_submit (give every worker the goal, how to verify success, and a repo so it gets its own \
 git worktree), keep working or launch more, then swarm_wait for them and read swarm_result: the worker's \
 structured report (status, metrics, artifacts), its summary, and a patch for repo jobs. Compare results \
-across workers by their metrics and apply the best patch yourself.";
+across workers by their metrics and apply the best patch yourself. Builder jobs (the default) and test-writer jobs require a verify command that fails before dispatch. Use preset reviewer for independent read-only reviews with structured verdict/blockers/checks, or preset general for exploration. Endpoint pools, protocol selection and native options can be supplied in a config TOML.";
 
 pub async fn serve(args: McpArgs) -> Result<()> {
     let jobs = job::jobs_dir(args.jobs.as_deref());
@@ -120,6 +120,8 @@ async fn call_tool(jobs: &Path, name: &str, arguments: &Value) -> Result<Value> 
         "swarm_submit" => job::submit_job(
             jobs,
             SubmitArgs {
+                policy: serde_json::from_value(arguments.clone())?,
+                config: text(arguments, "config").map(PathBuf::from),
                 goal: text(arguments, "goal"),
                 workspace: text(arguments, "workspace").map(PathBuf::from),
                 repo: text(arguments, "repo").map(PathBuf::from),
@@ -128,6 +130,7 @@ async fn call_tool(jobs: &Path, name: &str, arguments: &Value) -> Result<Value> 
                 key: text(arguments, "key"),
                 provider: text(arguments, "provider"),
                 base_url: text(arguments, "base_url"),
+                tool_protocol: text(arguments, "tool_protocol").map(|p| p.parse()).transpose()?,
                 model: text(arguments, "model"),
                 agents: number(arguments, "agents").map(|n| n as u32),
                 max_steps: number(arguments, "max_steps").map(|n| n as u32),
@@ -198,6 +201,14 @@ by reporting structured status and metrics, which swarm_result returns.",
                     "provider": {"type": "string", "description": "Provider (mock, local, chatgpt-web, ...); default SWARM_PROVIDER."},
                     "model": {"type": "string"},
                     "base_url": {"type": "string", "description": "Provider endpoint override, e.g. http://127.0.0.1:8790/v1 for a local OpenAI-compatible server. Without it the job inherits $SWARM_BASE_URL, which pins every MCP job to the host's configured provider (a browser bridge on some hosts, which stalls long runs)."},
+                    "tool_protocol": {"type": "string", "enum": ["auto", "native", "text"], "description": "Tool transport override. Use text for endpoints without native function calling; persisted for retries and resume."},
+                    "config": {"type":"string", "description":"Run TOML path, including native provider options and endpoint pools."},
+                    "preset": {"type":"string", "enum":["general","builder","reviewer","test-writer"], "default":"builder", "description":"Builder/test-writer require a red baseline --verify gate. Reviewer requires structured evidence. Explicit budgets override preset ceilings."},
+                    "min_tool_calls":{"type":"integer", "minimum":2},
+                    "freshness_ref":{"type":"string"},
+                    "max_active_jobs":{"type":"integer", "minimum":1},
+                    "priority":{"type":"integer", "description":"Higher goes first; queued jobs age one point per minute. Reviewers default to 20, builders 0."},
+                    "sandbox_image":{"type":"string", "description":"Preinstalled Docker image for network-free command isolation."},
                     "agents": {"type": "integer", "description": "Agents inside the job (default 1)."},
                     "max_steps": {"type": "integer", "description": "Model turns the worker may take (default 40)."},
                     "max_inference_calls": {"type": "integer", "description": "Inference calls the worker may make. Defaults to max-steps x agents, so raising max-steps alone is enough; set this only to give a retrying worker more calls than its step budget."},

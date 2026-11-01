@@ -7,11 +7,14 @@
 mod agent;
 mod approval;
 mod error;
+mod evidence;
 mod factory;
 mod hooks;
 mod prompt;
+pub mod repo_map;
 mod reply;
 mod runtime;
+pub mod review;
 
 pub use agent::{AgentOutcome, AgentRunner};
 pub use approval::{ApprovalHandler, ApprovalRequest};

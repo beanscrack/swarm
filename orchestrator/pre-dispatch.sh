@@ -2,7 +2,8 @@
 # Pre-dispatch dedupe: refuse to spend worker budget on work an open PR already covers.
 # Learned from a 90-call worker dispatched at an issue whose fix was already a green open PR.
 #
-# Usage: pre-dispatch.sh <owner/repo> <issue> [path ...]
+# Usage: pre-dispatch.sh <owner/repo> <issue> --gate <command> --workspace <path> [path ...]
+# Reviewer/exploration: --preset reviewer|general (no red gate required).
 #   paths = files the brief will touch; overlap with an open PR is reported as a stop.
 # Exit: 0 = clear to dispatch, 10 = STOP (overlap found), 2 = usage/API problem.
 set -euo pipefail
@@ -10,7 +11,37 @@ set -euo pipefail
 repo="${1:?usage: pre-dispatch.sh <owner/repo> <issue> [path ...]}"
 issue="${2:?missing issue number}"
 shift 2
-paths=("$@")
+preset=builder
+gate=""
+workspace=.
+paths=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --gate) gate="${2:?missing gate command}"; shift 2 ;;
+    --workspace) workspace="${2:?missing workspace}"; shift 2 ;;
+    --preset) preset="${2:?missing preset}"; shift 2 ;;
+    *) paths+=("$1"); shift ;;
+  esac
+done
+case "$preset" in
+  builder|test-writer)
+    [ -n "$gate" ] || { echo "STOP: builder/test-writer dispatch requires --gate <failing command>" >&2; exit 11; }
+    set +e
+    (cd "$workspace" && bash -c "$gate")
+    gate_status=$?
+    set -e
+    if [ "$gate_status" = 0 ]; then
+      echo "STOP: baseline gate is green; there is no demonstrated failing check" >&2; exit 11
+    fi
+    if [ "$gate_status" = 126 ] || [ "$gate_status" = 127 ]; then
+      echo "STOP: gate could not execute; this is not evidence of a failing check" >&2; exit 2
+    fi
+    note_gate="red baseline gate (exit $gate_status)"
+    ;;
+  reviewer|general) note_gate="read-only/exploration policy" ;;
+  *) echo "unknown preset: $preset" >&2; exit 2 ;;
+esac
+printf 'POLICY  %s\n' "$note_gate"
 
 command -v gh >/dev/null || { echo "gh required" >&2; exit 2; }
 

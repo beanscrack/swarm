@@ -22,12 +22,12 @@ use tokio::time::sleep;
 use swarm_core::agent::{Agent, AgentCheckpoint};
 use swarm_core::state::AgentState;
 use swarm_core::budget::{BudgetUsage, ResourceBudget};
-use swarm_core::config::ApprovalPolicy;
+use swarm_core::config::{ApprovalPolicy, ToolProtocolSelection};
 use swarm_core::event::{EventKind, RunEvent};
-use swarm_core::message::{ChatMessage, MessageToolCall};
+use swarm_core::message::{ChatMessage, ChatRole, MessageToolCall};
 use swarm_core::run::Run;
 use swarm_core::task::Task;
-use swarm_core::tool::{ToolKind, ToolRequestValidation};
+use swarm_core::tool::{ToolKind, ToolRequestValidation, ToolSchema, ToolSpec};
 use swarm_core::protocol::AgentPlan;
 use swarm_core::{AgentRole, ProviderId, StateMachine, TaskId, TaskState};
 use swarm_providers::{
@@ -37,6 +37,7 @@ use swarm_providers::{
 use swarm_store::Store;
 use swarm_tools::{ToolCall, ToolExecutor, ToolResult};
 
+use crate::evidence;
 use crate::prompt::initial_messages_with;
 use crate::reply::parse_plan;
 use crate::approval::{ApprovalHandler, ApprovalRequest};
@@ -58,6 +59,7 @@ pub struct AgentRunner {
     pub registry: Arc<ProviderRegistry>,
     pub executor: Arc<ToolExecutor>,
     pub approval: ApprovalPolicy,
+    pub tool_protocol: ToolProtocolSelection,
     pub approval_handler: Option<Arc<dyn ApprovalHandler>>,
     /// The host's look at each call before and after it runs.
     pub hooks: Option<Arc<dyn ToolHooks>>,
@@ -104,6 +106,100 @@ fn plan_batches(concurrent: &[bool], max: usize) -> Vec<std::ops::Range<usize>> 
 
 /// Inference retries per step, after the first attempt.
 const MAX_RETRIES: u32 = 3;
+
+/// The tool a planner uses to start worker agents mid-conversation and wait for
+/// them. It is not in the executor's catalog: it needs the store, so the runner
+/// handles it, and only a planner is offered it.
+const SPAWN_TOOL: &str = "spawn_agents";
+
+/// How often a waiting planner looks at its workers' task states.
+const SPAWN_POLL: Duration = Duration::from_millis(750);
+
+/// All workers' reports together in the one result handed back to the planner. They
+/// share it equally, so the last worker is not the one that is cut off: a planner that
+/// cannot see a report asks for it again, and the review is done twice.
+const SPAWN_TOTAL_CHARS: usize = 10_500;
+/// One worker's share is never below or above these, however many workers there are.
+const SPAWN_SHARE_MIN: usize = 600;
+const SPAWN_SHARE_MAX: usize = 3_000;
+/// Per worker, on top of its report: the `[worker n] title` line and a cut marker.
+const SPAWN_OVERHEAD: usize = 200;
+
+/// Characters of report each of `workers` gets so that all of them, headers included,
+/// fit in [`SPAWN_TOTAL_CHARS`].
+fn report_share(workers: usize) -> usize {
+    (SPAWN_TOTAL_CHARS / workers.max(1)).saturating_sub(SPAWN_OVERHEAD).clamp(SPAWN_SHARE_MIN, SPAWN_SHARE_MAX)
+}
+/// The `spawn_agents` result bypasses [`MODEL_OUTPUT_CAP`], which keeps only the head
+/// of a result and would drop every report after the second or third. It stays below
+/// the provider's newest-result window.
+const SPAWN_OUTPUT_CAP: usize = 12 * 1024;
+
+/// `report` cut to `share` characters, saying so (and by how much) when it is.
+fn clip_report(report: &str, share: usize) -> String {
+    let total = report.chars().count();
+    if total <= share {
+        return report.to_string();
+    }
+    let head: String = report.chars().take(share).collect();
+    format!("{head}\n…[cut: {total} characters, first {share} shown]")
+}
+
+fn spawn_spec() -> ToolSpec {
+    ToolSpec::new(
+        SPAWN_TOOL,
+        ToolKind::Custom,
+        "Start worker agents in parallel, one per task, each in its own session with the usual file, \
+         shell and git tools, and wait until every one has finished. Returns each worker's final report \
+         (or why it failed). Workers cannot see this conversation, so every task must be self-contained: \
+         name the repository, identifiers and exactly what to report back. At most as many run at once \
+         as the agent target allows; the rest queue.",
+        ToolSchema::new(json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "One self-contained instruction per worker.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "description": "Short label"},
+                            "description": {"type": "string", "description": "Full instructions for the worker"}
+                        },
+                        "required": ["description"]
+                    }
+                }
+            },
+            "required": ["tasks"]
+        })),
+    )
+}
+
+/// The worker instructions in a `spawn_agents` call: `(title, description)` each.
+fn spawn_requests(input: &Value) -> Result<Vec<(String, String)>, String> {
+    let list = input.get("tasks").and_then(Value::as_array)
+        .ok_or("spawn_agents: 'tasks' must be an array")?;
+    if list.is_empty() {
+        return Err("spawn_agents: 'tasks' must not be empty".to_string());
+    }
+    list.iter().enumerate().map(|(index, item)| {
+        // A bare string is a description with no title.
+        let (title, description) = match item {
+            Value::String(text) => (None, Some(text.as_str())),
+            other => (
+                other.get("title").and_then(Value::as_str),
+                other.get("description").and_then(Value::as_str),
+            ),
+        };
+        let description = description.map(str::trim).filter(|d| !d.is_empty())
+            .ok_or_else(|| format!("spawn_agents: tasks[{index}].description is required"))?;
+        if description.len() > 4_000 {
+            return Err(format!("spawn_agents: tasks[{index}].description is too long"));
+        }
+        let title = title.map(str::trim).filter(|t| !t.is_empty()).unwrap_or(description);
+        Ok((title.chars().take(120).collect(), description.to_string()))
+    }).collect()
+}
 
 /// A fresh `AgentCheckpoint` seeded with the run/task prompt.
 fn fresh_checkpoint(run: &Run, task: &Task, instructions: Option<&str>) -> AgentCheckpoint {
@@ -165,10 +261,11 @@ impl AgentRunner {
                 .await;
         }
         let key = provider_entry.id().as_str().to_string();
-        let tool_protocol = if provider_entry.capabilities().tools {
-            ToolProtocol::Native
-        } else {
-            ToolProtocol::Text
+        let tool_protocol = match self.tool_protocol {
+            ToolProtocolSelection::Native => ToolProtocol::Native,
+            ToolProtocolSelection::Text => ToolProtocol::Text,
+            ToolProtocolSelection::Auto if provider_entry.capabilities().tools => ToolProtocol::Native,
+            ToolProtocolSelection::Auto => ToolProtocol::Text,
         };
         let mut session: Box<dyn Session> = provider_entry
             .start_session(SessionConfig::default())
@@ -235,7 +332,7 @@ impl AgentRunner {
             )
             .await?;
             let started = Instant::now();
-            let resp = match self
+            let mut resp = match self
                 .infer(session, key, run, agent, task, &cp.messages, tool_protocol)
                 .await
             {
@@ -248,6 +345,17 @@ impl AgentRunner {
                 }
             };
             let latency_ms = started.elapsed().as_millis() as u64;
+
+            // Some compatible servers omit usage, including on their streaming path.
+            // Keep budgets bounded and make the estimate visible instead of recording zero.
+            let usage_estimated = resp.usage.input_tokens == 0 && resp.usage.output_tokens == 0;
+            if usage_estimated {
+                let input_chars = cp.messages.iter().map(|m| m.content.chars().count()).sum::<usize>()
+                    + serde_json::to_string(&self.executor.catalog().specs).unwrap_or_default().len();
+                resp.usage.input_tokens = (input_chars as u64).div_ceil(4).max(1);
+                resp.usage.output_tokens = ((resp.text.len() + resp.thinking.len()
+                    + serde_json::to_string(&resp.tool_calls).unwrap_or_default().len()) as u64).div_ceil(4);
+            }
 
             // Record usage + spend and announce the completed step.
             let spend = provider_entry.pricing().estimate(&resp.usage);
@@ -270,6 +378,7 @@ impl AgentRunner {
                 json!({
                     "step": cp.steps,
                     "model": provider_entry.model(),
+                    "usage_source": if usage_estimated { "estimated" } else { "provider" },
                     "input_tokens": resp.usage.input_tokens,
                     "output_tokens": resp.usage.output_tokens,
                     "spend_micros": spend,
@@ -290,7 +399,7 @@ impl AgentRunner {
                     cp.format_retries += 1;
                     if cp.format_retries > run.budget.max_format_retries {
                         return self.finish_failed(run, agent, task,
-                            "Gemini did not provide a valid tool request after format retries".to_string(), false).await;
+                            format!("the model did not provide a valid tool request in {} replies in a row", cp.format_retries), false).await;
                     }
                     cp.messages.push(ChatMessage::assistant(resp.text.clone()));
                     cp.messages.push(ChatMessage::user(
@@ -326,6 +435,22 @@ impl AgentRunner {
                             self.save(run, agent, task, &cp, now).await?;
                             return self.finish_completed(run, agent, task, format!("Planned {count} worker tasks")).await;
                         }
+                        // A planner that looked things up with tools, or ran workers,
+                        // and now answers in prose is giving its final answer.
+                        Ok(None) if !cp.tool_calls.is_empty() => {
+                            let problems = evidence::problems(task, &cp.tool_calls, &resp.text);
+                            if !problems.is_empty() && cp.evidence_retries < evidence::MAX_CORRECTIONS {
+                                cp.evidence_retries += 1;
+                                cp.messages.push(ChatMessage::assistant(resp.text.clone()));
+                                cp.messages.push(ChatMessage::user(evidence::correction(&problems)));
+                                self.save(run, agent, task, &cp, now).await?;
+                                continue;
+                            }
+                            let text = if problems.is_empty() { resp.text.clone() } else { evidence::annotate(&resp.text, &problems) };
+                            cp.messages.push(ChatMessage::assistant(text.clone()));
+                            self.save(run, agent, task, &cp, now).await?;
+                            return self.finish_completed(run, agent, task, text).await;
+                        }
                         invalid => {
                             cp.format_retries += 1;
                             if cp.format_retries > run.budget.max_format_retries {
@@ -341,13 +466,52 @@ impl AgentRunner {
                         }
                     }
                 } else {
+                    // A worker's "done" is checked against the calls Swarm recorded for
+                    // it: it is sent back (twice at most) for a review that skipped the
+                    // diffs, a missing verdict or an offered download, and past that its
+                    // report is kept but marked, so nothing unverified passes as verified.
+                    if task.role == AgentRole::Reviewer {
+                        let audit = self.review_audit(run, agent).await?;
+                        if audit["trusted"] != true {
+                            if cp.evidence_retries >= evidence::MAX_CORRECTIONS {
+                                return self.finish_failed(run, agent, task,
+                                    format!("unverified review: {}", audit["issues"]), false).await;
+                            }
+                            cp.evidence_retries += 1;
+                            cp.messages.push(ChatMessage::assistant(resp.text.clone()));
+                            cp.messages.push(ChatMessage::user(format!(
+                                "Review evidence rejected: {}. Inspect the work, attempt checks, and call report_result with verdict, blockers and checks matching the real tool results.", audit["issues"])));
+                            self.save(run, agent, task, &cp, now).await?;
+                            continue;
+                        }
+                    }
+                    let problems = evidence::problems(task, &cp.tool_calls, &resp.text);
+                    if !problems.is_empty() && cp.evidence_retries < evidence::MAX_CORRECTIONS {
+                        cp.evidence_retries += 1;
+                        cp.messages.push(ChatMessage::assistant(resp.text.clone()));
+                        cp.messages.push(ChatMessage::user(evidence::correction(&problems)));
+                        self.save(run, agent, task, &cp, now).await?;
+                        continue;
+                    }
+                    let text = if problems.is_empty() { resp.text.clone() } else { evidence::annotate(&resp.text, &problems) };
+                    // Kept in the saved conversation so a planner waiting on this
+                    // worker can read its final report back.
+                    cp.messages.push(ChatMessage::assistant(text.clone()));
                     self.save(run, agent, task, &cp, now).await?;
-                    return self
-                        .finish_completed(run, agent, task, resp.text.clone())
-                        .await;
+                    return self.finish_completed(run, agent, task, text).await;
                 }
             }
 
+            // A valid tool request ends a run of malformed ones. The counter is for
+            // consecutive failures; never reset, it counted over the agent's whole life
+            // and killed a review at step 27 for its third malformed reply, with valid
+            // ones in between.
+            cp.format_retries = 0;
+            for (index, call) in resp.tool_calls.iter_mut().enumerate() {
+                if call.id.starts_with("text-") || cp.tool_calls.iter().any(|old| old.call_id == call.id) {
+                    call.id = format!("{}-{}-{index}-{}", agent.id, cp.steps, call.id);
+                }
+            }
             let calls: Vec<MessageToolCall> = resp
                 .tool_calls
                 .iter()
@@ -363,6 +527,140 @@ impl AgentRunner {
             self.process_tools(&resp.tool_calls, run, agent, task, &mut cp, now).await?;
             self.save(run, agent, task, &cp, now).await?;
         }
+    }
+
+    async fn review_audit(&self, run: &Run, agent: &Agent) -> anyhow::Result<Value> {
+        let events: Vec<_> = self.store.latest_events(&run.id, 100_000).await?
+            .into_iter().filter(|e| e.agent_id.as_ref() == Some(&agent.id)).collect();
+        let accepted: std::collections::HashSet<_> = events.iter()
+            .filter(|e| e.kind == EventKind::ToolResult
+                && e.payload["name"] == "report_result" && e.payload["success"] == true)
+            .filter_map(|e| e.payload["call_id"].as_str()).collect();
+        let report = events.iter().rev().find(|e| e.kind == EventKind::ToolRequested
+            && e.payload["name"] == "report_result"
+            && e.payload["call_id"].as_str().is_some_and(|id| accepted.contains(id)))
+            .map(|e| &e.payload["arguments"]);
+        Ok(crate::review::audit_review(self.executor.config.root(), &events, report, 2))
+    }
+
+    /// Runs a `spawn_agents` call: creates one worker task per request under
+    /// `task`, then holds this agent's session open until every one has finished
+    /// and returns what each reported. The driver keeps scheduling meanwhile (this
+    /// future is one of its in-flight agents), and keeps this agent's lease alive.
+    async fn spawn_agents(&self, run: &Run, agent: &Agent, task: &Task, input: &Value) -> ToolResult {
+        match self.spawn_and_wait(run, agent, task, input).await {
+            Ok(result) => result,
+            Err(e) => ToolResult::failure(format!("spawn_agents: {e}")),
+        }
+    }
+
+    async fn spawn_and_wait(&self, run: &Run, agent: &Agent, task: &Task, input: &Value) -> anyhow::Result<ToolResult> {
+        if task.role != AgentRole::Planner || run.agent_target < 2 {
+            return Ok(ToolResult::failure("spawn_agents is only available to a planner in a multi-agent run"));
+        }
+        let requests = match spawn_requests(input) {
+            Ok(requests) => requests,
+            Err(message) => return Ok(ToolResult::failure(message)),
+        };
+        // A planner holds one provider slot while it waits, so the workers need
+        // at least one more or they would never start.
+        let provider = ProviderId::new(run.provider.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(limit) = self.registry.find(&provider).and_then(|p| p.capabilities().max_concurrency) {
+            if limit < 2 {
+                return Ok(ToolResult::failure(format!(
+                    "the {provider} provider allows {limit} request at a time, so workers could never run beside the planner; do the work yourself"
+                )));
+            }
+        }
+        let all = self.store.list_tasks(&run.id).await?;
+        let count = requests.len();
+        run.budget.check_depth(task.depth + 1)?;
+        let earlier = all.iter().filter(|t| t.parent_id.as_ref() == Some(&task.id)).count();
+        // A planner gets this many workers over its whole life, not per call. Say so, and
+        // how many are left: a bare "requested 17 against limit 16" led a planner to
+        // throw away most of its plan and start three workers for twenty-three items.
+        let limit = run.budget.max_children_per_task as usize;
+        if run.budget.check_children(earlier + count).is_err() {
+            let left = limit.saturating_sub(earlier);
+            return Ok(ToolResult::failure(format!(
+                "spawn_agents: {count} tasks would make {} workers; a planner may start at most {limit} in total across all its spawn_agents calls ({earlier} already started, {left} left). Nothing was started. Regroup ALL the remaining items into at most {left} tasks, several items per task, and call spawn_agents again with every item still covered.",
+                earlier + count
+            )));
+        }
+        let pending = all.iter().filter(|t| matches!(t.state, TaskState::Pending | TaskState::Ready)).count();
+        run.budget.check_pending_tasks(pending, count)?;
+
+        let now = now_ms();
+        let children: Vec<Task> = requests.into_iter().enumerate().map(|(index, (title, objective))| Task {
+            id: TaskId::new(),
+            run_id: run.id.clone(),
+            parent_id: Some(task.id.clone()),
+            depth: task.depth + 1,
+            title,
+            objective,
+            role: AgentRole::Worker,
+            group: format!("{}-{}", task.id, earlier + index),
+            priority: 0,
+            depends_on: Vec::new(),
+            state: TaskState::Ready,
+            attempts: 0,
+            created_at: now,
+            updated_at: now,
+        }).collect();
+        self.store.create_tasks(&children).await?;
+        let ids: Vec<TaskId> = children.iter().map(|child| child.id.clone()).collect();
+        for child in &children {
+            self.store.append_event(&RunEvent::new(
+                EventKind::TaskStateChanged,
+                run.id.clone(),
+                json!({ "state": "ready", "parent_task_id": task.id.as_str() }),
+            ).with_task(child.id.clone()).with_agent(agent.id.clone())).await?;
+        }
+
+        loop {
+            let tasks = self.store.list_tasks(&run.id).await?;
+            let mine: Vec<&Task> = tasks.iter().filter(|t| ids.contains(&t.id)).collect();
+            if mine.len() == ids.len() && mine.iter().all(|t| t.state.is_terminal()) {
+                break;
+            }
+            sleep(SPAWN_POLL).await;
+        }
+
+        let agents = self.store.agents_for_run(&run.id).await?;
+        let mut report = String::new();
+        let mut failures = 0;
+        let share = report_share(children.len());
+        for (index, child) in children.iter().enumerate() {
+            let state = self.store.load_task(&child.id).await?.map_or(TaskState::Failed, |t| t.state);
+            let body = if state == TaskState::Completed {
+                self.final_reply(&agents, &child.id).await?.unwrap_or_else(|| "(finished without a final message)".to_string())
+            } else {
+                failures += 1;
+                format!("did not finish: task {}", state.as_str())
+            };
+            let body = clip_report(&body, share);
+            report.push_str(&format!("[worker {}] {}\n{}\n\n", index + 1, child.title, body));
+        }
+        let mut result = ToolResult::ok(format!(
+            "{} worker(s) finished, {} did not complete. Each report is shown up to {share} characters so all of them fit; a block that is cut, missing or marked UNVERIFIED needs a follow-up spawn_agents call for just those items.\n\n{}",
+            count, failures, report.trim_end()
+        ));
+        // Failed workers still return a usable report; the caller decides what to retry.
+        result.success = true;
+        Ok(result)
+    }
+
+    /// The last thing a task's agent said, from its saved conversation.
+    async fn final_reply(&self, agents: &[Agent], task: &TaskId) -> anyhow::Result<Option<String>> {
+        let Some(child) = agents.iter().rev().find(|a| &a.task_id == task) else {
+            return Ok(None);
+        };
+        let Some(cp) = self.store.load_checkpoint(&child.id).await? else {
+            return Ok(None);
+        };
+        Ok(cp.messages.iter().rev()
+            .find(|m| m.role == ChatRole::Assistant && !m.content.trim().is_empty())
+            .map(|m| m.content.trim().to_string()))
     }
 
     async fn create_children(
@@ -436,8 +734,10 @@ impl AgentRunner {
         for attempt in 0..=MAX_RETRIES {
             let mut req = SendRequest::new(messages.to_vec());
             req.tools = self.executor.catalog().specs.clone();
+            if task.role == AgentRole::Planner && run.agent_target > 1 {
+                req.tools.push(spawn_spec());
+            }
             req.tool_protocol = tool_protocol;
-            req.max_tokens = Some(8192);
             req.zero_cost = run.zero_cost;
             match session.send(req).await {
                 Ok(resp) => {
@@ -506,7 +806,16 @@ impl AgentRunner {
             let executions = range.clone().filter(|&i| prepared[i].approved).map(|i| {
                 let tc = &prepared[i].tc;
                 let call = ToolCall::new(tc.id.clone(), tc.name.clone(), tc.arguments.clone());
-                async move { (i, self.executor.execute(&call).await) }
+                async move {
+                    let mut result = if call.name == SPAWN_TOOL {
+                        self.spawn_agents(run, agent, task, &call.arguments).await
+                    } else {
+                        self.executor.execute(&call).await
+                    };
+                    result.call_id = call.id.clone();
+                    result.name = call.name.clone();
+                    (i, result)
+                }
             });
             for (i, result) in futures::future::join_all(executions).await {
                 results[i] = Some(result);
@@ -548,7 +857,11 @@ impl AgentRunner {
         )
         .await?;
 
-        let validation = self.executor.validate(name.as_str(), &tc.arguments);
+        let validation = if name == SPAWN_TOOL {
+            ToolRequestValidation::AutoApprove { reason: "starts worker agents inside this run".to_string() }
+        } else {
+            self.executor.validate(name.as_str(), &tc.arguments)
+        };
         let approval_risk = match &validation {
             ToolRequestValidation::AutoApprove { .. } if self.approval == ApprovalPolicy::AskAll => {
                 Some("approval policy asks for every tool".to_string())
@@ -627,6 +940,7 @@ impl AgentRunner {
     ) -> anyhow::Result<()> {
         let PreparedTool { tc, name, denial, hook_call, .. } = prepared;
         let tc = &tc;
+        let exit_code = result.as_ref().and_then(|r| r.exit_code);
         let (success, model_output, record, change) = match result {
             Some(result) => {
                 let mut out = result.as_model_output();
@@ -648,7 +962,8 @@ impl AgentRunner {
             }
         };
 
-        let (model_text, truncated) = cap_for_model(&model_output);
+        let cap = if name == SPAWN_TOOL { SPAWN_OUTPUT_CAP } else { MODEL_OUTPUT_CAP };
+        let (model_text, truncated) = cap_for_model(&model_output, cap);
         cp.messages.push(ChatMessage::tool(tc.id.clone(), model_text));
 
         cp.tool_calls.push(record);
@@ -666,7 +981,8 @@ impl AgentRunner {
                 "success": success,
                 "truncated": truncated,
                 "arguments": tc.arguments.clone(),
-                "output": model_output.chars().take(1200).collect::<String>(),
+                "exit_code": exit_code,
+                "output": model_output.chars().take(MODEL_OUTPUT_CAP).collect::<String>(),
                 // What a file tool changed, captured when it ran, so a UI can
                 // show an exact diff without racing the file system.
                 "change": change,
@@ -772,11 +1088,11 @@ fn now_ms() -> i64 {
 }
 
 /// Caps tool output fed back to the model; reports whether it was truncated.
-fn cap_for_model(out: &str) -> (String, bool) {
-    if out.len() <= MODEL_OUTPUT_CAP {
+fn cap_for_model(out: &str, cap: usize) -> (String, bool) {
+    if out.len() <= cap {
         (out.to_string(), false)
     } else {
-        let mut end = MODEL_OUTPUT_CAP;
+        let mut end = cap;
         while end > 0 && !out.is_char_boundary(end) {
             end -= 1;
         }
@@ -839,6 +1155,37 @@ fn budget_pressure(budget: &ResourceBudget, usage: &BudgetUsage, notified: u32) 
 #[cfg(test)]
 mod tests {
     use super::budget_pressure;
+    use super::{cap_for_model, clip_report, report_share, MODEL_OUTPUT_CAP, SPAWN_OUTPUT_CAP, SPAWN_OVERHEAD, SPAWN_TOTAL_CHARS};
+
+    #[test]
+    fn a_report_is_cut_to_its_share_and_says_so() {
+        assert_eq!(clip_report("short", 100), "short");
+        let cut = clip_report(&"x".repeat(500), 100);
+        assert!(cut.starts_with(&"x".repeat(100)) && !cut.starts_with(&"x".repeat(101)));
+        assert!(cut.contains("cut: 500 characters, first 100 shown"), "{cut}");
+    }
+
+    #[test]
+    fn six_workers_share_the_result_window_with_none_cut_off_entirely() {
+        // Reports plus per-worker headers stay inside the cap the result is stored
+        // under, so no worker's report falls off the end.
+        for workers in 1..=12usize {
+            let total = workers * (report_share(workers) + SPAWN_OVERHEAD);
+            assert!(total <= SPAWN_OUTPUT_CAP, "{workers} workers: {total} chars");
+        }
+        assert!(6 * (report_share(6) + SPAWN_OVERHEAD) <= SPAWN_TOTAL_CHARS);
+        assert_eq!(report_share(6), 1_550);
+        assert_eq!(report_share(1), 3_000, "one worker is capped, not given the whole window");
+    }
+
+    #[test]
+    fn the_spawn_result_is_not_headed_by_the_small_tool_output_cap() {
+        let result = "w".repeat(10_000);
+        let (small, small_cut) = cap_for_model(&result, MODEL_OUTPUT_CAP);
+        let (large, large_cut) = cap_for_model(&result, SPAWN_OUTPUT_CAP);
+        assert!(small_cut && small.len() < 9_000, "an ordinary tool result is still capped at 8 KiB");
+        assert!(!large_cut && large.len() == 10_000, "a spawn_agents result keeps every worker's share");
+    }
 
     #[test]
     fn pressure_arms_at_the_thresholds_and_fires_once_each() {
@@ -954,6 +1301,7 @@ mod tests {
             registry: Arc::new(registry),
             executor: Arc::new(executor),
             approval: ApprovalPolicy::Never,
+            tool_protocol: ToolProtocolSelection::Auto,
             approval_handler: None,
             hooks: None,
             instructions: None,
@@ -1357,10 +1705,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded.steps, 2, "resume should continue from the checkpointed step");
+        // Step 1 from the checkpoint plus the final reply this run added.
         assert_eq!(
             loaded.messages.len(),
-            base_len + 1,
+            base_len + 2,
             "resume should keep the checkpointed conversation (incl. step 1), not reset it"
         );
+        assert_eq!(loaded.messages[base_len].content, "step 1 done");
     }
 }

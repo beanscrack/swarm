@@ -20,7 +20,66 @@ string_enum! {
     }
 }
 
+string_enum! {
+    /// Tool transport selection. Auto follows the provider's declared capabilities.
+    pub enum ToolProtocolSelection {
+        Auto => "auto",
+        Native => "native",
+        Text => "text",
+    }
+}
+
+impl Default for ToolProtocolSelection {
+    fn default() -> Self { Self::Auto }
+}
+
 /// Configuration for one provider endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenAiOptions {
+    pub chat_template_kwargs: serde_json::Map<String, serde_json::Value>,
+    pub min_output_tokens: Option<u32>,
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub streaming: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskPreset { General, Builder, Reviewer, TestWriter }
+impl TaskPreset {
+    pub fn as_str(self) -> &'static str { match self {
+        Self::General => "general", Self::Builder => "builder", Self::Reviewer => "reviewer", Self::TestWriter => "test-writer",
+    }}
+}
+impl std::str::FromStr for TaskPreset {
+    type Err = crate::CoreError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> { match s {
+        "general" => Ok(Self::General), "builder" => Ok(Self::Builder), "reviewer" => Ok(Self::Reviewer),
+        "test-writer" => Ok(Self::TestWriter),
+        _ => Err(crate::CoreError::Config(format!("unknown task preset: {s}"))),
+    }}
+}
+
+impl Default for TaskPreset { fn default() -> Self { Self::General } }
+
+impl TaskPreset {
+    pub fn limits(self) -> Option<(u64, u32)> {
+        match self {
+            Self::General => None,
+            Self::Builder => Some((14_000_000, 260)),
+            Self::Reviewer => Some((6_000_000, 160)),
+            Self::TestWriter => Some((8_000_000, 200)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEndpoint {
+    pub base_url: String,
+    pub max_concurrency: u32,
+}
+
+/// Configuration for one provider endpoint or a pool of equivalent endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: ProviderId,
@@ -47,6 +106,10 @@ pub struct ProviderConfig {
     pub zero_cost: bool,
     pub billing: BillingMode,
     pub max_concurrency: Option<u32>,
+    #[serde(default)]
+    pub openai: OpenAiOptions,
+    #[serde(default)]
+    pub endpoints: Vec<ProviderEndpoint>,
 }
 
 impl ProviderConfig {
@@ -68,6 +131,8 @@ impl ProviderConfig {
             zero_cost: true,
             billing: BillingMode::ZeroCost,
             max_concurrency: Some(4),
+            openai: OpenAiOptions::default(),
+            endpoints: Vec::new(),
         }
     }
 
@@ -89,6 +154,8 @@ impl ProviderConfig {
             zero_cost: false,
             billing: BillingMode::OnDemand,
             max_concurrency: Some(4),
+            openai: OpenAiOptions::default(),
+            endpoints: Vec::new(),
         }
     }
 
@@ -187,6 +254,9 @@ pub struct ToolSandboxConfig {
     pub command_timeout_secs: u64,
     pub memory_limit_mb: Option<u64>,
     pub allow_network: bool,
+    /// Optional preinstalled Linux image for OS-isolated, network-free command tools.
+    #[serde(default)]
+    pub docker_image: Option<String>,
     /// Refs this run's workers may `git push` to: branch names, `remote/branch`, or `*`.
     /// Empty (the default) means no push is allowed - the orchestrator owns remote writes.
     /// This is a guardrail on the shell command string, not a sandbox boundary.
@@ -204,6 +274,7 @@ impl Default for ToolSandboxConfig {
             command_timeout_secs: 120,
             memory_limit_mb: None,
             allow_network: false,
+            docker_image: None,
             allow_push: Vec::new(),
             approval: ApprovalPolicy::AskDangerous,
         }
@@ -214,6 +285,10 @@ impl Default for ToolSandboxConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunConfig {
     pub objective: String,
+    #[serde(default)]
+    pub tool_protocol: ToolProtocolSelection,
+    #[serde(default)]
+    pub preset: TaskPreset,
     pub provider: ProviderId,
     pub model: String,
     pub agents: u32,
@@ -224,7 +299,13 @@ pub struct RunConfig {
     pub memory: MemoryConfig,
     pub research: ResearchConfig,
     pub tools: ToolSandboxConfig,
+    #[serde(default = "default_repo_map_chars")]
+    pub repo_map_chars: usize,
+    #[serde(default)]
+    pub repo_map_file: Option<PathBuf>,
 }
+
+fn default_repo_map_chars() -> usize { 12_000 }
 
 impl RunConfig {
     /// A fully offline, zero-cost configuration using the mock provider.
@@ -232,6 +313,8 @@ impl RunConfig {
         let agents = agents.max(1);
         Self {
             objective: objective.into(),
+            tool_protocol: ToolProtocolSelection::Auto,
+            preset: TaskPreset::General,
             provider: ProviderId::new("mock").expect("provider id"),
             model: "mock-model".into(),
             agents,
@@ -248,6 +331,8 @@ impl RunConfig {
             memory: MemoryConfig::default(),
             research: ResearchConfig::default(),
             tools: ToolSandboxConfig::default(),
+            repo_map_chars: default_repo_map_chars(),
+            repo_map_file: None,
         }
     }
 

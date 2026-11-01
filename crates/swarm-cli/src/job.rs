@@ -29,6 +29,8 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use swarm_core::RunStatus;
+use swarm_core::config::{ToolProtocolSelection, TaskPreset};
+use crate::job_policy::{JobPolicy, audit_review, work_calls};
 use swarm_core::event::{EventKind, RunEvent};
 use swarm_store::Store;
 
@@ -106,6 +108,8 @@ pub enum JobCommand {
 
 #[derive(Debug, Args, Default, Clone)]
 pub struct SubmitArgs {
+    #[command(flatten)]
+    pub policy: JobPolicy,
     /// What the worker should do.
     #[arg(long)]
     pub goal: Option<String>,
@@ -134,6 +138,12 @@ pub struct SubmitArgs {
     /// Provider endpoint override; default $SWARM_BASE_URL.
     #[arg(long)]
     pub base_url: Option<String>,
+    /// Tool transport override, also saved for verification rounds and resume.
+    #[arg(long, env = "SWARM_TOOL_PROTOCOL")]
+    pub tool_protocol: Option<ToolProtocolSelection>,
+    /// Full provider configuration, including native options and endpoint pools.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     #[arg(long)]
     pub model: Option<String>,
     #[arg(long)]
@@ -193,6 +203,8 @@ struct JobSpec {
     #[serde(default)]
     base_url: Option<String>,
     #[serde(default)]
+    tool_protocol: ToolProtocolSelection,
+    #[serde(default)]
     model: Option<String>,
     /// The worker's limits, kept so a verify job's later rounds run with the same ones.
     #[serde(default)]
@@ -221,6 +233,16 @@ struct JobSpec {
     /// Where a verify job's supervisor has got to (`verify.json`); not part of job.json.
     #[serde(skip)]
     live: Option<VerifyState>,
+    #[serde(default)]
+    policy: JobPolicy,
+    #[serde(default)]
+    baseline_gate: Option<Value>,
+    #[serde(default)]
+    freshness_ref: Option<String>,
+    #[serde(default)]
+    freshness_commit: Option<String>,
+    #[serde(default)]
+    config: Option<PathBuf>,
 }
 
 /// A verify job's progress. Only the supervisor writes it, so it never races the
@@ -264,10 +286,11 @@ pub async fn run(args: JobArgs) -> Result<(String, bool)> {
 }
 
 pub fn jobs_dir(explicit: Option<&Path>) -> PathBuf {
-    explicit
+    let root = explicit
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("SWARM_JOBS").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(".swarm-jobs"))
+        .unwrap_or_else(|| PathBuf::from(".swarm-jobs"));
+    std::path::absolute(&root).unwrap_or(root)
 }
 
 fn now_ms() -> i64 {
@@ -316,7 +339,9 @@ fn load_spec(jobs: &Path, id: &str) -> Result<(JobSpec, PathBuf)> {
 }
 
 fn save_spec(dir: &Path, spec: &JobSpec) -> Result<()> {
-    fs::write(dir.join("job.json"), serde_json::to_string_pretty(spec)?)?;
+    let temp = dir.join(format!("job-{}.tmp", swarm_core::RunId::new()));
+    fs::write(&temp, serde_json::to_string_pretty(spec)?)?;
+    fs::rename(temp, dir.join("job.json"))?;
     Ok(())
 }
 
@@ -360,13 +385,30 @@ pub fn submit_job(jobs: &Path, args: SubmitArgs) -> Result<Value> {
     if args.workspace.is_some() && args.repo.is_some() {
         bail!("give workspace or repo, not both");
     }
+    if args.policy.max_active_jobs == 0 { bail!("--max-active-jobs must be positive"); }
+    if args.policy.needs_red_gate() && args.verify.as_deref().unwrap_or("").trim().is_empty() {
+        bail!("builder/test-writer jobs require --verify with a failing baseline check; use --preset reviewer for reviews or --preset general for exploration");
+    }
+    let configured = args.config.as_ref().map(|path| -> Result<swarm_core::config::RunConfig> {
+        Ok(toml::from_str(&fs::read_to_string(path)?)?)
+    }).transpose()?;
+    let configured_provider = configured.as_ref().map(|cfg| cfg.provider.to_string());
     let provider = args
         .provider
         .clone()
+        .or(configured_provider)
         .or_else(|| std::env::var("SWARM_PROVIDER").ok())
         .filter(|p| !p.trim().is_empty())
         .ok_or_else(|| anyhow!("no provider: pass provider (mock, local, chatgpt-web, ...) or set SWARM_PROVIDER"))?;
     let base_url = args.base_url.clone().or_else(|| std::env::var("SWARM_BASE_URL").ok()).filter(|u| !u.is_empty());
+
+    let tool_protocol = match args.tool_protocol {
+        Some(protocol) => protocol,
+        None => match std::env::var("SWARM_TOOL_PROTOCOL") {
+            Ok(value) => value.parse()?,
+            Err(_) => configured.as_ref().map(|cfg| cfg.tool_protocol).unwrap_or_default(),
+        },
+    };
 
     if let Some(key) = &args.key {
         if let Some((existing, _)) = all_specs(jobs).into_iter().find(|(spec, _)| spec.key.as_deref() == Some(key)) {
@@ -383,7 +425,15 @@ pub fn submit_job(jobs: &Path, args: SubmitArgs) -> Result<Value> {
         let base = args.base.clone().unwrap_or_else(|| "HEAD".to_string());
         let commit = git(&repo, &["rev-parse", "--verify", &format!("{base}^{{commit}}")])
             .with_context(|| format!("`{base}` is not a commit in {}", repo.display()))?;
-        let branch = format!("swarm/{id}");
+        let freshness_ref = args.policy.freshness_ref.clone().or_else(||
+            git(&repo, &["rev-parse", "--verify", "origin/main"]).ok().map(|_| "origin/main".to_string()));
+        if let Some(reference) = freshness_ref {
+            let current = git(&repo, &["rev-parse", "--verify", &format!("{reference}^{{commit}}")])?;
+            if git(&repo, &["merge-base", "--is-ancestor", &current, &commit]).is_err() {
+                bail!("stale base: {base} does not include {reference} ({current}); refresh before dispatch");
+            }
+        }
+        let branch = format!("codex/{id}");
         let work = dir.join("work");
         git(&repo, &["worktree", "add", "-b", &branch, &work.to_string_lossy(), &commit])?;
         (work, Some(repo), Some(base), Some(commit), Some(branch))
@@ -415,6 +465,7 @@ pub fn submit_job(jobs: &Path, args: SubmitArgs) -> Result<Value> {
         cancelled: false,
         provider: Some(provider),
         base_url,
+        tool_protocol,
         model: args.model.clone(),
         agents: args.agents,
         max_steps: args.max_steps,
@@ -427,20 +478,44 @@ pub fn submit_job(jobs: &Path, args: SubmitArgs) -> Result<Value> {
         verify,
         allow_push: args.allow_push.clone(),
         live: None,
+        policy: args.policy.clone(),
+        baseline_gate: None,
+        freshness_ref: None,
+        freshness_commit: None,
+        config: args.config.as_ref().map(fs::canonicalize).transpose()?,
     };
 
+    if let Some(repo) = &spec.repo {
+        let reference = spec.policy.freshness_ref.clone().or_else(||
+            git(repo, &["rev-parse", "--verify", "origin/main"]).ok().map(|_| "origin/main".to_string()));
+        if let Some(reference) = reference {
+            let current = git(repo, &["rev-parse", "--verify", &format!("{reference}^{{commit}}")])?;
+            if git(repo, &["merge-base", "--is-ancestor", &current, spec.base_commit.as_deref().unwrap()]).is_err() {
+                bail!("stale base: {} does not include {reference} ({current}); refresh the base before dispatch", spec.base.as_deref().unwrap_or("HEAD"));
+            }
+            spec.freshness_ref = Some(reference);
+            spec.freshness_commit = Some(current);
+        }
+    }
+    if spec.policy.sandbox_image.is_none() { spec.policy.sandbox_image = configured.as_ref().and_then(|cfg| cfg.tools.docker_image.clone()); }
+    if spec.policy.sandbox_image.is_some() && !spec.allow_push.is_empty() { bail!("isolated workers cannot receive push grants"); }
+    if spec.policy.needs_red_gate() {
+        let command = spec.verify.as_deref().unwrap();
+        let (code, output) = baseline_check(&spec, command)?;
+        spec.baseline_gate = Some(json!({"command":command, "exit_code":code, "output":output, "red":code != 0}));
+        save_spec(&dir, &spec)?;
+        if code == 0 { bail!("baseline gate is green: `{command}` already passes; refusing builder dispatch"); }
+    }
+    if spec.policy.sandbox_image.is_none() {
+        spec.policy.sandbox_image = configured.as_ref().and_then(|cfg| cfg.tools.docker_image.clone());
+    }
     let exe = job_exe()?;
     let log = File::create(dir.join("run.log"))?;
-    let mut command = if spec.verify.is_some() {
-        // A supervisor outlives this call: it runs the worker, verifies, and goes again.
-        // The spec is saved first because the supervisor reads it.
-        save_spec(&dir, &spec)?;
-        let mut command = Command::new(exe);
-        command.arg("job").arg("--jobs").arg(jobs).arg("supervise").arg(&id);
-        command
-    } else {
-        worker_command(&spec, &spec.full_goal(), &spec.store)?
-    };
+    // Every job enters the same bounded, priority-aware queue.
+    save_spec(&dir, &spec)?;
+    let mut command = Command::new(exe);
+    command.arg("job").arg("--jobs").arg(jobs).arg("supervise").arg(&id);
+    command.env("SWARM_JOB_ID", &id);
     command.stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
     detach(&mut command);
     let child = command.spawn().context("start the job process")?;
@@ -458,10 +533,56 @@ fn job_exe() -> Result<PathBuf> {
     Ok(std::env::var_os("SWARM_JOB_EXE").map(PathBuf::from).map_or_else(std::env::current_exe, Ok)?)
 }
 
+fn baseline_check(spec: &JobSpec, command: &str) -> Result<(i32, String)> {
+    let isolated = verification_container(spec, command)?;
+    let mut process: Command = if let Some(container) = &isolated {
+        let original = container.command.as_std();
+        let mut process = Command::new(original.get_program()); process.args(original.get_args()); process
+    } else { swarm_tools::shell::shell().command(command).into_std() };
+    process.current_dir(&spec.workspace).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = process.spawn().context("start baseline gate")?;
+    let pid = child.id();
+    let (send, recv) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = send.send(child.wait_with_output()); });
+    match recv.recv_timeout(Duration::from_secs(spec.verify_timeout_secs)) {
+        Ok(result) => {
+            let output = result?;
+            let code = output.status.code().ok_or_else(|| anyhow!("baseline gate terminated without exit code"))?;
+            if code == 126 || code == 127 || code == 9009 || (code == 125 && spec.policy.sandbox_image.is_some()) {
+                bail!("baseline check could not execute (exit {code}): {}", String::from_utf8_lossy(&output.stderr));
+            }
+            let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            Ok((code, tail_chars(&text, VERIFY_OUTPUT_CAP)))
+        }
+        Err(_) => { kill_tree(pid); bail!("baseline gate timed out; timeout is not a red gate"); }
+    }
+}
+
+fn verification_container(spec: &JobSpec, command: &str) -> Result<Option<swarm_tools::isolation::ContainerCommand>> {
+    let Some(image) = &spec.policy.sandbox_image else { return Ok(None); };
+    let config = swarm_tools::SandboxConfig::new(&spec.workspace).docker_image(Some(image.clone()));
+    swarm_tools::isolation::prepare_repository(&config).map_err(|e| anyhow!(e))?;
+    Ok(Some(swarm_tools::isolation::container_command(&config, "/bin/sh", &["-c".into(), command.into()]).map_err(|e| anyhow!(e))?))
+}
+
+fn freshness(spec: &JobSpec) -> Value {
+    let Some(reference) = &spec.freshness_ref else {
+        return json!({"base_drift":null, "checked":false});
+    };
+    let current = spec.repo.as_ref().and_then(|repo| git(repo, &["rev-parse", "--verify", &format!("{reference}^{{commit}}")]).ok());
+    json!({"checked":current.is_some(), "reference":reference,
+        "submitted_commit":spec.freshness_commit, "current_commit":current,
+        "base_drift":current.as_ref().zip(spec.freshness_commit.as_ref()).map(|(a,b)| a != b)})
+}
+
 impl JobSpec {
     /// The goal as the worker sees it: the caller's text plus the report instruction.
     fn full_goal(&self) -> String {
-        if self.no_report_footer { self.goal.clone() } else { format!("{}{REPORT_FOOTER}", self.goal) }
+        let mut goal = if self.no_report_footer { self.goal.clone() } else { format!("{}{REPORT_FOOTER}", self.goal) };
+        if self.policy.preset == TaskPreset::Reviewer {
+            goal.push_str("\nREVIEW CONTRACT: read relevant diffs/files and attempt real checks. Do not modify files. Call report_result with status, summary, verdict (APPROVE, REQUEST_CHANGES, INCONCLUSIVE), blockers (file, line, claim, verification: executed|code_inspection|unverified, repro_command and observed_output or null), and checks (command, observed_output). Use exact commands and an exact nonempty output excerpt. Swarm matches evidence against recorded tool results. Code inspection is not an executed reproduction. An incomplete review must be INCONCLUSIVE.");
+        }
+        goal
     }
 }
 
@@ -477,9 +598,13 @@ fn worker_command(spec: &JobSpec, goal: &str, store: &Path) -> Result<Command> {
         .arg("--workspace")
         .arg(&spec.workspace)
         .args(["--approve-all", "--plain"]);
+    command.args(["--tool-protocol", spec.tool_protocol.as_str()]);
+    if let Some(config) = &spec.config { command.arg("--config").arg(config); }
     if let Some(url) = &spec.base_url {
         command.args(["--base-url", url]);
     }
+    command.args(["--preset", spec.policy.preset.as_str()]);
+    if let Some(image) = &spec.policy.sandbox_image { command.args(["--sandbox-image", image]); }
     if let Some(model) = &spec.model {
         command.args(["--model", model]);
     }
@@ -489,7 +614,7 @@ fn worker_command(spec: &JobSpec, goal: &str, store: &Path) -> Result<Command> {
     if let Some(agents) = spec.agents {
         command.args(["--agents", &agents.to_string()]);
     }
-    if let Some(steps) = spec.max_steps {
+    if let Some(steps) = spec.max_steps.or_else(|| spec.policy.preset.limits().map(|(_, steps)| steps)) {
         command.args(["--max-steps", &steps.to_string()]);
     }
     if let Some(calls) = spec.max_inference_calls {
@@ -500,7 +625,7 @@ fn worker_command(spec: &JobSpec, goal: &str, store: &Path) -> Result<Command> {
     }
     // Jobs are autonomous and read real code, so they get far more than the 200000
     // a plain run does (that figure is the offline mock's); it is still a bound.
-    command.args(["--max-tokens", &spec.max_tokens.unwrap_or(DEFAULT_JOB_MAX_TOKENS).to_string()]);
+    command.args(["--max-tokens", &spec.max_tokens.or_else(|| spec.policy.preset.limits().map(|(tokens, _)| tokens)).unwrap_or(DEFAULT_JOB_MAX_TOKENS).to_string()]);
     Ok(command)
 }
 
@@ -539,7 +664,11 @@ fn write_verify(dir: &Path, state: &VerifyState) -> Result<()> {
 /// Run `command` in the workspace: its exit code (None when killed or timed out)
 /// and the end of its combined output.
 async fn run_verify(spec: &JobSpec, command: &str) -> (Option<i32>, String) {
-    let mut process = swarm_tools::shell::shell().command(command);
+    let mut isolated = match verification_container(spec, command) {
+        Ok(value) => value, Err(error) => return (None, error.to_string()),
+    };
+    let mut host_process = swarm_tools::shell::shell().command(command);
+    let process = match &mut isolated { Some(container) => &mut container.command, None => &mut host_process };
     process
         .current_dir(&spec.workspace)
         .stdin(Stdio::null())
@@ -573,7 +702,21 @@ async fn run_verify(spec: &JobSpec, command: &str) -> (Option<i32>, String) {
 /// is in verify.json, and leaves job.json (and so `cancel`) alone.
 pub async fn supervise_job(jobs: &Path, id: &str) -> Result<Value> {
     let (spec, dir) = load_spec(jobs, id)?;
-    let Some(verify) = spec.verify.clone() else { bail!("job {id} has no --verify command") };
+    let _capacity = await_job_slot(jobs, &spec, &dir).await?;
+    let resume_args = dir.join("resume-args.json");
+    if spec.verify.is_none() || resume_args.exists() {
+        let mut worker = if resume_args.exists() {
+            let args: Vec<String> = serde_json::from_slice(&fs::read(&resume_args)?)?;
+            let mut command = Command::new(job_exe()?); command.args(args); command
+        } else { worker_command(&spec, &spec.full_goal(), &spec.store)? };
+        let log = fs::OpenOptions::new().create(true).append(true).open(dir.join("run.log"))?;
+        worker.stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
+        let status = tokio::task::spawn_blocking(move || worker.status()).await??;
+        let _ = fs::remove_file(resume_args);
+        fs::write(dir.join("dispatch.json"), json!({"phase":"done"}).to_string())?;
+        return Ok(json!({"job_id":id,"worker_success":status.success()}));
+    }
+    let verify = spec.verify.clone().unwrap();
     let base_goal = spec.full_goal();
     let mut state = VerifyState::default();
     let mut goal = base_goal.clone();
@@ -605,6 +748,7 @@ pub async fn supervise_job(jobs: &Path, id: &str) -> Result<Value> {
     }
     state.phase = "done".to_string();
     write_verify(&dir, &state)?;
+    fs::write(dir.join("dispatch.json"), json!({"phase":"done"}).to_string())?;
     Ok(json!({"job_id": id, "passed": state.passed, "rounds": state.rounds.len()}))
 }
 
@@ -649,6 +793,7 @@ fn detach(command: &mut Command) {
 }
 
 fn pid_alive(pid: u32) -> bool {
+    if pid == std::process::id() { return true; }
     if cfg!(windows) {
         Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
@@ -657,6 +802,44 @@ fn pid_alive(pid: u32) -> bool {
             .unwrap_or(false)
     } else {
         Command::new("kill").args(["-0", &pid.to_string()]).output().map(|o| o.status.success()).unwrap_or(false)
+    }
+}
+
+async fn await_job_slot(jobs: &Path, spec: &JobSpec, dir: &Path) -> Result<File> {
+    let dispatch = dir.join("dispatch.json");
+    fs::write(&dispatch, json!({"phase":"queued", "pid":std::process::id()}).to_string())?;
+    let lock_path = jobs.join("dispatch.lock");
+    loop {
+        if load_spec(jobs, &spec.id)?.0.cancelled { bail!("job cancelled while queued"); }
+        let lock = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path)?;
+        if lock.try_lock().is_ok() {
+            let mut queued = Vec::new();
+            let mut cap = spec.policy.max_active_jobs;
+            for (other, path) in all_specs(jobs) {
+                let state: Value = fs::read(path.join("dispatch.json")).ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+                if other.cancelled || state["phase"] == "done" { continue; }
+                let alive = state["pid"].as_u64().is_some_and(|pid| pid_alive(pid as u32));
+                if !alive { continue; }
+                cap = cap.min(other.policy.max_active_jobs.max(1));
+                if state["phase"] == "queued" {
+                    queued.push((other.policy.priority_at(other.started_at, now_ms()), other.started_at, other.id));
+                }
+            }
+            queued.sort_by(|a,b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+            if queued.first().is_some_and(|q| q.2 == spec.id) {
+                for i in 0..cap {
+                    let slot = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+                        .open(jobs.join(format!("active-{i}.lock")))?;
+                    if slot.try_lock().is_ok() {
+                        fs::write(&dispatch, json!({"phase":"active", "pid":std::process::id()}).to_string())?;
+                        return Ok(slot);
+                    }
+                }
+            }
+        }
+        drop(lock);
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -688,8 +871,13 @@ struct Snapshot {
     store: Option<Store>,
 }
 
-async fn snapshot(spec: &JobSpec) -> Snapshot {
+async fn snapshot(spec: &mut JobSpec) -> Snapshot {
     let alive = spec.pid.is_some_and(pid_alive);
+    // Re-read completion after checking the PID. The supervisor may have finished
+    // between load_spec and this snapshot; a stale verifying phase must not turn
+    // that successful exit into an interrupted job.
+    let dir = spec.store.parent().unwrap_or(Path::new(".")).to_path_buf();
+    overlay_verify(spec, &dir);
     let store = open_store(spec).await;
     let run = match &store {
         Some(store) => store.list_runs().await.ok().and_then(|runs| runs.into_iter().next()),
@@ -702,8 +890,12 @@ async fn snapshot(spec: &JobSpec) -> Snapshot {
     // A verify job is running until its supervisor says done, whatever the latest
     // worker run says: the check and the next round have not happened yet.
     let verify_pending = spec.live.as_ref().is_some_and(|live| live.phase != "done");
+    let queued = alive && fs::read(spec.store.parent().unwrap_or(Path::new(".")).join("dispatch.json"))
+        .ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).is_some_and(|v| v["phase"] == "queued");
     let state = if spec.cancelled {
         "cancelled"
+    } else if queued {
+        "queued"
     } else if verify_pending {
         if alive { "running" } else { "interrupted" }
     } else {
@@ -741,7 +933,9 @@ fn tail(path: &Path, lines: usize) -> String {
 }
 
 async fn status_of(spec: &JobSpec, dir: &Path) -> Value {
-    let snap = snapshot(spec).await;
+    let mut current = spec.clone();
+    let snap = snapshot(&mut current).await;
+    let spec = &current;
     let mut out = json!({
         "job_id": spec.id,
         "label": spec.label,
@@ -767,6 +961,8 @@ async fn status_of(spec: &JobSpec, dir: &Path) -> Value {
             out["inference_calls"] = json!(stats.usage.inference_calls);
             out["tool_calls"] = json!(stats.usage.tool_calls);
             out["tokens"] = json!(stats.usage.total_tokens());
+            out["total_tokens"] = json!(stats.usage.total_tokens());
+            out["usage_estimated"] = json!(snap.events.iter().any(|e| e.kind == EventKind::InferenceCompleted && e.payload["usage_source"] == "estimated"));
         }
         // Next to the usage so "ran out of budget" is visible without reading logs.
         out["token_limit"] = json!(run.budget.max_total_tokens);
@@ -813,14 +1009,14 @@ pub async fn wait_jobs(jobs: &Path, ids: &[String], timeout_secs: u64, any: bool
 
 /// The arguments of the worker's last accepted `report_result` call.
 pub fn reported_result(events: &[RunEvent]) -> Option<Value> {
-    let accepted: HashSet<&str> = events
+    let accepted: HashSet<_> = events
         .iter()
         .filter(|event| {
             event.kind == EventKind::ToolResult
                 && event.payload.get("name").and_then(Value::as_str) == Some("report_result")
                 && event.payload.get("success").and_then(Value::as_bool) == Some(true)
         })
-        .filter_map(|event| event.payload.get("call_id").and_then(Value::as_str))
+        .filter_map(|event| event.payload.get("call_id").and_then(Value::as_str).map(|id| (event.agent_id.as_ref(), id)))
         .collect();
     events
         .iter()
@@ -828,7 +1024,7 @@ pub fn reported_result(events: &[RunEvent]) -> Option<Value> {
         .find(|event| {
             event.kind == EventKind::ToolRequested
                 && event.payload.get("name").and_then(Value::as_str) == Some("report_result")
-                && event.payload.get("call_id").and_then(Value::as_str).is_some_and(|id| accepted.contains(id))
+                && event.payload.get("call_id").and_then(Value::as_str).is_some_and(|id| accepted.contains(&(event.agent_id.as_ref(), id)))
         })
         .and_then(|event| event.payload.get("arguments").cloned())
 }
@@ -865,7 +1061,7 @@ fn write_patch(spec: &JobSpec, dir: &Path) -> Option<Value> {
     }
     // Byte-code caches and the Python tool's temp script are by-products of running
     // things, not part of what the worker changed.
-    let skip = [":(exclude)**/__pycache__/**", ":(exclude)*.pyc", ":(exclude).swarm_tmp_run.py"];
+    let skip = [":(exclude)**/__pycache__/**", ":(exclude)*.pyc", ":(exclude).swarm_tmp_run.py", ":(exclude).swarm/**"];
     let mut add = vec!["add", "-N", "--", "."];
     add.extend(skip);
     git(ws, &add).ok();
@@ -885,8 +1081,8 @@ fn write_patch(spec: &JobSpec, dir: &Path) -> Option<Value> {
 }
 
 pub async fn job_result(jobs: &Path, id: &str) -> Result<Value> {
-    let (spec, dir) = load_spec(jobs, id)?;
-    let snap = snapshot(&spec).await;
+    let (mut spec, dir) = load_spec(jobs, id)?;
+    let snap = snapshot(&mut spec).await;
     let mut out = status_of(&spec, &dir).await;
     let reported = reported_result(&snap.events);
     if let Some(report) = &reported {
@@ -935,12 +1131,7 @@ pub async fn job_result(jobs: &Path, id: &str) -> Result<Value> {
             // Tools the worker really used (planning and reporting are not work). A check that passes on an
             // untouched tree proves nothing when the worker never looked at the tree: a chat model can answer
             // from its own connectors and never call a swarm tool.
-            let worked = snap
-                .events
-                .iter()
-                .filter(|event| event.kind == EventKind::ToolRequested)
-                .filter(|event| !matches!(event.payload.get("name").and_then(Value::as_str), Some("todo_write" | "report_result")))
-                .count();
+            let worked = work_calls(&snap.events);
             out["verify"]["worker_tool_calls"] = json!(worked);
             out["outcome"] = match live.passed {
                 Some(true) if changed => json!("verified"),
@@ -961,6 +1152,15 @@ pub async fn job_result(jobs: &Path, id: &str) -> Result<Value> {
             }
         }
     }
+    if spec.policy.preset == TaskPreset::Reviewer || reported.as_ref().is_some_and(|r| r.get("verdict").is_some()) {
+        out["review_evidence"] = audit_review(&spec.workspace, &snap.events, reported.as_ref(), spec.policy.min_tool_calls);
+        if is_terminal(&snap.state) {
+            out["outcome"] = if out["review_evidence"]["trusted"] == true && snap.state == "completed" { json!("review_verified") } else { json!("unverified_review") };
+        }
+    }
+    out["baseline_gate"] = json!(spec.baseline_gate);
+    out["base_freshness"] = freshness(&spec);
+    out["base_drift"] = out["base_freshness"]["base_drift"].clone();
     if !is_terminal(&snap.state) {
         out["note"] = json!("the job has not finished; this is a partial view");
     } else if reported.is_none() && out["note"].is_null() {
@@ -971,12 +1171,20 @@ pub async fn job_result(jobs: &Path, id: &str) -> Result<Value> {
 
 pub async fn cancel_job(jobs: &Path, id: &str) -> Result<Value> {
     let (mut spec, dir) = load_spec(jobs, id)?;
-    let snap = snapshot(&spec).await;
+    let snap = snapshot(&mut spec).await;
     if is_terminal(&snap.state) && snap.state != "interrupted" {
         return Ok(json!({"job_id": id, "state": snap.state, "note": "already finished"}));
     }
     if let Some(pid) = spec.pid {
         kill_tree(pid);
+    }
+    if spec.policy.sandbox_image.is_some() {
+        let output = Command::new("docker").args(["ps", "-q", "--filter", &format!("label=swarm.job={id}")]).output()?;
+        for container in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+            if container.chars().all(|c| c.is_ascii_hexdigit()) {
+                let _ = Command::new("docker").args(["rm", "-f", container]).output();
+            }
+        }
     }
     spec.cancelled = true;
     save_spec(&dir, &spec)?;
@@ -1020,7 +1228,7 @@ pub async fn resume_job(jobs: &Path, id: &str, raise: BudgetRaise) -> Result<Val
     if spec.verify.is_some() {
         bail!("job {id} has a --verify loop, which cannot be resumed; submit a new job with --workspace {} to carry on from its files", spec.workspace.display());
     }
-    let snap = snapshot(&spec).await;
+    let snap = snapshot(&mut spec).await;
     // A budget-exhausted run is a pause, not a failure: its transcript is in the
     // store and it continues from its last checkpoint. Because usage is cumulative,
     // resuming it without a raised ceiling would die on the very next call.
@@ -1051,6 +1259,9 @@ pub async fn resume_job(jobs: &Path, id: &str, raise: BudgetRaise) -> Result<Val
     if let Some(provider) = &spec.provider {
         command.args(["--provider", provider]);
     }
+    command.args(["--tool-protocol", spec.tool_protocol.as_str()]);
+    if let Some(config) = &spec.config { command.arg("--config").arg(config); }
+    if let Some(image) = &spec.policy.sandbox_image { command.args(["--sandbox-image", image]); }
     if let Some(url) = &spec.base_url {
         command.args(["--base-url", url]);
     }
@@ -1074,6 +1285,11 @@ pub async fn resume_job(jobs: &Path, id: &str, raise: BudgetRaise) -> Result<Val
     if let Some(secs) = raise.max_wall_clock_secs {
         command.args(["--max-wall-clock-secs", &secs.to_string()]);
     }
+    let worker_args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+    fs::write(dir.join("resume-args.json"), serde_json::to_vec(&worker_args)?)?;
+    let mut command = Command::new(job_exe()?);
+    command.arg("job").arg("--jobs").arg(jobs).arg("supervise").arg(id);
+    command.env("SWARM_JOB_ID", id);
     command.stdin(Stdio::null()).stdout(Stdio::from(log.try_clone()?)).stderr(Stdio::from(log));
     detach(&mut command);
     let child = command.spawn().context("start the resumed job process")?;
@@ -1195,6 +1411,24 @@ mod tests {
     }
 
     #[test]
+    fn job_protocol_is_backward_compatible_and_forwarded_to_worker() {
+        assert!(jobs_dir(Some(Path::new("relative-jobs"))).is_absolute());
+        let legacy = json!({
+            "id":"job_test", "key":null, "label":null, "goal":"g", "workspace":"work",
+            "store":"store", "repo":null, "base":null, "base_commit":null,
+            "branch":null, "pid":null, "started_at":0
+        });
+        let mut spec: JobSpec = serde_json::from_value(legacy).unwrap();
+        assert_eq!(spec.tool_protocol, ToolProtocolSelection::Auto);
+        spec.tool_protocol = ToolProtocolSelection::Text;
+        let saved = serde_json::to_string(&spec).unwrap();
+        let loaded: JobSpec = serde_json::from_str(&saved).unwrap();
+        let command = worker_command(&loaded, "g", Path::new("store")).unwrap();
+        let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|pair| pair == ["--tool-protocol", "text"]));
+    }
+
+    #[test]
     fn the_retry_goal_keeps_the_original_task_and_says_why_it_failed() {
         let goal = retry_goal("fix the parser", "go test ./...", 2, Some(1), "FAIL TestParse");
         assert!(goal.starts_with("fix the parser"), "{goal}");
@@ -1225,7 +1459,7 @@ mod tests {
     #[test]
     fn submit_needs_a_goal_a_provider_and_one_place_to_work() {
         let dir = tempfile::tempdir().unwrap();
-        let ok_provider = SubmitArgs { goal: Some("g".into()), provider: Some("mock".into()), ..Default::default() };
+        let ok_provider = SubmitArgs { policy: JobPolicy { preset: TaskPreset::General, ..Default::default() }, goal: Some("g".into()), provider: Some("mock".into()), ..Default::default() };
         let none = SubmitArgs { provider: Some("mock".into()), ..Default::default() };
         assert!(submit_job(dir.path(), none).unwrap_err().to_string().contains("goal"));
         let both = SubmitArgs {
@@ -1239,4 +1473,43 @@ mod tests {
             assert!(submit_job(dir.path(), no_provider).unwrap_err().to_string().contains("no provider"));
         }
     }
+    #[tokio::test]
+    async fn queued_review_gets_capacity_before_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |id: &str, preset: &str| -> JobSpec {
+            serde_json::from_value(json!({"id":id,"key":null,"label":null,"goal":"g","workspace":dir.path(),
+                "store":dir.path().join(id).join("store"),"repo":null,"base":null,"base_commit":null,
+                "branch":null,"pid":std::process::id(),"started_at":now_ms(),
+                "policy":{"preset":preset,"max_active_jobs":1}})).unwrap()
+        };
+        let low = make("low","builder"); let high = make("high","reviewer");
+        for spec in [&low,&high] {
+            let path = dir.path().join(&spec.id); fs::create_dir_all(&path).unwrap(); save_spec(&path,spec).unwrap();
+            fs::write(path.join("dispatch.json"),json!({"phase":"queued","pid":std::process::id()}).to_string()).unwrap();
+        }
+        let low_dir = dir.path().join("low"); let high_dir = dir.path().join("high");
+        assert!(tokio::time::timeout(Duration::from_millis(200),await_job_slot(dir.path(),&low,&low_dir)).await.is_err());
+        let slot = tokio::time::timeout(Duration::from_secs(5),await_job_slot(dir.path(),&high,&high_dir)).await.unwrap().unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(200),await_job_slot(dir.path(),&low,&low_dir)).await.is_err());
+        drop(slot); fs::write(high_dir.join("dispatch.json"),json!({"phase":"done"}).to_string()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5),await_job_slot(dir.path(),&low,&low_dir)).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn completed_supervisor_wins_over_a_stale_verifying_snapshot() {
+        let dir = tempfile::tempdir().unwrap(); let store_path = dir.path().join("store");
+        let store = Store::open(&store_path).await.unwrap();
+        let mut run = swarm_core::run::Run::new("g","mock",None,1,true,Default::default(),now_ms());
+        run.status = RunStatus::Completed; store.create_run(&run).await.unwrap();
+        let mut spec: JobSpec = serde_json::from_value(json!({"id":"stale","key":null,"label":null,
+            "goal":"g","workspace":dir.path(),"store":store_path,"repo":null,"base":null,
+            "base_commit":null,"branch":null,"pid":null,"started_at":now_ms(),"verify":"true"})).unwrap();
+        spec.live = Some(VerifyState { phase:"verifying".into(), store:store_path.clone(), ..Default::default() });
+        write_verify(dir.path(), &VerifyState { phase:"done".into(),store:store_path,passed:Some(true),..Default::default() }).unwrap();
+        let status = status_of(&spec,dir.path()).await;
+        assert_eq!(status["state"],"completed","{status}");
+        assert_eq!(status["verify"]["phase"],"done");
+        assert_eq!(status["verify"]["passed"],true);
+    }
+
 }

@@ -71,6 +71,10 @@ pub struct AgentCheckpoint {
     /// (0 = never). Defaulted so checkpoints written before this field still load.
     #[serde(default)]
     pub pressure_notified: u32,
+    /// Times the final reply was sent back for failing the evidence checks. Its own
+    /// count: `format_retries` is for malformed tool requests.
+    #[serde(default)]
+    pub evidence_retries: u32,
 }
 
 impl AgentCheckpoint {

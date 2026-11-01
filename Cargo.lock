@@ -2319,6 +2319,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "swarm-core",
  "thiserror",
  "tokio",
@@ -2382,6 +2383,7 @@ dependencies = [
  "swarm-core",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

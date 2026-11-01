@@ -29,6 +29,9 @@ pub fn build_registry(cfg: &RunConfig) -> Result<ProviderRegistry, RuntimeError>
         if !cfg.may_run(pc) {
             continue;
         }
+        if pc.kind == ProviderKind::ManagedAgent && cfg.tools.docker_image.is_some() {
+            return Err(RuntimeError::Config("managed agents own their process boundary; Docker tool isolation requires a Swarm-driven provider".into()));
+        }
         registry.register(provider_for(pc)?);
     }
     Ok(registry)
@@ -75,6 +78,8 @@ pub fn local_provider_config() -> ProviderConfig {
         zero_cost: true,
         billing: BillingMode::ZeroCost,
         max_concurrency: Some(1),
+        openai: Default::default(),
+        endpoints: Vec::new(),
     }
 }
 
@@ -99,6 +104,8 @@ pub fn chatgpt_web_provider_config() -> ProviderConfig {
         zero_cost: false,
         billing: BillingMode::Subscription,
         max_concurrency: Some(4),
+        openai: Default::default(),
+        endpoints: Vec::new(),
     }
 }
 
@@ -120,11 +127,34 @@ pub fn gemini_web_provider_config() -> ProviderConfig {
         zero_cost: false,
         billing: BillingMode::Subscription,
         max_concurrency: Some(4),
+        openai: Default::default(),
+        endpoints: Vec::new(),
     }
 }
 
 /// Constructs the live provider for a single [`ProviderConfig`].
 fn provider_for(pc: &ProviderConfig) -> Result<Arc<dyn Provider>, RuntimeError> {
+    if !pc.endpoints.is_empty() || pc.kind == ProviderKind::OpenAiCompatible {
+        if pc.kind != ProviderKind::OpenAiCompatible {
+            return Err(RuntimeError::Config("endpoint pools require an OpenAI-compatible provider".into()));
+        }
+        let mut endpoints = Vec::new();
+        let endpoints_config = if pc.endpoints.is_empty() {
+            vec![swarm_core::config::ProviderEndpoint { base_url: pc.base_url.clone().unwrap_or_default(), max_concurrency: pc.max_concurrency.unwrap_or(4) }]
+        } else { pc.endpoints.clone() };
+        for endpoint in &endpoints_config {
+            let mut child = pc.clone(); child.endpoints.clear(); child.base_url = Some(endpoint.base_url.clone());
+            endpoints.push((endpoint.base_url.clone(), endpoint.max_concurrency, single_provider_for(&child)?));
+        }
+        let cap = pc.max_concurrency.unwrap_or(endpoints_config.iter().map(|e| e.max_concurrency).sum());
+        let pool = swarm_providers::pool::PoolProvider::new(pc.name.clone(), endpoints, cap)
+            .map_err(|e| RuntimeError::Config(e.to_string()))?;
+        return Ok(Arc::new(pool));
+    }
+    single_provider_for(pc)
+}
+
+fn single_provider_for(pc: &ProviderConfig) -> Result<Arc<dyn Provider>, RuntimeError> {
     match pc.kind {
         ProviderKind::Mock => {
             let mut p = MockProvider::unowned();
@@ -152,6 +182,10 @@ fn provider_for(pc: &ProviderConfig) -> Result<Arc<dyn Provider>, RuntimeError> 
             oai.max_tokens = Some(pc.max_output_tokens);
             oai.timeout_ms = OPENAI_TIMEOUT_MS;
             oai.billing = pc.billing.clone();
+            oai.chat_template_kwargs = pc.openai.chat_template_kwargs.clone();
+            oai.min_output_tokens = pc.openai.min_output_tokens;
+            oai.extra_headers = pc.openai.headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            oai.streaming = pc.openai.streaming.unwrap_or(true);
             let provider: Arc<dyn Provider> = Arc::new(OpenAiProvider::new(pc.name.clone(), oai)?);
             Ok(provider)
         }

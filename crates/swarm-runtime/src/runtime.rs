@@ -18,7 +18,7 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use swarm_core::agent::Agent;
-use swarm_core::config::{ApprovalPolicy, RunConfig};
+use swarm_core::config::{ApprovalPolicy, RunConfig, ToolProtocolSelection};
 use swarm_core::event::{EventKind, RunEvent};
 use swarm_core::run::{Run, RunMode};
 use swarm_core::task::Task;
@@ -37,6 +37,9 @@ use crate::hooks::ToolHooks;
 /// renewed well before they would expire.
 const RENEW_TICK_MS: i64 = DEFAULT_LEASE_TTL_MS / 3;
 
+/// How often the driver looks for newly created tasks while agents are running.
+const SCHEDULE_TICK_MS: i64 = 500;
+
 /// Current wall-clock time as epoch milliseconds (the store's time base).
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -53,6 +56,7 @@ pub struct Runtime {
     executor: Arc<ToolExecutor>,
     scheduler: Scheduler,
     approval: ApprovalPolicy,
+    tool_protocol: ToolProtocolSelection,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
     hooks: Option<Arc<dyn ToolHooks>>,
     instructions: Option<String>,
@@ -66,7 +70,8 @@ impl Runtime {
         scheduler: Scheduler,
     ) -> Self {
         Self { store, registry, executor, scheduler, approval: ApprovalPolicy::AskDangerous,
-            approval_handler: None, hooks: None, instructions: None }
+            approval_handler: None, hooks: None, instructions: None,
+            tool_protocol: ToolProtocolSelection::Auto }
     }
 
     /// Project instructions (`AGENTS.md` / `CLAUDE.md`) for every agent prompt.
@@ -78,6 +83,12 @@ impl Runtime {
     /// Sets the tool approval policy used by agents in this runtime.
     pub fn with_approval(mut self, approval: ApprovalPolicy) -> Self {
         self.approval = approval;
+        self
+    }
+
+    /// Selects the tool transport for all agents in this runtime.
+    pub fn with_tool_protocol(mut self, protocol: ToolProtocolSelection) -> Self {
+        self.tool_protocol = protocol;
         self
     }
 
@@ -116,7 +127,7 @@ impl Runtime {
             depth: 0,
             title: cfg.objective.clone(),
             objective: cfg.objective.clone(),
-            role: if cfg.agents > 1 { AgentRole::Planner } else { AgentRole::Worker },
+            role: if cfg.preset == swarm_core::config::TaskPreset::Reviewer { AgentRole::Reviewer } else if cfg.agents > 1 { AgentRole::Planner } else { AgentRole::Worker },
             group: "main".to_string(),
             priority: 0,
             depends_on: Vec::new(),
@@ -149,6 +160,7 @@ impl Runtime {
 
         let mut in_flight: JoinSet<(TaskId, String, AgentOutcome)> = JoinSet::new();
         let mut lease_tokens: Vec<(TaskId, String)> = Vec::new();
+        let mut last_renewal = now_ms();
 
         loop {
             let now = now_ms();
@@ -219,15 +231,22 @@ impl Runtime {
                 if !claimed {
                     continue;
                 }
-                let agent = Agent::new(
-                    run.id.clone(),
-                    task.id.clone(),
-                    None,
-                    task.role,
-                    task.depth,
-                    now,
-                );
-                self.store.create_agent(&agent).await?;
+                let agent = match self.store.agent_for_task(&task.id).await? {
+                    Some(mut existing) => {
+                        // The lease owns this task again. Retain the agent id so its
+                        // messages, tool results, child ids and cumulative steps survive.
+                        existing.state = AgentState::Ready;
+                        existing.updated_at = now;
+                        self.store.update_agent(&existing).await?;
+                        existing
+                    }
+                    None => {
+                        let agent = Agent::new(run.id.clone(), task.id.clone(), None,
+                            task.role, task.depth, now);
+                        self.store.create_agent(&agent).await?;
+                        agent
+                    }
+                };
                 lease_tokens.push((task.id.clone(), token.clone()));
                 self.emit_task(&run.id, &task.id, TaskState::Running).await?;
 
@@ -240,6 +259,7 @@ impl Runtime {
                 let provider_c = provider.clone();
                 let token_c = token.clone();
                 let approval = self.approval;
+                let tool_protocol = self.tool_protocol;
                 let approval_handler = self.approval_handler.clone();
                 let hooks = self.hooks.clone();
                 let instructions = self.instructions.clone();
@@ -250,6 +270,7 @@ impl Runtime {
                         registry,
                         executor,
                         approval,
+                        tool_protocol,
                         approval_handler,
                         hooks,
                         instructions,
@@ -271,8 +292,10 @@ impl Runtime {
                 break;
             }
 
-            // (5) Wait for the next finished agent or a renewal tick.
-            let wait_ms = (deadline - now_ms()).clamp(1, RENEW_TICK_MS) as u64;
+            // (5) Wait for the next finished agent or a tick. A running agent can
+            // create tasks (a planner's `spawn_agents`), so look for new work often;
+            // leases are renewed on their own, slower cadence.
+            let wait_ms = (deadline - now_ms()).clamp(1, SCHEDULE_TICK_MS) as u64;
             let woke = tokio::select! {
                 r = in_flight.join_next() => r,
                 _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => None,
@@ -288,10 +311,13 @@ impl Runtime {
                     ))));
                 }
                 None => {
-                    // Renewal tick: keep in-flight leases alive.
+                    // Keep in-flight leases alive once per renewal period.
                     let now = now_ms();
-                    for (id, token) in &lease_tokens {
-                        let _ = self.store.renew_lease(id, token, now, DEFAULT_LEASE_TTL_MS).await;
+                    if now - last_renewal >= RENEW_TICK_MS {
+                        last_renewal = now;
+                        for (id, token) in &lease_tokens {
+                            let _ = self.store.renew_lease(id, token, now, DEFAULT_LEASE_TTL_MS).await;
+                        }
                     }
                 }
             }
@@ -601,6 +627,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_planner_starts_workers_with_spawn_agents_and_answers_from_their_results() {
+        let dir = TempDir::new().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut registry = ProviderRegistry::new();
+        let provider_entry: Arc<dyn Provider> = Arc::new(MockProvider::unowned());
+        registry.register(provider_entry);
+        let store = Arc::new(Store::open(&dir.path().join("store")).await.unwrap());
+        let executor = Arc::new(ToolExecutor::new(SandboxConfig::new(ws)));
+        let scheduler = Scheduler::new(SchedulerConfig {
+            max_active: 4,
+            provider_limits: BTreeMap::from([("mock".to_string(), 4)]),
+            default_provider_limit: 4,
+            max_per_group: 4,
+        });
+        let rt = Runtime::new(store.clone(), Arc::new(registry), executor, scheduler);
+        let cfg = RunConfig::mock("review the open pull requests via spawn_agents", 3);
+        let run = rt.create_run(&cfg, RunMode::General).await.unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(30), rt.drive(&run.id))
+            .await.expect("the run must not hang waiting on its workers").unwrap();
+        assert_eq!(status, RunStatus::Completed);
+
+        let root = run.root_task_id.as_ref().unwrap();
+        let tasks = store.list_tasks(&run.id).await.unwrap();
+        let workers: Vec<_> = tasks.iter().filter(|t| t.parent_id.as_ref() == Some(root)).collect();
+        assert_eq!(workers.len(), 2);
+        assert!(workers.iter().all(|t| t.role == AgentRole::Worker && t.state == TaskState::Completed));
+        assert!(workers.iter().any(|t| t.title == "first half"));
+        // The planner's answer was written after it read both workers' reports.
+        let events = store.latest_events(&run.id, 10_000).await.unwrap();
+        let answer = events.iter().rev()
+            .find(|e| e.kind == EventKind::Message && e.task_id.as_ref() == Some(root))
+            .and_then(|e| e.payload.get("summary").and_then(|s| s.as_str()))
+            .expect("the planner finished with a summary");
+        assert!(answer.starts_with("combined report"), "{answer}");
+        assert!(answer.contains("[worker 1] first half"), "{answer}");
+        assert!(answer.contains("[worker 2] review the second half"), "{answer}");
+        assert!(answer.contains("understood"), "workers' own replies come back: {answer}");
+    }
+
+    #[tokio::test]
     async fn wall_clock_budget_stops_inference_and_finalizes_tasks() {
         let (_dir, store, rt, run) = setup_with_latency(
             vec![MockStep::text("too late")], 1, Duration::from_secs(2),
@@ -616,4 +684,25 @@ mod tests {
         assert!(store.agents_for_run(&run.id).await.unwrap().iter()
             .all(|agent| agent.state == AgentState::Failed));
     }
+    #[tokio::test]
+    async fn reclaimed_task_keeps_the_same_agent_and_transcript() {
+        let (_dir, store, rt, run) = setup(vec![MockStep::text("continued")],1).await;
+        let task = store.load_task(run.root_task_id.as_ref().unwrap()).await.unwrap().unwrap();
+        let mut agent = Agent::new(run.id.clone(), task.id.clone(), None, task.role,0,now_ms());
+        agent.state = AgentState::Ready;
+        store.create_agent(&agent).await.unwrap();
+        let mut cp = swarm_core::agent::AgentCheckpoint::default();
+        cp.steps = 1;
+        cp.messages = crate::prompt::initial_messages(&run,&task);
+        cp.messages.push(swarm_core::message::ChatMessage::user("checkpoint sentinel from the prior attempt"));
+        store.save_checkpoint(&agent.id,&run.id,&cp,now_ms()).await.unwrap();
+        assert_eq!(rt.drive(&run.id).await.unwrap(),RunStatus::Completed);
+        let agents = store.agents_for_run(&run.id).await.unwrap();
+        assert_eq!(agents.len(),1);
+        assert_eq!(agents[0].id,agent.id);
+        let saved = store.load_checkpoint(&agent.id).await.unwrap().unwrap();
+        assert_eq!(saved.steps,2);
+        assert!(saved.messages.iter().any(|m| m.content.contains("checkpoint sentinel")));
+    }
+
 }

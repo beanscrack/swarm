@@ -62,6 +62,7 @@ pub mod message;
 pub mod protocol;
 pub mod provider;
 pub mod research;
+pub mod review;
 pub mod run;
 pub mod state;
 pub mod task;

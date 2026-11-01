@@ -165,7 +165,16 @@ pub fn builtin_catalog() -> ToolCatalog {
                     "additionalProperties": {"type": "number"}
                 },
                 "artifacts": {"type": "array", "items": {"type": "string"}},
-                "notes": {"type": "string", "description": "Caveats, what you would try next"}
+                "notes": {"type": "string", "description": "Caveats, what you would try next"},
+                "verdict": {"type":"string", "enum":["APPROVE","REQUEST_CHANGES","INCONCLUSIVE"]},
+                "blockers": {"type":"array", "items":{"type":"object", "properties":{
+                    "file":{"type":"string"}, "line":{"type":"integer", "minimum":1},
+                    "claim":{"type":"string"}, "verification":{"type":"string", "enum":["executed","code_inspection","unverified"]},
+                    "repro_command":{"type":["string","null"]}, "observed_output":{"type":["string","null"]}
+                }, "required":["file","line","claim","verification","repro_command","observed_output"]}},
+                "checks":{"type":"array", "items":{"type":"object", "properties":{
+                    "command":{"type":"string"}, "observed_output":{"type":"string"}
+                }, "required":["command","observed_output"]}}
             },
             "required": ["status", "summary"]
         }),

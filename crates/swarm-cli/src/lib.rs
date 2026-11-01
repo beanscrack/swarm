@@ -8,6 +8,7 @@ mod commands;
 mod custom;
 mod hooks;
 mod job;
+mod job_policy;
 mod live;
 mod mcp;
 mod transcript;

@@ -14,6 +14,7 @@
 mod catalog;
 mod error;
 mod executor;
+pub mod isolation;
 mod sandbox;
 pub mod shell;
 pub mod todo;

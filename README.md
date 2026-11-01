@@ -68,10 +68,17 @@ patch. See [docs/ORCHESTRATION.md](docs/ORCHESTRATION.md) and the ready-made ski
 `skills/swarm-orchestrator/`.
 
 ```sh
-swarm job submit --provider chatgpt-web --repo ./kernels --goal "Optimise matmul.cu with tiling; bench: ..."
+swarm job submit --config swift.toml --repo ./kernels --preset builder \
+  --goal "Fix the failing matmul case" --verify "pytest -q tests/test_matmul.py"
 swarm job wait job_... --timeout 300
 swarm job result job_...
 ```
+
+Jobs default to builder policy and require a verification command that fails on the
+baseline. Reviews use `--preset reviewer` and structured evidence; exploration uses
+`--preset general`. Native provider options, endpoint pools, priorities, transcript
+resume, repo maps and optional Docker command isolation are documented in
+[the agent contracts guide](docs/AGENT-CONTRACTS.md).
 
 ## Interactive session
 

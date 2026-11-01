@@ -82,7 +82,7 @@ fn an_mcp_client_can_launch_a_worker_wait_for_it_and_read_the_result() {
     assert_eq!(parse["error"]["code"], -32700, "{parse}");
 
     let (submitted, is_error) =
-        client.call("swarm_submit", json!({"goal": "create hello.txt and say done", "provider": "mock", "label": "mcp"}));
+        client.call("swarm_submit", json!({"goal": "create hello.txt and say done", "preset": "general", "provider": "mock", "label": "mcp"}));
     assert!(!is_error, "{submitted}");
     let id = submitted["job_id"].as_str().unwrap().to_string();
 

@@ -47,6 +47,8 @@ pub struct OpenAiConfig {
     pub streaming: bool,
     /// Extra static headers (e.g. a site key for a local server).
     pub extra_headers: Vec<(String, String)>,
+    pub chat_template_kwargs: serde_json::Map<String, Value>,
+    pub min_output_tokens: Option<u32>,
 }
 
 impl OpenAiConfig {
@@ -66,6 +68,8 @@ impl OpenAiConfig {
             pricing: ModelPricing::default(),
             streaming: true,
             extra_headers: Vec::new(),
+            chat_template_kwargs: Default::default(),
+            min_output_tokens: None,
         })
     }
 
@@ -205,7 +209,8 @@ impl Session for OpenAiSession {
         let do_stream = self.config.streaming;
         let body = self.build_body(request, do_stream);
 
-        let req = self.client.post(self.chat_url());
+        let req = self.client.post(self.chat_url())
+            .header("Accept", if do_stream { "text/event-stream" } else { "application/json" });
         let response = match req
             .json(&body)
             .send()
@@ -230,7 +235,7 @@ impl Session for OpenAiSession {
             .await
             .map_err(|e| ProviderError::Transport(e.to_string()))?;
 
-        let chunks = if do_stream {
+        let chunks = if do_stream && text.lines().any(|line| line.starts_with("data:")) {
             parse_sse_body(&text)?
         } else {
             let v: Value = serde_json::from_str(&text)
@@ -301,15 +306,22 @@ impl OpenAiSession {
         if has_tools && !tools_as_text {
             let tools: Vec<Value> = request.tools.iter().map(openai_tool_schema).collect();
             body["tools"] = json!(tools);
-            if do_stream {
-                body["stream_options"] = json!({"include_usage": true});
-            }
         }
-        if self.config.temperature > 0.0 {
+        if do_stream {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        if !self.config.chat_template_kwargs.is_empty() {
+            body["chat_template_kwargs"] = json!(self.config.chat_template_kwargs);
+        }
+        if let Some(temperature) = request.temperature.or(self.session_config.temperature) {
+            body["temperature"] = json!(temperature);
+        } else if self.config.temperature > 0.0 {
             body["temperature"] = json!(self.config.temperature);
         }
-        if let Some(max) = self.config.max_tokens {
-            body["max_tokens"] = json!(max);
+        if let Some(max) = request.max_tokens.or(self.session_config.max_tokens).or(self.config.max_tokens) {
+            body["max_tokens"] = json!(max.max(self.config.min_output_tokens.unwrap_or(0)));
+        } else if let Some(min) = self.config.min_output_tokens {
+            body["max_tokens"] = json!(min);
         }
         body
     }
@@ -700,4 +712,24 @@ mod tests {
         assert_eq!(classify_http_status(400, None), Permanent);
         assert_eq!(classify_http_status(503, None), Transient);
     }
+    #[tokio::test]
+    async fn native_options_and_text_stream_usage_reach_the_wire() {
+        let server = serve(200, r#"{"choices":[{"message":{"content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":3,"total_tokens":20}}"#).await;
+        let mut cfg = OpenAiConfig::new(&format!("{}/v1",server.uri()),"swift").unwrap();
+        cfg.chat_template_kwargs.insert("enable_thinking".into(),json!(false));
+        cfg.min_output_tokens = Some(4096);
+        let p = OpenAiProvider::new(ProviderId::new("options").unwrap(), cfg).unwrap();
+        let session = p.start_session(SessionConfig::default()).await.unwrap();
+        let mut request = req("go"); request.tool_protocol = ToolProtocol::Text; request.max_tokens = Some(100);
+        let response = session.send(request).await.unwrap();
+        assert_eq!(response.usage.input_tokens,17);
+        assert_eq!(response.usage.output_tokens,3);
+        let received = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["max_tokens"],4096);
+        assert_eq!(body["stream_options"]["include_usage"],true);
+        assert_eq!(received[0].headers.get("accept").unwrap(),"text/event-stream");
+    }
+
 }

@@ -11,6 +11,53 @@ struct Jobs {
     dir: tempfile::TempDir,
 }
 
+#[test]
+fn builders_require_a_red_baseline_and_keep_the_gate_evidence() {
+    let jobs = Jobs::new();
+    let binary = env!("CARGO_BIN_EXE_swarm");
+    let submit = |extra: &[&str]| {
+        Command::new(binary).args(["job","submit","--provider","mock","--goal","create hello.txt"])
+            .arg("--jobs").arg(jobs.root()).args(extra).env("SWARM_MOCK_SCRIPT","coding").output().unwrap()
+    };
+    let missing = submit(&[]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("require --verify"));
+    let green = submit(&["--verify","true"]);
+    assert!(!green.status.success());
+    assert!(String::from_utf8_lossy(&green.stderr).contains("baseline gate is green"));
+    let red = submit(&["--verify","test -f hello.txt"]);
+    assert!(red.status.success(),"{}",String::from_utf8_lossy(&red.stderr));
+    let value: Value = serde_json::from_slice(&red.stdout).unwrap();
+    let id = value["job_id"].as_str().unwrap(); jobs.finish(id);
+    let result = jobs.ok(&["result",id]);
+    assert_eq!(result["baseline_gate"]["red"],true);
+    assert_eq!(result["outcome"],"verified");
+    assert_eq!(result["token_limit"],14_000_000);
+}
+
+#[test]
+fn upstream_movement_is_reported_without_polluting_the_worker_patch() {
+    let jobs = Jobs::new(); let repo = jobs.dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap(); git(&repo,&["init"]);
+    std::fs::write(repo.join("base.txt"),"base\n").unwrap(); git(&repo,&["add","."]);
+    git(&repo,&["commit","-m","base"]);
+    let base = git(&repo,&["rev-parse","HEAD"]);
+    git(&repo,&["update-ref","refs/remotes/origin/main","HEAD"]);
+    let submitted = jobs.submit(&["--repo",repo.to_str().unwrap()]);
+    std::fs::write(repo.join("upstream.txt"),"upstream\n").unwrap(); git(&repo,&["add","."]);
+    git(&repo,&["commit","-m","upstream"]); git(&repo,&["update-ref","refs/remotes/origin/main","HEAD"]);
+    let id = submitted["job_id"].as_str().unwrap(); jobs.finish(id);
+    let result = jobs.ok(&["result",id]);
+    assert_eq!(result["base_drift"],true);
+    let patch = std::fs::read_to_string(result["patch"]["path"].as_str().unwrap()).unwrap();
+    assert!(patch.contains("hello.txt")); assert!(!patch.contains("upstream.txt"));
+    let stale = Command::new(env!("CARGO_BIN_EXE_swarm"))
+        .args(["job","submit","--preset","general","--provider","mock","--goal","explore","--repo",repo.to_str().unwrap(),"--base",&base])
+        .arg("--jobs").arg(jobs.root()).output().unwrap();
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("stale base"));
+}
+
 impl Jobs {
     fn new() -> Self {
         Self { dir: tempfile::tempdir().unwrap() }
@@ -48,7 +95,7 @@ impl Jobs {
     }
 
     fn submit(&self, extra: &[&str]) -> Value {
-        let mut args = vec!["submit", "--provider", "mock", "--goal", "create hello.txt and say done"];
+        let mut args = vec!["submit", "--preset", "general", "--provider", "mock", "--goal", "create hello.txt and say done"];
         args.extend_from_slice(extra);
         self.ok(&args)
     }
@@ -163,7 +210,7 @@ fn a_repo_job_gets_its_own_worktree_and_returns_a_patch() {
     let cleaned = jobs.ok(&["clean", a_id]);
     assert_eq!(cleaned["patch_kept"], true, "{cleaned}");
     assert!(!PathBuf::from(a["workspace"].as_str().unwrap()).exists());
-    assert!(!git(&repo, &["branch", "--list", &format!("swarm/{a_id}")]).contains(a_id));
+    assert!(!git(&repo, &["branch", "--list", &format!("codex/{a_id}")]).contains(a_id));
     assert!(Path::new(patch).is_file());
     assert!(PathBuf::from(b["workspace"].as_str().unwrap()).exists(), "the other job is not touched");
 }
@@ -177,7 +224,7 @@ fn submit_returns_at_once_even_when_the_callers_output_is_captured() {
     let started = std::time::Instant::now();
     // `output()` captures stdout and stderr through pipes and waits for them to close.
     let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
-        .args(["job", "submit", "--provider", "mock", "--goal", "create hello.txt and say done", "--jobs"])
+        .args(["job", "submit", "--preset", "general", "--provider", "mock", "--goal", "create hello.txt and say done", "--jobs"])
         .arg(jobs.root())
         .env("SWARM_MOCK_SCRIPT", "coding")
         .env("SWARM_MOCK_LATENCY_MS", "6000") // three model calls: about 18 seconds of work
@@ -209,7 +256,7 @@ fn the_outcome_tells_apart_a_job_that_did_work_from_one_that_only_ended() {
     // A worker that does nothing (the plain mock only replies) ends as `completed`
     // too, and the outcome says no work was done.
     let idle = Command::new(env!("CARGO_BIN_EXE_swarm"))
-        .args(["job", "submit", "--provider", "mock", "--goal", "do nothing at all", "--jobs"])
+        .args(["job", "submit", "--preset", "general", "--provider", "mock", "--goal", "do nothing at all", "--jobs"])
         .arg(jobs.root())
         .env_remove("SWARM_PROVIDER")
         .env_remove("SWARM_MOCK_SCRIPT")
@@ -284,7 +331,7 @@ fn unknown_jobs_bad_input_and_finished_jobs_are_handled() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("no such job"));
 
     let no_provider = Command::new(env!("CARGO_BIN_EXE_swarm"))
-        .args(["job", "submit", "--goal", "x", "--jobs"])
+        .args(["job", "submit", "--preset", "general", "--goal", "x", "--jobs"])
         .arg(jobs.root())
         .env_remove("SWARM_PROVIDER")
         .output()
@@ -388,20 +435,19 @@ fn a_job_waiting_on_its_check_is_still_running() {
         return;
     }
     let jobs = Jobs::new();
-    // The worker finishes in seconds; the check takes longer. In between the job must not read as done.
-    let submitted = jobs.submit(&["--verify", "sleep 6; test -f hello.txt"]);
+    // Hold the check until status has observed it. Wall-clock sleeps can be
+    // missed when many subprocess tests and Windows process queries compete.
+    let submitted = jobs.submit(&["--verify", "echo waiting > verify-started; while [ ! -f verify-release ]; do sleep 0.1; done; test -f hello.txt"]);
     let id = submitted["job_id"].as_str().unwrap().to_string();
-    let mut saw_verifying = false;
-    for _ in 0..60 {
-        let status = jobs.ok(&["status", &id]);
-        if status["verify"]["phase"] == "verifying" {
-            assert_eq!(status["state"], "running", "a verifying job is not finished: {status}");
-            saw_verifying = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+    let workspace = PathBuf::from(submitted["workspace"].as_str().unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !workspace.join("verify-started").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    assert!(saw_verifying, "never saw the verifying phase");
+    let status = jobs.ok(&["status", &id]);
+    std::fs::write(workspace.join("verify-release"), "release").unwrap();
+    assert_eq!(status["verify"]["phase"], "verifying", "{status}");
+    assert_eq!(status["state"], "running", "a verifying job is not finished: {status}");
     jobs.finish(&id);
     assert_eq!(jobs.ok(&["result", &id])["outcome"], "verified");
 }
@@ -432,7 +478,7 @@ fn a_passing_check_on_a_worker_that_used_no_tools_is_not_verified() {
     let jobs = Jobs::new();
     // The plain mock only replies: no tool calls, no changes. The check passes on the untouched tree.
     let output = Command::new(env!("CARGO_BIN_EXE_swarm"))
-        .args(["job", "submit", "--provider", "mock", "--goal", "do nothing at all", "--verify", "true", "--jobs"])
+        .args(["job", "submit", "--preset", "general", "--provider", "mock", "--goal", "do nothing at all", "--verify", "true", "--jobs"])
         .arg(jobs.root())
         .env_remove("SWARM_PROVIDER")
         .env_remove("SWARM_MOCK_SCRIPT")

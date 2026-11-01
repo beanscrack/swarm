@@ -21,6 +21,7 @@ pub mod managed;
 pub mod mock;
 pub mod openai;
 pub mod pricing;
+pub mod pool;
 pub mod provider;
 pub mod quota;
 pub mod registry;
