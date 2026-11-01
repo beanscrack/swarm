@@ -370,7 +370,24 @@ fn parse_json_body(v: &Value) -> Vec<ProviderTextChunk> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let calls = parse_tool_calls(v.pointer("/choices/0/message"));
+    let mut calls = parse_tool_calls(v.pointer("/choices/0/message"));
+    // Text tool protocol fallback. An endpoint with no native tool_calls answers the tools
+    // prompt (SendRequest::tools_as_text) with a JSON object inside prose; with only the
+    // native path, the loop sees no call, spends max_format_retries nagging, and dies - the
+    // repair loop standing in for a protocol. Recovering the call lets a tool-call-free
+    // server drive the agent. Tolerance rules (fences, key aliases, truncation) and the
+    // requirement that a tool NAME be present live in text_tools, so a reply that merely
+    // talks about tools produces no call. Streaming parity is a known gap; see
+    // docs/TEXT-TOOLS-PLAN.md.
+    if calls.is_empty() {
+        if let Ok(parsed) = crate::text_tools::parse_tool_call(&text) {
+            calls.push(NativeToolCall {
+                id: "text-0".to_string(),
+                name: parsed.name,
+                arguments: parsed.arguments,
+            });
+        }
+    }
     let finish = FinishReason::from_provider_str(
         v.pointer("/choices/0/finish_reason")
             .and_then(Value::as_str)
