@@ -464,6 +464,20 @@ fn parse_sse_body(body: &str) -> Result<Vec<ProviderTextChunk>> {
         .values()
         .map(|a| NativeToolCall::new(a.id.clone(), a.name.clone(), parse_tool_arguments(&a.args)))
         .collect();
+    // Streaming parity for the text tool protocol. The non-streaming parser recovers a
+    // tool object from prose; a streamed reply must get the same treatment, because swarm
+    // asks for SSE by default and a text-protocol endpoint that streams would otherwise
+    // produce no call at all - the protocol would only exist where streaming is off.
+    let mut calls = calls;
+    if calls.is_empty() {
+        if let Ok(parsed) = crate::text_tools::parse_tool_call(&text) {
+            calls.push(NativeToolCall {
+                id: "text-0".to_string(),
+                name: parsed.name,
+                arguments: parsed.arguments,
+            });
+        }
+    }
     Ok(build_chunks(&text, &calls, finish, usage))
 }
 
