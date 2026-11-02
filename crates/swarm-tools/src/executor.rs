@@ -541,6 +541,8 @@ impl ToolExecutor {
         let timeout = Self::timeout_for(input, &self.config);
         let interpreter = if cfg!(windows) { "python" } else { "python3" };
         let mut cmd = tokio::process::Command::new(interpreter);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         cmd.arg(tmp.as_os_str());
         cmd.current_dir(&self.config.workspace_root);
         // A tool must never read the user's keyboard, and an abandoned call (Ctrl+C,
@@ -588,6 +590,8 @@ impl ToolExecutor {
         let timeout = Self::timeout_for(input, &self.config);
         if self.config.docker_image.is_some() { return self.run_isolated("git", &args, timeout).await; }
         let mut cmd = tokio::process::Command::new("git");
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         cmd.args(&args);
         cmd.current_dir(&self.config.workspace_root);
         // A tool must never read the user's keyboard, and an abandoned call (Ctrl+C,

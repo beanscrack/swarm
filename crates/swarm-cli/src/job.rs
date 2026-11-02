@@ -752,11 +752,25 @@ pub async fn supervise_job(jobs: &Path, id: &str) -> Result<Value> {
     Ok(json!({"job_id": id, "passed": state.passed, "rounds": state.rounds.len()}))
 }
 
+/// Keep a helper process (tasklist, taskkill) from flashing a console window when
+/// it is started from a process that has no visible console of its own.
+#[cfg(windows)]
+fn hide_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0800_0000);
+}
+
+#[cfg(not(windows))]
+fn hide_window(_command: &mut Command) {}
+
 #[cfg(windows)]
 fn detach(command: &mut Command) {
     use std::os::windows::process::CommandExt;
-    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: outlives the caller, no console.
-    command.creation_flags(0x0000_0008 | 0x0000_0200);
+    // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP: outlives the caller and owns a
+    // hidden console that its children inherit. DETACHED_PROCESS (no console at all)
+    // made every console program the worker ran (git, go, python, cmd) open its own
+    // visible terminal window.
+    command.creation_flags(0x0800_0000 | 0x0000_0200);
     stop_inheriting_stdio();
 }
 
@@ -795,8 +809,10 @@ fn detach(command: &mut Command) {
 fn pid_alive(pid: u32) -> bool {
     if pid == std::process::id() { return true; }
     if cfg!(windows) {
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        let mut tasklist = Command::new("tasklist");
+        tasklist.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+        hide_window(&mut tasklist);
+        tasklist
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
             .unwrap_or(false)
@@ -845,7 +861,10 @@ async fn await_job_slot(jobs: &Path, spec: &JobSpec, dir: &Path) -> Result<File>
 
 fn kill_tree(pid: u32) {
     if cfg!(windows) {
-        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output();
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        hide_window(&mut taskkill);
+        let _ = taskkill.output();
     } else {
         let _ = Command::new("kill").args(["-TERM", &format!("-{pid}")]).output();
         let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();

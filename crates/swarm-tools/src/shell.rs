@@ -36,6 +36,8 @@ impl Shell {
         let mut parts = self.argv(script);
         let mut cmd = tokio::process::Command::new(&parts[0]);
         cmd.args(&parts[1..]);
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: never open a terminal window
         cmd
     }
 

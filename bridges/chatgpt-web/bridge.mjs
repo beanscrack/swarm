@@ -189,7 +189,13 @@ async function firstVisible(page, selectors, timeout = 30000) {
 async function composer(page) {
   const found = await firstVisible(page, COMPOSER);
   if (!found) {
-    throw new BridgeError(401, 'ChatGPT composer unavailable; sign in in the bridge Chrome window');
+    // 401 is final for the caller (it stops retrying), so claim it only when the
+    // site really shows a sign-in wall. A page that has not rendered its composer
+    // yet (just navigated to a fresh chat) is worth a retry.
+    if (await loginWall(page).catch(() => false)) {
+      throw new BridgeError(401, 'ChatGPT composer unavailable; sign in in the bridge Chrome window');
+    }
+    throw new BridgeError(503, 'ChatGPT composer did not render within 30s and no sign-in wall is showing; re-run the turn');
   }
   return found;
 }
@@ -806,17 +812,26 @@ async function resetToFreshChat(page) {
     if (await assistantCount(page) === 0 && await userTurnCount(page) === 0) break;
     await page.waitForTimeout(250);
   }
+  // The fresh page must have a usable composer before the send path starts. If it
+  // does not appear (a half-rendered page after the delete + navigation), reload
+  // the root URL once; the deleted chat cannot be resumed there.
+  if (!(await firstVisible(page, COMPOSER, 10000))) {
+    trace('fresh chat: no composer after 10s, reloading', page.url());
+    await page.goto(chatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await firstVisible(page, COMPOSER, 20000);
+  }
   trace('fresh chat ready', page.url());
 }
 
 async function sendLogged(session, prompt, fresh = false) {
   if (fresh) {
-    await resetToFreshChat(session.page);
     session.log = [];
     session.rotate = false;
   }
   session.log.push({ role: 'user', text: prompt });
-  const reply = await withConnectorApproval(session.page, () => sendMessage(session, prompt));
+  // The reset to a fresh chat happens inside sendMessage, under the per-browser
+  // send lock and with the tab in front: done out here it ran in a background tab.
+  const reply = await withConnectorApproval(session.page, () => sendMessage(session, prompt, fresh));
   session.log.push({ role: 'assistant', text: reply.text });
   if (fresh) {
     session.log = [];
@@ -905,21 +920,61 @@ async function restartChat(session, prompt) {
 /// sidebar's New chat control is the only reliable reset.
 async function startNewChat(page) {
   const before = page.url();
-  const control = page.locator('button[aria-label="New chat"], a[aria-label="New chat"]').first();
+  // The page carries a hidden duplicate of this control ahead of the visible one
+  // (a collapsed-sidebar copy); `.first()` of the unfiltered match is the hidden
+  // one, its click times out, and the failure used to be swallowed, so no turn
+  // ever started a fresh chat. Only visible controls are candidates.
+  const control = page.locator('button[aria-label="New chat"]:visible, a[aria-label="New chat"]:visible').first();
+  // The chat view is /c/<id>; a fresh composer stays on the root URL.
+  const onRoot = async (ticks) => {
+    for (let tick = 0; tick < ticks; tick += 1) {
+      if (!/\/c\//.test(page.url())) return true;
+      await page.waitForTimeout(250);
+    }
+    return !/\/c\//.test(page.url());
+  };
+  if (!/\/c\//.test(before)) return true;
   if (await control.count().catch(() => 0)) {
     await control.click({ timeout: 5000 }).catch(() => {});
-  } else {
-    await page.goto(chatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    if (await onRoot(20)) return true;
   }
-  // The chat view is /c/<id>; a fresh composer stays on the root URL.
-  for (let tick = 0; tick < 20; tick += 1) {
-    if (!/\/c\//.test(page.url())) return true;
-    await page.waitForTimeout(250);
-  }
-  return page.url() !== before && !/\/c\//.test(page.url());
+  // The site's own shortcut for a new chat, then the root URL as a last resort.
+  await page.keyboard.press('Control+Shift+O').catch(() => {});
+  if (await onRoot(12)) return true;
+  await page.goto(chatUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+  trace('startNewChat: fell back to the root URL', page.url());
+  return await onRoot(8);
 }
 
-async function sendMessage(session, prompt) {
+// Tabs that share one Chrome cannot all submit at once: only the foreground tab
+// is rendered and focused, so a send into a background tab types text the editor
+// never registers ("ChatGPT would not post the prompt") and a click can land on
+// the wrong tab. The SEND phase (focus, type, submit, confirm the turn started)
+// therefore takes a per-access-point lock and brings its tab to the front; the long
+// reply wait happens after the lock is released, so generations still overlap.
+const sendChains = contexts.map(() => Promise.resolve());
+function acquireSendLock(accessPoint) {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const previous = sendChains[accessPoint];
+  sendChains[accessPoint] = previous.then(() => gate);
+  return previous.then(() => release);
+}
+
+async function sendMessage(session, prompt, fresh = false) {
+  const release = await acquireSendLock(session.accessPoint);
+  let released = false;
+  const sendDone = () => { if (!released) { released = true; release(); } };
+  try {
+    await session.page.bringToFront().catch(() => {});
+    if (fresh) await resetToFreshChat(session.page);
+    return await sendMessageInner(session, prompt, sendDone);
+  } finally {
+    sendDone();
+  }
+}
+
+async function sendMessageInner(session, prompt, sendDone) {
   const { page } = session;
   // The site stops accepting messages in a chat after roughly six exchanges and
   // fails SILENTLY (no wall, dropped send), so rotate proactively: sendLogged
@@ -1022,6 +1077,7 @@ async function sendMessage(session, prompt) {
     }
   }
 
+  sendDone(); // the prompt is posted; another tab on this browser may take its turn
   trace('sendMessage: waiting for reply, sent', sent, 'previousTurns', previousTurns, 'useApi', useApi);
   const deadline = Date.now() + responseTimeoutMs;
   let apiFailures = 0;

@@ -40,11 +40,44 @@ fn command(result: &Value) -> Option<String> {
     }
 }
 
+/// Fewest real (non-elided) characters an excerpt must show to count as evidence.
+const MIN_EXCERPT_CHARS: usize = 8;
+
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Is `excerpt` a faithful quote of `output`? Whitespace is compared collapsed (a
+/// chat model round-trips tabs and column padding as plain spaces), and the quote
+/// may elide stretches with `...` or `…`. Every remaining fragment must still occur
+/// in the real output, in order, so an invented line never passes; an excerpt that
+/// is mostly ellipsis does not either.
+fn excerpt_in(output: &str, excerpt: &str) -> bool {
+    let output = squash(output);
+    let excerpt = squash(&excerpt.replace('…', "..."));
+    let fragments: Vec<&str> = excerpt
+        .split("...")
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .collect();
+    if fragments.iter().map(|f| f.chars().count()).sum::<usize>() < MIN_EXCERPT_CHARS.min(excerpt.chars().count()) {
+        return false;
+    }
+    let mut from = 0;
+    for fragment in fragments {
+        match output[from..].find(fragment) {
+            Some(at) => from += at + fragment.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
 fn observed(events: &[RunEvent], cmd: &str, output: &str) -> bool {
     !output.trim().is_empty()
         && results(events).any(|r| {
             command(r).as_deref() == Some(cmd)
-                && r["output"].as_str().unwrap_or("").contains(output)
+                && excerpt_in(r["output"].as_str().unwrap_or(""), output)
                 && r["exit_code"].is_number()
         })
 }
@@ -165,6 +198,21 @@ pub fn audit_review(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn excerpts_tolerate_whitespace_and_elision_but_not_invention() {
+        let out = "ok  \tgithub.com/Coalign/platform/internal/app\t249.774s\n";
+        assert!(excerpt_in(out, "ok github.com/Coalign/platform/internal/app 249.774s"));
+        let stat = " internal/app/journal_test.go | 779 +++++\n 1 file changed, 779 insertions(+)\n";
+        assert!(excerpt_in(stat, ".../app/journal_test.go | 779 +++++\n1 file changed, 779 insertions(+)"));
+        assert!(excerpt_in(stat, "journal_test.go | 779 ... 779 insertions(+)"));
+        // order matters, invented text fails, and a bare ellipsis proves nothing
+        assert!(!excerpt_in(stat, "779 insertions(+) ... journal_test.go"));
+        assert!(!excerpt_in(stat, "journal_test.go | 12 deletions(-)"));
+        assert!(!excerpt_in(stat, "..."));
+        assert!(!excerpt_in(stat, "… …"));
+    }
+
     #[test]
     fn a_failed_diff_is_not_successful_inspection() {
         let dir = tempfile::tempdir().unwrap();
